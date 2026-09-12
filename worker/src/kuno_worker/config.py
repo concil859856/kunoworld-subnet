@@ -30,6 +30,8 @@ class WorkerConfig:
     h3_fl2va_url: str = "http://127.0.0.1:30010"
     h3_ref2va_url: str = "http://127.0.0.1:30011"
     ltx_models_dir: Path | None = None
+    h3_model_id: str = "MiniMaxAI/MiniMax-H3"
+    h3_turbo_lora: str | None = None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> WorkerConfig:
@@ -53,5 +55,7 @@ class WorkerConfig:
             h3_fl2va_url=env.get("KUNO_H3_FL2VA_URL", "http://127.0.0.1:30010"),
             h3_ref2va_url=env.get("KUNO_H3_REF2VA_URL", "http://127.0.0.1:30011"),
             ltx_models_dir=Path(ltx_dir) if ltx_dir else None,
+            h3_model_id=env.get("KUNO_H3_MODEL_ID", "MiniMaxAI/MiniMax-H3"),
+            h3_turbo_lora=env.get("KUNO_H3_TURBO_LORA"),
             hardware={k[len("KUNO_HW_"):].lower(): v for k, v in env.items() if k.startswith("KUNO_HW_")},
         )

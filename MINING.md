@@ -75,7 +75,7 @@ a dev gateway. This earns nothing and is not accepted on mainnet; it proves the 
 uv run kuno-devkit init --data data                 # dev keys + golden manifest
 export KUNO_DATA_DIR=data
 export KUNO_GATEWAY_URL=https://dev.kunoworld.com   # or your own gateway
-export KUNO_BACKEND=real                            # real models instead of the placeholder renderer
+export KUNO_BACKEND=cold                            # the models' own CLI, one process per job
 export KUNO_TEE=mock                                # simulated quotes; mainnet manifests reject these
 export KUNO_LTX_MODELS_DIR=/models/ltx-2.5
 export KUNO_PROFILES=ltx-2.5-fast
@@ -84,6 +84,32 @@ uv run kuno-worker
 
 Watch the first job end to end, then try each mode the profile supports. Every job is
 charged against a dev balance, so failures cost nothing but time.
+
+## 3b. Switch to resident runtimes for real serving
+
+There are three backends:
+
+| `KUNO_BACKEND` | What it does | When |
+|---|---|---|
+| `mock` | placeholder video from ffmpeg, no GPU | dev networks, tests |
+| `cold` | the models' own CLI / server entry points, reloading weights per job | validating a new box against the official docs |
+| `real` | pipelines loaded once and kept in memory | serving |
+
+`cold` spends minutes loading and seconds generating — LTX-2.5 is about 66 GB and H3 about
+124 GB, and inside a confidential VM loading is far slower still. Once `cold` produces
+correct video, switch to `real`, which loads each profile once, keeps it resident, and runs
+jobs one at a time behind it:
+
+```bash
+export KUNO_BACKEND=real
+export KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors   # h3-turbo only
+```
+
+For MiniMax H3, `real` still prefers the official SGLang servers from step 2 (already
+resident); only the Turbo LoRA profile, which SGLang does not support, runs through the
+in-process pipeline. Serving several profiles on one machine loads them in turn and evicts
+the least recently used when VRAM runs out, so pin `KUNO_PROFILES` to what the card can
+actually hold.
 
 ## 4. Mainnet
 

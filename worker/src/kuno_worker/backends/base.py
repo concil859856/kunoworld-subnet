@@ -18,11 +18,13 @@ class InputFile:
     ref: InputRef
     data: bytes
     mime: str
+    path: str | None = None  # set by save(), for runtimes that take file paths
 
     def save(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"input-{self.ref.index}{EXTENSIONS.get(self.mime, '.bin')}"
         path.write_bytes(self.data)
+        self.path = str(path)
         return path
 
 
