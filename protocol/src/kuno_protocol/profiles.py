@@ -125,6 +125,8 @@ class ModelProfile(BaseModel):
     limits: Limits
     hardware_class: str
     gpus_per_worker: int
+    # Per-GPU VRAM the official bf16 recipe needs; quantized paths need less.
+    min_vram_gb: float = 0
     steps: int
     license: LicenseInfo
     pricing: Pricing

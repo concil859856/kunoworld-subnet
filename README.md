@@ -8,6 +8,8 @@ inside a confidential VM, and the validator. The byte-level spec is in
 
 You provide GPU servers. KunoWorld provides the exact image they run; you never see
 customer prompts, media or videos, and the network can prove the image is unmodified.
+**[MINING.md](MINING.md)** is the step-by-step guide: what to rent, where the weights go,
+a first run on a dev network, and the mainnet requirements.
 
 **Hardware classes**
 

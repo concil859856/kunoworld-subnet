@@ -75,7 +75,8 @@
           "768p": 0.06
         }
       },
-      "vcu_per_output_second": 16
+      "vcu_per_output_second": 16,
+      "min_vram_gb": 80
     },
     {
       "id": "h3",
@@ -150,7 +151,8 @@
           "768p": 0.12
         }
       },
-      "vcu_per_output_second": 60
+      "vcu_per_output_second": 60,
+      "min_vram_gb": 80
     },
     {
       "id": "h3-reference",
@@ -254,7 +256,8 @@
           "768p": 0.1
         }
       },
-      "vcu_per_output_second": 64
+      "vcu_per_output_second": 64,
+      "min_vram_gb": 80
     },
     {
       "id": "ltx-2.5-fast",
@@ -363,7 +366,8 @@
           "1080p": 0.04
         }
       },
-      "vcu_per_output_second": 5
+      "vcu_per_output_second": 5,
+      "min_vram_gb": 80
     },
     {
       "id": "ltx-2.5-pro",
@@ -474,7 +478,8 @@
           "1080p": 0.07
         }
       },
-      "vcu_per_output_second": 15
+      "vcu_per_output_second": 15,
+      "min_vram_gb": 80
     },
     {
       "id": "ltx-2.5-4k",
@@ -547,7 +552,8 @@
         }
       },
       "vcu_per_output_second": 40,
-      "timeout_s": 3600
+      "timeout_s": 3600,
+      "min_vram_gb": 141
     }
   ]
 }
