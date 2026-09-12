@@ -16,6 +16,7 @@ ROLE_TYPES: dict[InputRole, frozenset[str]] = {
     InputRole.REFERENCE_VIDEO: VIDEO_TYPES,
     InputRole.REFERENCE_AUDIO: AUDIO_TYPES,
     InputRole.SOURCE_VIDEO: VIDEO_TYPES,
+    InputRole.SOURCE_AUDIO: AUDIO_TYPES,
 }
 
 EXTENSIONS = {
