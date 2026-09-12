@@ -98,6 +98,10 @@ class GatewayClient:
     def fail(self, job_id: str, code: str, message: str) -> None:
         self._send("POST", f"/miner/v1/jobs/{job_id}/fail", self._json({"code": code, "message": message[:500]}))
 
+    def retire(self) -> dict:
+        """Tell the gateway this enclave is leaving, so queued jobs are released at once."""
+        return self._send("POST", "/miner/v1/retire", timeout=10).json()
+
     def answer_challenge(self, challenge_id: str, evidence: AttestationEvidence) -> dict:
         body = self._json({"evidence": evidence.model_dump(mode="json")})
         return self._send("POST", f"/miner/v1/challenges/{challenge_id}", body).json()

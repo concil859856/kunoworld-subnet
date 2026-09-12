@@ -119,6 +119,16 @@ class Worker:
             elif kind == "challenge":
                 self.handle_challenge(MinerChallenge.model_validate(work))
 
+    def retire(self) -> None:
+        """Best-effort goodbye on shutdown; the gateway releases anything still queued for us."""
+        if not self.ready.is_set():
+            return
+        try:
+            released = self.client.retire().get("released", 0)
+            log.info("retired enclave %s (%d queued job(s) released)", self.identity.enclave_id, released)
+        except (httpx.HTTPError, GatewayError) as exc:
+            log.warning("could not retire cleanly (%s); the gateway will notice within a minute", type(exc).__name__)
+
     def handle_challenge(self, challenge: MinerChallenge) -> None:
         try:
             self.client.answer_challenge(challenge.challenge_id, self.attest(bytes.fromhex(challenge.nonce)))

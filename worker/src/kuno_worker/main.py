@@ -66,6 +66,7 @@ def main() -> None:
     deadline = time.time() + SHUTDOWN_GRACE_S
     while worker.busy and time.time() < deadline:
         time.sleep(0.5)
+    worker.retire()
 
 
 if __name__ == "__main__":
