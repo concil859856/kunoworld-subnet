@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import httpx
 
-from kunoworld import KunoClient, KunoError
 from kuno_protocol.attestation import AttestationEvidence, GoldenManifest, Verdict, verify_evidence
 from kuno_protocol.profiles import load_profiles
 from kuno_protocol.switch import SignedSwitch, SwitchConfig
@@ -43,11 +42,23 @@ class Validator:
             base_url=self.gateway_url, headers={"authorization": f"Bearer {api_key}"}, timeout=60.0, transport=transport
         )
         # Canaries for region-licensed models (H3) must originate from a licensed region.
-        self.sdk = KunoClient(api_key, self.gateway_url, manifest=manifest, country=country, transport=transport)
+        self._sdk_args = (api_key, country, transport)
+        self._sdk = None
+
+    @property
+    def sdk(self):
+        """The client SDK, imported lazily: scoring and attestation don't need it."""
+        if self._sdk is None:
+            from kunoworld import KunoClient
+
+            api_key, country, transport = self._sdk_args
+            self._sdk = KunoClient(api_key, self.gateway_url, manifest=self.manifest, country=country, transport=transport)
+        return self._sdk
 
     def close(self) -> None:
         self._http.close()
-        self.sdk.close()
+        if self._sdk is not None:
+            self._sdk.close()
 
     # ------------------------------------------------------------ inputs
 
@@ -102,6 +113,8 @@ class Validator:
     # ------------------------------------------------------------ canaries
 
     def run_canary(self, profile_id: str) -> CanaryResult:
+        from kunoworld import KunoError  # only canaries need the client SDK
+
         profile = self.profiles[profile_id]
         try:
             result = self.sdk.generate(
