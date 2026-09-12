@@ -1,0 +1,553 @@
+{
+  "version": 2,
+  "note": "Capabilities per the official inference code (research/research_model_capabilities.md). Prices and VCU weights are launch estimates pending Phase 0 benchmarks.",
+  "profiles": [
+    {
+      "id": "h3-turbo",
+      "family": "minimax-h3",
+      "name": "MiniMax H3 Turbo",
+      "tagline": "Top open-weight quality with native stereo audio, 8-step distilled",
+      "variant": "turbo",
+      "checkpoint": "MiniMaxAI/MiniMax-H3 transformer (FL2VA) + lightx2v/Minimax-h3-Turbo 8-step v1.0 @1344x768",
+      "runtime": "lightx2v",
+      "modes": [
+        "text_to_video",
+        "image_to_video",
+        "last_frame",
+        "first_last_frame"
+      ],
+      "limits": {
+        "min_duration_s": 5,
+        "max_duration_s": 14,
+        "duration_step_s": 1,
+        "sizes": {
+          "768p": {
+            "16:9": [
+              1344,
+              768
+            ],
+            "9:16": [
+              768,
+              1344
+            ],
+            "4:3": [
+              1024,
+              768
+            ],
+            "3:4": [
+              768,
+              1024
+            ],
+            "1:1": [
+              768,
+              768
+            ],
+            "21:9": [
+              1536,
+              640
+            ]
+          }
+        },
+        "fps": [
+          24
+        ],
+        "default_fps": 24,
+        "audio": true,
+        "max_inputs": {
+          "first_frame": 1,
+          "last_frame": 1
+        },
+        "max_prompt_chars": 7000,
+        "negative_prompt": false,
+        "prompt_enhancer": false
+      },
+      "hardware_class": "C4",
+      "gpus_per_worker": 4,
+      "steps": 8,
+      "license": {
+        "name": "MiniMax H3 Community License",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE",
+        "attribution": "MiniMax H3",
+        "region_policy": "minimax-h3"
+      },
+      "pricing": {
+        "usd_per_second": {
+          "768p": 0.06
+        }
+      },
+      "vcu_per_output_second": 16
+    },
+    {
+      "id": "h3",
+      "family": "minimax-h3",
+      "name": "MiniMax H3",
+      "tagline": "Full 50-step H3 for maximum fidelity",
+      "variant": "quality",
+      "checkpoint": "MiniMaxAI/MiniMax-H3 transformer (FL2VA), 50 steps",
+      "runtime": "sglang",
+      "modes": [
+        "text_to_video",
+        "image_to_video",
+        "last_frame",
+        "first_last_frame"
+      ],
+      "limits": {
+        "min_duration_s": 5,
+        "max_duration_s": 14,
+        "duration_step_s": 1,
+        "sizes": {
+          "768p": {
+            "16:9": [
+              1344,
+              768
+            ],
+            "9:16": [
+              768,
+              1344
+            ],
+            "4:3": [
+              1024,
+              768
+            ],
+            "3:4": [
+              768,
+              1024
+            ],
+            "1:1": [
+              768,
+              768
+            ],
+            "21:9": [
+              1536,
+              640
+            ]
+          }
+        },
+        "fps": [
+          24
+        ],
+        "default_fps": 24,
+        "audio": true,
+        "max_inputs": {
+          "first_frame": 1,
+          "last_frame": 1
+        },
+        "max_prompt_chars": 7000,
+        "negative_prompt": false,
+        "prompt_enhancer": false
+      },
+      "hardware_class": "C4",
+      "gpus_per_worker": 4,
+      "steps": 50,
+      "license": {
+        "name": "MiniMax H3 Community License",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE",
+        "attribution": "MiniMax H3",
+        "region_policy": "minimax-h3"
+      },
+      "pricing": {
+        "usd_per_second": {
+          "768p": 0.12
+        }
+      },
+      "vcu_per_output_second": 60
+    },
+    {
+      "id": "h3-reference",
+      "family": "minimax-h3",
+      "name": "MiniMax H3 Director",
+      "tagline": "Direct a scene from up to 9 images, 3 clips and 3 audio tracks \u2014 edit, extend or drive video from audio",
+      "variant": "quality",
+      "checkpoint": "MiniMaxAI/MiniMax-H3 transformer_ref (Ref2VA), 50 steps",
+      "runtime": "sglang",
+      "modes": [
+        "reference_to_video",
+        "video_edit",
+        "extend_video",
+        "audio_to_video"
+      ],
+      "limits": {
+        "min_duration_s": 5,
+        "max_duration_s": 14,
+        "duration_step_s": 1,
+        "sizes": {
+          "768p": {
+            "16:9": [
+              1344,
+              768
+            ],
+            "9:16": [
+              768,
+              1344
+            ],
+            "4:3": [
+              1024,
+              768
+            ],
+            "3:4": [
+              768,
+              1024
+            ],
+            "1:1": [
+              768,
+              768
+            ],
+            "21:9": [
+              1536,
+              640
+            ]
+          }
+        },
+        "fps": [
+          24
+        ],
+        "default_fps": 24,
+        "audio": true,
+        "max_inputs": {
+          "reference_image": 9,
+          "reference_video": 3,
+          "reference_audio": 3,
+          "source_video": 1,
+          "source_audio": 1,
+          "first_frame": 1
+        },
+        "input_groups": [
+          {
+            "roles": [
+              "reference_image",
+              "first_frame"
+            ],
+            "max": 9
+          },
+          {
+            "roles": [
+              "reference_video",
+              "source_video"
+            ],
+            "max": 3
+          },
+          {
+            "roles": [
+              "reference_audio",
+              "source_audio"
+            ],
+            "max": 3
+          }
+        ],
+        "max_total_inputs": 12,
+        "visual_required_with_audio": true,
+        "max_prompt_chars": 7000,
+        "negative_prompt": false,
+        "prompt_enhancer": false
+      },
+      "hardware_class": "C4",
+      "gpus_per_worker": 4,
+      "steps": 50,
+      "license": {
+        "name": "MiniMax H3 Community License",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE",
+        "attribution": "MiniMax H3",
+        "region_policy": "minimax-h3"
+      },
+      "pricing": {
+        "usd_per_second": {
+          "768p": 0.1
+        }
+      },
+      "vcu_per_output_second": 64
+    },
+    {
+      "id": "ltx-2.5-fast",
+      "family": "ltx-2.5",
+      "name": "LTX-2.5 Fast",
+      "tagline": "Seconds-fast video with audio, keyframes and retakes",
+      "variant": "fast",
+      "checkpoint": "Lightricks/LTX-2.5 ltx-2.5-22b-distilled (8+3 steps, x2 latent upscaler)",
+      "runtime": "ltx-pipelines",
+      "modes": [
+        "text_to_video",
+        "image_to_video",
+        "last_frame",
+        "first_last_frame",
+        "keyframes",
+        "retake"
+      ],
+      "limits": {
+        "min_duration_s": 2,
+        "max_duration_s": 20,
+        "duration_step_s": 1,
+        "sizes": {
+          "720p": {
+            "16:9": [
+              1280,
+              704
+            ],
+            "9:16": [
+              704,
+              1280
+            ],
+            "4:3": [
+              960,
+              704
+            ],
+            "3:4": [
+              704,
+              960
+            ],
+            "1:1": [
+              960,
+              960
+            ],
+            "21:9": [
+              1664,
+              704
+            ]
+          },
+          "1080p": {
+            "16:9": [
+              1920,
+              1088
+            ],
+            "9:16": [
+              1088,
+              1920
+            ],
+            "4:3": [
+              1472,
+              1088
+            ],
+            "3:4": [
+              1088,
+              1472
+            ],
+            "1:1": [
+              1088,
+              1088
+            ],
+            "21:9": [
+              2560,
+              1088
+            ]
+          }
+        },
+        "fps": [
+          24,
+          25,
+          48,
+          50
+        ],
+        "default_fps": 24,
+        "audio": true,
+        "max_inputs": {
+          "first_frame": 1,
+          "last_frame": 1,
+          "keyframe": 8,
+          "source_video": 1
+        },
+        "max_prompt_chars": 4000,
+        "negative_prompt": false,
+        "prompt_enhancer": true
+      },
+      "hardware_class": "C1",
+      "gpus_per_worker": 1,
+      "steps": 11,
+      "license": {
+        "name": "LTX-2 Community License",
+        "url": "https://huggingface.co/Lightricks/LTX-2/blob/main/LICENSE",
+        "attribution": null,
+        "region_policy": null
+      },
+      "pricing": {
+        "usd_per_second": {
+          "720p": 0.024,
+          "1080p": 0.04
+        }
+      },
+      "vcu_per_output_second": 5
+    },
+    {
+      "id": "ltx-2.5-pro",
+      "family": "ltx-2.5",
+      "name": "LTX-2.5 Pro",
+      "tagline": "Full LTX-2.5 with guidance, negative prompts and audio-driven video",
+      "variant": "pro",
+      "checkpoint": "Lightricks/LTX-2.5 ltx-2.5-22b-dev two-stage (30+3 steps)",
+      "runtime": "ltx-pipelines",
+      "modes": [
+        "text_to_video",
+        "image_to_video",
+        "last_frame",
+        "first_last_frame",
+        "keyframes",
+        "retake",
+        "audio_to_video"
+      ],
+      "limits": {
+        "min_duration_s": 2,
+        "max_duration_s": 20,
+        "duration_step_s": 1,
+        "sizes": {
+          "720p": {
+            "16:9": [
+              1280,
+              704
+            ],
+            "9:16": [
+              704,
+              1280
+            ],
+            "4:3": [
+              960,
+              704
+            ],
+            "3:4": [
+              704,
+              960
+            ],
+            "1:1": [
+              960,
+              960
+            ],
+            "21:9": [
+              1664,
+              704
+            ]
+          },
+          "1080p": {
+            "16:9": [
+              1920,
+              1088
+            ],
+            "9:16": [
+              1088,
+              1920
+            ],
+            "4:3": [
+              1472,
+              1088
+            ],
+            "3:4": [
+              1088,
+              1472
+            ],
+            "1:1": [
+              1088,
+              1088
+            ],
+            "21:9": [
+              2560,
+              1088
+            ]
+          }
+        },
+        "fps": [
+          24,
+          25,
+          48,
+          50
+        ],
+        "default_fps": 24,
+        "audio": true,
+        "max_inputs": {
+          "first_frame": 1,
+          "last_frame": 1,
+          "keyframe": 8,
+          "source_video": 1,
+          "source_audio": 1
+        },
+        "max_prompt_chars": 4000,
+        "negative_prompt": true,
+        "prompt_enhancer": true
+      },
+      "hardware_class": "C2",
+      "gpus_per_worker": 1,
+      "steps": 33,
+      "license": {
+        "name": "LTX-2 Community License",
+        "url": "https://huggingface.co/Lightricks/LTX-2/blob/main/LICENSE",
+        "attribution": null,
+        "region_policy": null
+      },
+      "pricing": {
+        "usd_per_second": {
+          "720p": 0.04,
+          "1080p": 0.07
+        }
+      },
+      "vcu_per_output_second": 15
+    },
+    {
+      "id": "ltx-2.5-4k",
+      "family": "ltx-2.5",
+      "name": "LTX-2.5 4K",
+      "tagline": "Production-grade 4K with detail refinement",
+      "variant": "dfr",
+      "checkpoint": "Lightricks/LTX-2.5 DFR pipeline (distilled + pixel detailing IC-LoRA)",
+      "runtime": "ltx-pipelines",
+      "modes": [
+        "text_to_video",
+        "image_to_video",
+        "keyframes"
+      ],
+      "limits": {
+        "min_duration_s": 2,
+        "max_duration_s": 10,
+        "duration_step_s": 1,
+        "sizes": {
+          "1440p": {
+            "16:9": [
+              2560,
+              1408
+            ],
+            "9:16": [
+              1408,
+              2560
+            ]
+          },
+          "2160p": {
+            "16:9": [
+              3840,
+              2176
+            ],
+            "9:16": [
+              2176,
+              3840
+            ]
+          }
+        },
+        "fps": [
+          24,
+          25,
+          48,
+          50
+        ],
+        "default_fps": 24,
+        "audio": true,
+        "max_inputs": {
+          "first_frame": 1,
+          "keyframe": 8
+        },
+        "max_prompt_chars": 4000,
+        "negative_prompt": false,
+        "prompt_enhancer": true
+      },
+      "hardware_class": "C2",
+      "gpus_per_worker": 1,
+      "steps": 11,
+      "license": {
+        "name": "LTX-2 Community License",
+        "url": "https://huggingface.co/Lightricks/LTX-2/blob/main/LICENSE",
+        "attribution": null,
+        "region_policy": null
+      },
+      "pricing": {
+        "usd_per_second": {
+          "1440p": 0.12,
+          "2160p": 0.2
+        }
+      },
+      "vcu_per_output_second": 40,
+      "timeout_s": 3600
+    }
+  ]
+}

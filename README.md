@@ -1,0 +1,61 @@
+# KunoWorld subnet
+
+Public code for the KunoWorld Bittensor subnet: the protocol, the miner worker that runs
+inside a confidential VM, and the validator. The byte-level spec is in
+[../docs/protocol.md](../docs/protocol.md).
+
+## For miners
+
+You provide GPU servers. KunoWorld provides the exact image they run; you never see
+customer prompts, media or videos, and the network can prove the image is unmodified.
+
+**Hardware classes**
+
+| Class | GPUs | Serves |
+|---|---|---|
+| C1 | 1× RTX PRO 6000 Blackwell Server Edition (96 GB) | LTX-2.5 Fast |
+| C2 | 1× H200 (141 GB) | LTX-2.5 Pro, LTX-2.5 4K |
+| C4 | 4× H100/H200 (HGX, protected PCIe) | MiniMax H3, H3 Turbo, H3 Director |
+| C8 | 8× B200/B300 (HGX, encrypted NVLink) | H3 fast path, future flagship profiles |
+
+Required: Intel Xeon 5th gen (Emerald Rapids) or Xeon 6 (Granite Rapids) with TDX enabled,
+NVIDIA GPUs in confidential-computing mode, bare-metal BIOS access or a supported cloud
+confidential VM. Consumer GPUs (RTX 4090/5090) have no confidential mode and cannot join.
+
+**How the worker behaves** (`subnet/worker`)
+- Generates its HPKE and Ed25519 keys in memory at boot; they never leave the VM.
+- Attests with a fresh gateway nonce, then re-attests every 10 minutes and answers
+  validator challenges at any time.
+- Only makes outbound connections; the VM exposes no ports.
+- Rejects replayed jobs, tampered requests and mismatched inputs, runs the in-enclave
+  safety gate, and never logs content.
+
+Local development with a simulated TEE:
+
+```bash
+uv run kuno-devkit init --data data
+KUNO_DATA_DIR=data uv run kuno-worker --profiles ltx-2.5-fast,h3-turbo
+```
+
+Production (`KUNO_TEE=tdx`, `KUNO_BACKEND=real`) runs inside the published CVM image with the
+official SGLang (H3) and `ltx_pipelines` (LTX-2.5) runtimes. The image, its golden
+measurements and the TDX/NVIDIA verifiers are not released yet.
+
+## For validators
+
+Each round the validator:
+1. challenges every active enclave with its own nonce and verifies the answer itself;
+2. sends canary jobs through the normal encrypted path (indistinguishable from customer jobs)
+   and checks that the requested model served them and the output matches the request;
+3. scores miners from the public receipt ledger: verified video compute units per model
+   family, split by the owner-signed switch, gated on a live attestation and on reliability
+   (≥ 98% success once a miner has 20 finished jobs in the window);
+4. sets weights (never to the owner hotkey or a burn UID — burned miner emission cuts the
+   subnet's TAO emission share).
+
+```bash
+KUNO_DATA_DIR=data uv run kuno-validator once --canary h3-turbo --canary ltx-2.5-fast
+uv run --extra chain kuno-validator run --netuid <netuid> --wallet-name <name> --wallet-hotkey <hotkey>
+```
+
+Validators must send H3 canaries from a region where the H3 license applies.

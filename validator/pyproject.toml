@@ -1,0 +1,23 @@
+[project]
+name = "kuno-validator"
+version = "0.1.0"
+description = "KunoWorld validator: attestation challenges, canary jobs, scoring and weight setting"
+requires-python = ">=3.10"
+dependencies = [
+    "kuno-protocol",
+    "kunoworld",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+chain = ["bittensor>=11"]
+
+[project.scripts]
+kuno-validator = "kuno_validator.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kuno_validator"]
