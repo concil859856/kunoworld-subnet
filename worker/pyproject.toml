@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 kuno-worker = "kuno_worker.main:main"
+kuno-plan = "kuno_worker.plan:main"
 
 [build-system]
 requires = ["hatchling"]
