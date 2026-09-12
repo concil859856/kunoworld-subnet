@@ -28,6 +28,7 @@ def main() -> None:
     parser.add_argument("--wallet-name", default="default")
     parser.add_argument("--wallet-hotkey", default="default")
     parser.add_argument("--network", default="finney")
+    parser.add_argument("--dry-run", action="store_true", help="resolve hotkeys to UIDs and print the vector without submitting")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -42,7 +43,10 @@ def main() -> None:
         if args.netuid is not None:
             from .chain import set_weights
 
-            set_weights(weights, args.netuid, args.wallet_name, args.wallet_hotkey, args.network)
+            outcome = set_weights(
+                weights, args.netuid, args.wallet_name, args.wallet_hotkey, args.network, dry_run=args.dry_run
+            )
+            print(json.dumps(outcome, indent=2, default=str))
         if args.command == "once":
             break
         time.sleep(args.interval)

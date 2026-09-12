@@ -1,8 +1,12 @@
 # KunoWorld subnet
 
 Public code for the KunoWorld Bittensor subnet: the protocol, the miner worker that runs
-inside a confidential VM, and the validator. The byte-level spec is in
-[../docs/protocol.md](../docs/protocol.md).
+inside a confidential VM, and the validator.
+
+- [PROTOCOL.md](PROTOCOL.md) — the byte-level wire spec every implementation must match
+- [MINING.md](MINING.md) — running a miner: what to rent, weights, dev network, mainnet
+- [VALIDATING.md](VALIDATING.md) — running a validator: attestation, canaries, scoring, weights
+- [SECURITY.md](SECURITY.md) — what the enclave protects, what it does not, how to report a flaw
 
 ## For miners
 
