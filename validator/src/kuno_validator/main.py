@@ -7,8 +7,8 @@ import os
 import time
 from pathlib import Path
 
-from kuno_protocol.attestation import GoldenManifest
 from kuno_protocol.canonical import b64d
+from kuno_protocol.policy import policy_from_env
 
 from .validator import Validator
 
@@ -46,7 +46,10 @@ def main() -> None:
     owner = env.get("KUNO_OWNER_PUBLIC_KEY")
     if not owner and args.netuid is not None and not args.dry_run and not args.allow_unsigned_switch:
         parser.error("refusing to set weights without KUNO_OWNER_PUBLIC_KEY (pass --allow-unsigned-switch to override)")
-    manifest = GoldenManifest.model_validate_json(Path(env["KUNO_MANIFEST"]).read_text())
+    # KUNO_ATTESTATION=production refuses to start without Intel DCAP and NVIDIA verifiers and an
+    # owner-signed manifest, exactly as the gateway does.
+    policy = policy_from_env(env)
+    manifest = policy.load_manifest(env.get("KUNO_SIGNED_MANIFEST") or env["KUNO_MANIFEST"])
     state_path = Path(env.get("KUNO_VALIDATOR_STATE", data_dir / "validator-state.json"))
     validator = Validator(
         env.get("KUNO_GATEWAY_URL", "http://127.0.0.1:8080"),
@@ -54,6 +57,7 @@ def main() -> None:
         manifest,
         b64d(owner) if owner else None,
         state_path=state_path,
+        policy=policy,
     )
 
     while True:

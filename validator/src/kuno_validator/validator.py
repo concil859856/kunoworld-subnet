@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 
-from kuno_protocol.attestation import AttestationEvidence, GoldenManifest, Verdict, verify_evidence
+from kuno_protocol.attestation import AttestationEvidence, AttestationPolicy, GoldenManifest, Verdict
 from kuno_protocol.canonical import sha256_hex
 from kuno_protocol.mp4 import Mp4Error, probe
 from kuno_protocol.profiles import ModelProfile, load_profiles
@@ -60,11 +60,14 @@ class Validator:
         transport: httpx.BaseTransport | None = None,
         country: str | None = None,
         state_path: Path | None = None,
+        policy: AttestationPolicy | None = None,
     ):
         if not api_key:
             raise ValueError("a validator API key is required: the gateway authenticates every validator read")
         self.gateway_url = gateway_url.rstrip("/")
         self.manifest = manifest
+        # The same policy the gateway runs: real TDX and GPU verifiers, and production's stricter rules.
+        self.policy = policy or AttestationPolicy()
         self.owner_public_key = owner_public_key
         self.profiles = load_profiles()
         self._http = httpx.Client(
@@ -175,7 +178,7 @@ class Validator:
                 answer = self._request("GET", f"/validator/v1/challenges/{challenge_id}").json()
                 if answer["status"] == "answered" and answer["evidence"]:
                     evidence = AttestationEvidence.model_validate(answer["evidence"])
-                    verdict = verify_evidence(evidence, self.manifest, expected_nonce=nonce)
+                    verdict = self.policy.verify(evidence, self.manifest, expected_nonce=nonce)
                     if verdict.enclave_id != enclave["enclave_id"]:
                         verdict.ok = False
                         verdict.reasons.append("answered with different keys than the registered enclave")
