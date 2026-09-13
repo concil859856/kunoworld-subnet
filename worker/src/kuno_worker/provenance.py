@@ -36,13 +36,15 @@ the receipt format and break every existing lookup by plain SHA-256.
 
 Certificates
 ------------
-`issue_dev_certificate` creates a throwaway root CA and a leaf for the enclave key.
-Readers report such a file as `Valid` (signature and hashes check out) with the status
-`signingCredential.untrusted`: it proves integrity and key possession, not identity.
-Production needs a certificate chain to a CA on the C2PA trust list. The intended
-design: the enclave sends `certificate_signing_request()` to a KunoWorld issuing CA
-that checks the enclave's attestation first; the CA's root is submitted to the C2PA
-trust list. Neither the issuing service nor trust-list membership exists yet.
+After each attestation the worker sends `certificate_signing_request()` to the gateway's
+issuing CA, which signs a short-lived leaf only for a freshly attested enclave's own key
+(worker.py `_refresh_certificate`, gateway `ca.py`). Readers given the KunoWorld root from
+`GET /v1/c2pa/trust` as a trust anchor report such a file as `Trusted`. See subnet/PROVENANCE.md.
+
+`issue_dev_certificate` creates a throwaway root CA and a leaf for the enclave key; a
+mock-TEE worker uses it only when the gateway has no CA. Readers report such a file as
+`Valid` with the status `signingCredential.untrusted`: integrity and key possession, not
+identity. The KunoWorld root is not on the C2PA Trust List yet.
 """
 
 from __future__ import annotations

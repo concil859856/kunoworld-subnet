@@ -11,22 +11,29 @@ The gate is a pipeline:
      involving minors;
   2. a pluggable prompt classifier (recommended: Qwen3Guard-Gen-0.6B, Apache-2.0,
      loaded from a local path, CPU only; see `Qwen3GuardClassifier`);
-  3. an optional classifier over frames sampled from the finished video.
+  3. frame classifiers over frames sampled from the finished video, before it is sealed
+     (sexual content, and apparent minors; see `safety_frames`).
 
-Contract with worker.py (unchanged): `check_request(prompt, negative_prompt)` returns
-None or raises `SafetyViolation`, which the worker reports as `safety_blocked`. When a
-configured classifier cannot give an answer, the gate raises `SafetyUnavailable`
-instead — not a SafetyViolation — so the job fails closed as the miner's
-`internal_error` rather than being blamed on the customer.
+Contract with worker.py: `check_request(prompt, negative_prompt)` returns None or raises
+`SafetyViolation`, which the worker reports as `safety_blocked`; `check_output(video, signals)`
+does the same for the rendered MP4. When a configured classifier cannot give an answer, the
+gate raises `SafetyUnavailable` instead — not a SafetyViolation — so the job fails closed as
+the miner's `internal_error` rather than being blamed on the customer.
 
-Nothing here may put prompt text into logs, exception messages or tracebacks.
+Nothing here may put prompt text or frames into logs, exception messages or tracebacks.
 
 Configuration (environment, read once):
   KUNO_SAFETY_CLASSIFIER           qwen3guard | sequence | none      (unset: blocklist only, logged as an error)
   KUNO_SAFETY_MODEL_PATH           local directory with the classifier weights (never downloaded)
-  KUNO_SAFETY_REQUIRE_CLASSIFIER   1 to refuse every request when no classifier is configured
+  KUNO_SAFETY_REQUIRE_CLASSIFIER   1 to refuse to start without a working prompt classifier and frame classifier
   KUNO_SAFETY_THRESHOLDS           JSON {category: score} overriding DEFAULT_THRESHOLDS
   KUNO_SAFETY_LABEL_MAP            JSON {model label: category} for the `sequence` adapter
+  KUNO_SAFETY_FRAME_MODEL_PATH     sexual-content image classifier directory (unset: outputs unchecked, logged as an error)
+  KUNO_SAFETY_MINOR_MODEL_PATH     CLIP directory for apparent-minor presence (unset: minors assumed in every frame)
+  KUNO_SAFETY_FRAMES               frames sampled per video, first and last included (default 10)
+  KUNO_SAFETY_ALLOW_NSFW           1 to allow explicit adult content; sexual content with apparent minors always blocks
+  KUNO_SAFETY_FRAME_THRESHOLDS     JSON overriding FramePolicy thresholds: sexual, minor, minor_sexual, minor_suggestive
+  KUNO_SAFETY_FRAME_LABEL_MAP, KUNO_SAFETY_FRAME_DTYPE, KUNO_SAFETY_THREADS   see safety_frames.load_frame_models
 """
 
 from __future__ import annotations
@@ -35,14 +42,14 @@ import json
 import logging
 import os
 import re
-import subprocess
-import tempfile
 import threading
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+
+from .safety_frames import POLICY_CATEGORIES, FramePolicy, RequestSignals, load_frame_models, sample_frames
 
 log = logging.getLogger("kuno.worker.safety")
 
@@ -64,6 +71,10 @@ class SafetyUnavailable(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("content safety classifier unavailable")
+
+
+class SafetyConfigError(ValueError):
+    """The safety configuration forbids starting (e.g. a required classifier is missing)."""
 
 
 # ---------------------------------------------------------------- stage 1: normalized blocklist
@@ -213,6 +224,10 @@ class Blocklist:
         # A negative prompt steers away from what it lists: "clothing" there pushes toward nudity.
         if self._hits(negative, self.clothing):
             raise SafetyViolation("sexual_minors")
+
+    def mentions_minor(self, prompt: str) -> bool:
+        """True when the prompt (not the negative prompt, which lists what to avoid) names a minor."""
+        return bool(self._hits(normalize_tokens(prompt), self.minor))
 
 
 # ---------------------------------------------------------------- stage 2: prompt classifier
@@ -364,28 +379,74 @@ class SafetyGate:
     require_classifier: bool = False
     # Set when a classifier was configured but failed to load: the gate then fails closed.
     unavailable: bool = False
-    frames_to_sample: int = 8
+    # Per-frame scorers (`safety_frames.FrameScorer`); `frame_classifier` above is the older
+    # whole-clip interface and is checked too.
+    frame_classifiers: list[Any] = field(default_factory=list)
+    frame_policy: FramePolicy = field(default_factory=FramePolicy)
+    # Set when frame models were configured but failed to load.
+    frame_unavailable: bool = False
+    frames_to_sample: int = 10
 
     def check_request(self, prompt: str, negative_prompt: str | None = None) -> None:
         self.blocklist.check(prompt, negative_prompt)
-        if self.unavailable or (self.classifier is None and self.require_classifier):
+        # Refuse before spending GPU time on a video the output stage could not judge.
+        if self.unavailable or self.frame_unavailable:
+            raise SafetyUnavailable()
+        if self.require_classifier and (self.classifier is None or not self._frame_models()):
             raise SafetyUnavailable()
         if self.classifier is None:
             return
         # Negative prompts list what to avoid, so a classifier would misread them; stage 1 covers them.
         self._judge(self._score(self.classifier.classify, prompt))
 
-    def check_output(self, video: bytes) -> None:
-        """Optional output stage: classifies frames sampled from the finished MP4."""
-        if self.frame_classifier is None:
+    def request_signals(self, prompt: str, negative_prompt: str | None = None) -> RequestSignals:
+        """Booleans the output stage uses to err toward blocking. Carries no prompt text."""
+        return RequestSignals(mentions_minor=self.blocklist.mentions_minor(prompt))
+
+    def check_output(self, video: bytes, signals: RequestSignals | None = None) -> None:
+        """Classifies frames sampled from the finished MP4, before it is sealed or signed."""
+        models = self._frame_models()
+        if self.frame_unavailable or (self.require_classifier and not models):
+            raise SafetyUnavailable()
+        if not models:
             return
+        size = max(int(getattr(model, "input_size", 224)) for model in models)
         try:
-            frames = sample_frames(video, self.frames_to_sample)
-        except Exception:
+            frames = sample_frames(video, self.frames_to_sample, size)
+        except Exception as exc:  # ffmpeg's stderr is not echoed; keep only the type
+            log.error("sampling frames for the safety check failed with %s; failing closed", type(exc).__name__)
             raise SafetyUnavailable() from None
         if not frames:
             raise SafetyUnavailable()
-        self._judge(self._score(self.frame_classifier.classify_frames, frames))
+        rows: list[Mapping[str, float]] = []
+        for model in models:
+            rows.extend(self._score(lambda f, m=model: self._frame_rows(m, f), frames))
+        try:
+            category = self.frame_policy.decide(rows, signals)
+        except ValueError:
+            log.error("a frame classifier returned an invalid score; failing closed")
+            raise SafetyUnavailable() from None
+        if category is not None:
+            raise SafetyViolation(category)
+        # Any other category a frame model reports goes through the ordinary thresholds.
+        others: dict[str, float] = {}
+        for row in rows:
+            for key, value in row.items():
+                if key not in POLICY_CATEGORIES:
+                    others[key] = max(others.get(key, 0.0), value)
+        self._judge(others)
+
+    def _frame_models(self) -> list[Any]:
+        return ([self.frame_classifier] if self.frame_classifier is not None else []) + list(self.frame_classifiers)
+
+    @staticmethod
+    def _frame_rows(model: Any, frames: Sequence[Any]) -> list[Mapping[str, float]]:
+        if hasattr(model, "score_frames"):
+            rows = list(model.score_frames(frames))
+            if len(rows) != len(frames):  # a dropped frame would go unexamined
+                raise ValueError("frame scorer returned the wrong number of rows")
+            return rows
+        return [model.classify_frames(frames)]
 
     @staticmethod
     def _score(fn, arg) -> Mapping[str, float]:
@@ -409,7 +470,22 @@ class SafetyGate:
             "classifier_unavailable": self.unavailable,
             "require_classifier": self.require_classifier,
             "frame_classifier": getattr(self.frame_classifier, "name", None),
+            "frame_classifiers": [getattr(m, "name", type(m).__name__) for m in self.frame_classifiers],
+            "frame_classifier_unavailable": self.frame_unavailable,
+            "frames_to_sample": self.frames_to_sample,
+            "allow_nsfw": self.frame_policy.allow_explicit,
         }
+
+    def startup_errors(self) -> list[str]:
+        """Reasons this gate must not serve at all. Only KUNO_SAFETY_REQUIRE_CLASSIFIER produces any."""
+        if not self.require_classifier:
+            return []
+        errors = []
+        if self.classifier is None or self.unavailable:
+            errors.append("KUNO_SAFETY_REQUIRE_CLASSIFIER is set but no prompt classifier loaded (KUNO_SAFETY_CLASSIFIER)")
+        if not self._frame_models() or self.frame_unavailable:
+            errors.append("KUNO_SAFETY_REQUIRE_CLASSIFIER is set but no frame classifier loaded (KUNO_SAFETY_FRAME_MODEL_PATH)")
+        return errors
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> SafetyGate:
@@ -418,6 +494,8 @@ class SafetyGate:
         gate = cls(require_classifier=env.get("KUNO_SAFETY_REQUIRE_CLASSIFIER", "") in ("1", "true", "yes"))
         if env.get("KUNO_SAFETY_THRESHOLDS"):
             gate.thresholds = {**DEFAULT_THRESHOLDS, **json.loads(env["KUNO_SAFETY_THRESHOLDS"])}
+        # An explicit KUNO_SAFETY_CLASSIFIER=none is a deliberate opt-out: stay quiet about missing frame models too.
+        gate._load_frames(env, quiet=kind == "none")
         if kind in ("", "none"):
             if not kind:
                 log.error("KUNO_SAFETY_CLASSIFIER is not set: only the blocklist protects this worker")
@@ -440,28 +518,23 @@ class SafetyGate:
             gate.unavailable = True
         return gate
 
-
-def sample_frames(video: bytes, count: int, size: int = 224) -> list[Any]:
-    """Evenly spaced RGB frames, scaled to size x size, decoded with ffmpeg inside the enclave."""
-    import numpy as np  # noqa: PLC0415
-
-    from kuno_protocol.mp4 import probe  # noqa: PLC0415
-
-    from .backends.media_tools import ffmpeg_exe  # noqa: PLC0415
-
-    duration = max(probe(video).duration_s, 0.001)
-    with tempfile.TemporaryDirectory(prefix="kuno-safety-") as tmp:
-        source = Path(tmp) / "in.mp4"
-        source.write_bytes(video)
-        result = subprocess.run(
-            [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(source), "-vf",
-             f"fps={count / duration:.6f},scale={size}:{size}", "-frames:v", str(count),
-             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-            check=True, capture_output=True, timeout=120,
-        )
-    frame_bytes = size * size * 3
-    raw = result.stdout
-    return [np.frombuffer(raw[i : i + frame_bytes], dtype=np.uint8).reshape(size, size, 3) for i in range(0, len(raw) - frame_bytes + 1, frame_bytes)]
+    def _load_frames(self, env: Mapping[str, str], quiet: bool = False) -> None:
+        """Frame policy and models. Malformed settings raise ValueError; models that fail to load fail closed."""
+        self.frame_policy = FramePolicy.from_env(env)
+        self.frames_to_sample = int(env.get("KUNO_SAFETY_FRAMES", "10"))
+        if self.frames_to_sample < 2:
+            raise ValueError("KUNO_SAFETY_FRAMES must be at least 2 (the first and last frame)")
+        try:
+            models, warnings = load_frame_models(env)
+        except Exception as exc:  # loading sees no customer content, so the message is safe to print
+            log.error("frame safety classifier failed to load (%s: %s); refusing all requests", type(exc).__name__, exc)
+            self.frame_unavailable = True
+            return
+        if not models and not quiet:
+            log.error("KUNO_SAFETY_FRAME_MODEL_PATH is not set: finished videos are not checked before delivery")
+        for warning in warnings:
+            log.error("%s", warning)
+        self.frame_classifiers = list(models)
 
 
 # ---------------------------------------------------------------- module interface used by worker.py
@@ -471,11 +544,18 @@ _lock = threading.Lock()
 
 
 def default_gate() -> SafetyGate:
-    """The process-wide gate, built from the environment on first use (call early to load models at startup)."""
+    """The process-wide gate, built from the environment on first use (call early to load models at startup).
+
+    Raises SafetyConfigError (a ValueError, so kuno-worker exits) when the configuration forbids serving.
+    """
     global _gate
     with _lock:
         if _gate is None:
-            _gate = SafetyGate.from_env()
+            gate = SafetyGate.from_env()
+            errors = gate.startup_errors()
+            if errors:
+                raise SafetyConfigError("; ".join(errors))
+            _gate = gate
         return _gate
 
 
@@ -490,5 +570,9 @@ def check_request(prompt: str, negative_prompt: str | None = None) -> None:
     default_gate().check_request(prompt, negative_prompt)
 
 
-def check_output(video: bytes) -> None:
-    default_gate().check_output(video)
+def request_signals(prompt: str, negative_prompt: str | None = None) -> RequestSignals:
+    return default_gate().request_signals(prompt, negative_prompt)
+
+
+def check_output(video: bytes, signals: RequestSignals | None = None) -> None:
+    default_gate().check_output(video, signals)

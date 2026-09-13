@@ -8,12 +8,13 @@ came from.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_serializer
 
 from .canonical import b64d, b64e, canonical_json, sha256_hex
 from .crypto import verify_signature
+from .verified import StepCommitment
 
 
 class VideoInfo(BaseModel):
@@ -44,6 +45,17 @@ class ReceiptBody(BaseModel):
     gpu_seconds: float
     video: VideoInfo
     miner_hotkey: str | None = None
+    # Verified mode (see VERIFIED_MODE.md): the Merkle root over per-step latents, signed with
+    # the rest of the body. When absent the key is left out of every encoding, so a receipt
+    # without it serializes, and therefore signs and verifies, exactly as before it existed.
+    step_commitment: StepCommitment | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_commitment(self, handler) -> dict[str, Any]:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("step_commitment") is None:
+            data.pop("step_commitment", None)
+        return data
 
 
 class Receipt(BaseModel):

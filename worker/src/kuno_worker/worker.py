@@ -19,12 +19,14 @@ from kuno_protocol.media import ROLE_TYPES, sniff_mime
 from kuno_protocol.profiles import ModelProfile, ParamError, load_profiles, validate_params
 from kuno_protocol.receipts import Receipt, ReceiptBody, input_digest, sign_receipt
 from kuno_protocol.schemas import MinerChallenge, MinerJob, SealedPayload, input_label, job_aad, output_label
+from kuno_protocol.verified import MinerAudit
 
+from .audits import AuditCalls, AuditResponder
 from .backends.base import Backend, GenerationTask, InputFile
 from .config import WorkerConfig
 from .gateway_client import GatewayClient, GatewayError
 from .identity import EnclaveIdentity
-from .safety import SafetyViolation, check_request
+from .safety import SafetyUnavailable, SafetyViolation, check_output, check_request, request_signals
 
 log = logging.getLogger("kuno.worker")
 
@@ -39,6 +41,14 @@ class JobRejected(Exception):
 
 class JobCanceled(Exception):
     pass
+
+
+class CertificateUnavailable(Exception):
+    """C2PA is on but the gateway issued no usable signing certificate; registration is retried."""
+
+
+class MissingTimestampAuthority(ValueError):
+    """A real enclave was given a certificate but no RFC 3161 timestamp authority to sign with."""
 
 
 class Worker:
@@ -61,6 +71,7 @@ class Worker:
         self.miner_hotkey = hotkey.ss58_address if hotkey is not None else config.miner_hotkey
         self.failures = 0
         self.config = config
+        self.turbo_submission = self._load_turbo_submission()
         self.tee = tee
         self.backends = backends
         self.profiles: dict[str, ModelProfile] = {p: catalog[p] for p in config.profiles}
@@ -75,6 +86,9 @@ class Worker:
         self.busy = False
         self._seen: set[str] = set()
         self._last_progress: dict[str, float] = {}
+        # Verified mode: retained step openings per job, discarded if the job fails after generation.
+        self._openings: dict[str, object] = {}
+        self.audits = AuditResponder(self.identity)
 
     # ------------------------------------------------------------ attestation
 
@@ -101,11 +115,94 @@ class Worker:
         proof = None
         if self.hotkey is not None:
             proof = sign_hotkey_proof(self.hotkey, nonce, self.identity.enclave_id, self.identity.signing_public)
-        self.client.register(evidence, self.miner_hotkey, self.config.capacity, proof)
+        if self.turbo_submission is None:
+            self.client.register(evidence, self.miner_hotkey, self.config.capacity, proof)
+        else:
+            self.client.register(evidence, self.miner_hotkey, self.config.capacity, proof, turbo_submission=self.turbo_submission)
         self.evidence = evidence
         self.last_attested = time.time()
+        self._refresh_certificate()
         self.ready.set()
         log.info("attested enclave %s for %s", self.identity.enclave_id, ", ".join(self.profiles))
+
+    # ------------------------------------------------------------ C2PA certificate
+
+    def _certificate_margin_s(self) -> float:
+        # Checked only at (re-)attestation, which a long job can delay: leave room for two missed rounds.
+        return 2 * self.config.reattest_s + self.config.pull_wait_s
+
+    def _refresh_certificate(self) -> None:
+        """Right after each successful (re-)attestation, while the gateway's verification is fresh:
+        obtain a gateway-issued C2PA certificate if there is none, it is a stand-in, or it is due."""
+        from .certificates import DEV, GATEWAY, CertifiedSigner, EnclaveCertificate
+        from .provenance import certificate_signing_request
+
+        signer = self._provenance_signer
+        if not isinstance(signer, CertifiedSigner):
+            return  # provenance off, or an operator-supplied certificate chain
+        now = time.time()
+        current = signer.certificate
+        if current is not None and current.source == GATEWAY and now < current.refresh_at(self._certificate_margin_s()):
+            return
+        try:
+            csr = certificate_signing_request(self.identity.signing_key, self.identity.enclave_id)
+            response = self.client.request_certificate(csr)
+            issued = EnclaveCertificate.parse(
+                response["certificate_chain_pem"], self.identity.signing_public, self.identity.enclave_id, GATEWAY
+            )
+            if not issued.usable(now + 1):
+                raise ValueError("the gateway issued a certificate that is not currently valid")
+        except GatewayError as exc:
+            no_ca = exc.status == 503 and exc.code == "ca_unavailable"
+            if no_ca and self.config.tee == "mock":
+                if current is not None and current.source == GATEWAY and current.usable(now):
+                    return  # keep a real certificate until it runs out
+                if current is None or current.source != DEV:
+                    self._install_dev_certificate(signer, DEV)
+                    log.warning("the gateway has no C2PA CA; this mock-TEE worker signs provenance with an untrusted dev certificate")
+                return
+            self._certificate_unavailable(signer, current, now, exc)
+            return
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            self._certificate_unavailable(signer, current, now, exc)
+            return
+        tsa_url = signer.configured_tsa_url or response.get("tsa_url")
+        if tsa_url is None and self.config.tee != "mock":
+            # Without a timestamp, readers reject every manifest once the short-lived certificate expires,
+            # so a customer's video would stop verifying a day after delivery. Refuse instead.
+            self._certificate_unavailable(
+                signer, current, now,
+                MissingTimestampAuthority("no RFC 3161 timestamp authority: set KUNO_PROVENANCE_TSA_URL or the gateway's KUNO_C2PA_TSA_URL"),
+            )
+            return
+        signer.install(issued, response.get("tsa_url"))
+        log.info("C2PA certificate issued for enclave %s, valid until %s", self.identity.enclave_id,
+                 time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(issued.not_after)))
+
+    def _certificate_unavailable(self, signer, current, now: float, exc: Exception) -> None:
+        """Keep a still-valid certificate through a failed renewal; without one, stop taking jobs."""
+        from .certificates import PROVISIONAL
+
+        if isinstance(exc, GatewayError):
+            reason = exc.message
+        elif isinstance(exc, MissingTimestampAuthority):
+            reason = str(exc)
+        else:
+            reason = type(exc).__name__
+        if current is not None and current.source != PROVISIONAL and current.usable(now):
+            log.warning("could not renew the C2PA certificate (%s); the current one stays valid for %.0fs", reason, current.not_after - now)
+            return
+        signer.install(None)
+        self.ready.clear()
+        log.error("no C2PA signing certificate (%s): this worker takes no jobs until the gateway issues one", reason)
+        raise CertificateUnavailable(f"no C2PA signing certificate: {reason}") from exc
+
+    def _install_dev_certificate(self, signer, source: str) -> None:
+        from .certificates import EnclaveCertificate
+        from .provenance import issue_dev_certificate
+
+        chain, _root = issue_dev_certificate(self.identity.signing_key, self.identity.enclave_id)
+        signer.install(EnclaveCertificate.parse(chain, self.identity.signing_public, self.identity.enclave_id, source))
 
     # ------------------------------------------------------------ main loop
 
@@ -136,6 +233,8 @@ class Worker:
                     self.handle_job(MinerJob.model_validate(work))
                 elif kind == "challenge":
                     self.handle_challenge(MinerChallenge.model_validate(work))
+                elif kind == "audit":
+                    self.audits.handle(MinerAudit.model_validate(work), AuditCalls(self.client))
             except ValidationError:
                 log.error("the gateway sent a malformed %s; ignoring it", kind)
 
@@ -184,9 +283,32 @@ class Worker:
         except (httpx.HTTPError, GatewayError) as exc:
             log.warning("could not retire cleanly (%s); the gateway will notice within a minute", type(exc).__name__)
 
+    def _load_turbo_submission(self) -> dict | None:
+        """The signed submission this worker competes with, checked against its own hotkey and image."""
+        path = self.config.turbo_submission
+        if path is None:
+            return None
+        from kuno_protocol.turbo import SignedTurboSubmission, verify_submission
+
+        signed = SignedTurboSubmission.model_validate_json(path.read_text())
+        ok, detail = verify_submission(signed)
+        if not ok:
+            raise ValueError(f"KUNO_TURBO_SUBMISSION does not verify: {detail}")
+        submission = signed.submission
+        if self.miner_hotkey and self.miner_hotkey != submission.hotkey:
+            raise ValueError(f"the Turbo submission is for hotkey {submission.hotkey}, but this worker runs {self.miner_hotkey}")
+        if submission.image_digest != self.config.image_digest:
+            raise ValueError("the Turbo submission names a different image digest than KUNO_IMAGE_DIGEST")
+        self.miner_hotkey = submission.hotkey
+        return signed.model_dump(mode="json")
+
     def handle_challenge(self, challenge: MinerChallenge) -> None:
         try:
-            self.client.answer_challenge(challenge.challenge_id, self.attest(bytes.fromhex(challenge.nonce)))
+            evidence = self.attest(bytes.fromhex(challenge.nonce))
+            if self.turbo_submission is None:
+                self.client.answer_challenge(challenge.challenge_id, evidence)
+            else:
+                self.client.answer_challenge(challenge.challenge_id, evidence, candidate=True)
         except AttestationUnavailable as exc:
             log.error("challenge %s failed: %s", challenge.challenge_id, exc)
         except (httpx.HTTPError, GatewayError, ValueError) as exc:
@@ -197,16 +319,30 @@ class Worker:
         try:
             return self.process(job)
         except JobRejected as exc:
+            self._discard_openings(job.job_id)
             self._fail(job.job_id, exc.code, exc.message)
         except JobCanceled:
+            self._discard_openings(job.job_id)
             log.info("job %s canceled by the customer", job.job_id)
         except Exception as exc:  # never log the message: it may echo request content
+            self._discard_openings(job.job_id)
             log.error("job %s failed with %s", job.job_id, type(exc).__name__)
             self._fail(job.job_id, "internal_error", "Generation failed inside the worker.")
         finally:
+            # A delivered job keeps its openings for the retention window; the store expires them.
+            self._openings.pop(job.job_id, None)
             self._last_progress.pop(job.job_id, None)
             self.busy = False
         return None
+
+    def _discard_openings(self, job_id: str) -> None:
+        handle = self._openings.pop(job_id, None)
+        if handle is None:
+            return
+        try:
+            handle.discard()
+        except Exception as exc:  # never let cleanup mask the job's own failure
+            log.warning("could not discard retained openings for job %s (%s)", job_id, type(exc).__name__)
 
     def _fail(self, job_id: str, code: str, message: str) -> None:
         try:
@@ -258,6 +394,8 @@ class Worker:
             check_request(payload.prompt, payload.negative_prompt)
         except SafetyViolation:
             raise JobRejected("safety_blocked", "The request was blocked by the content policy.") from None
+        # Booleans only (e.g. "the prompt names a minor"); the frame check uses them to err toward blocking.
+        signals = request_signals(payload.prompt, payload.negative_prompt)
 
         width, height = profile.size_for(job.params.resolution, job.params.aspect_ratio)
         task = GenerationTask(
@@ -276,6 +414,17 @@ class Worker:
         result = self.backend_for(profile).generate(
             task, lambda value, stage: self._progress(job.job_id, 0.05 + 0.85 * value, stage)
         )
+        if result.openings is not None:
+            self._openings[job.job_id] = result.openings
+
+        # Judge the rendered frames before anything is signed, sealed or uploaded.
+        self._progress(job.job_id, 0.9, "checking", force=True)
+        try:
+            check_output(result.data, signals)
+        except SafetyViolation:
+            raise JobRejected("safety_blocked", "The video was blocked by the content policy.") from None
+        except SafetyUnavailable:
+            raise JobRejected("internal_error", "The worker could not run its content safety check.") from None
 
         self._progress(job.job_id, 0.92, "sealing", force=True)
         assert self.evidence is not None
@@ -297,6 +446,7 @@ class Worker:
             gpu_seconds=0.0,
             video=result.info,
             miner_hotkey=self.miner_hotkey,
+            step_commitment=result.step_commitment,
         )
         # Provenance goes in before sealing, so the receipt's content digest covers the delivered file.
         final = self._embed_provenance(rendered, draft)
@@ -331,16 +481,19 @@ class Worker:
             return None
         if mode != "c2pa":
             raise ValueError(f"KUNO_PROVENANCE must be 'off' or 'c2pa', not {mode!r}")
-        from .provenance import ProvenanceSigner, _c2pa, issue_dev_certificate
+        from .certificates import PROVISIONAL, CertifiedSigner
+        from .provenance import ProvenanceSigner, _c2pa
 
         _c2pa()  # fail at start-up, not on the first job, when the extra is missing
         if self.config.provenance_cert_chain is not None:
-            chain = self.config.provenance_cert_chain.read_text()
-        else:
-            if self.config.tee != "mock":
-                log.error("no KUNO_PROVENANCE_CERT_CHAIN: C2PA readers will report this worker's videos as untrusted")
-            chain, _root = issue_dev_certificate(self.identity.signing_key, self.identity.enclave_id)
-        return ProvenanceSigner(self.identity.signing_key, chain)
+            return ProvenanceSigner(self.identity.signing_key, self.config.provenance_cert_chain.read_text(), self.config.provenance_tsa_url)
+        # The gateway's CA issues the certificate after each attestation (see _refresh_certificate).
+        signer = CertifiedSigner(self.identity.signing_key, self.config.provenance_tsa_url)
+        if self.config.tee == "mock":
+            # Only reachable before the first registration (jobs arrive after it): the first answer from the
+            # gateway replaces this with an issued certificate, or with a dev one only if the gateway has no CA.
+            self._install_dev_certificate(signer, PROVISIONAL)
+        return signer
 
     def _open_inputs(self, job: MinerJob, payload: SealedPayload, input_key: bytes, blobs: list[bytes]) -> list[InputFile]:
         refs = sorted(payload.inputs, key=lambda r: r.index)

@@ -75,9 +75,39 @@ do. A verifier accepts it only if every GPU reports `measres` success, debug dis
 boot on, a matching report nonce and a verified report signature, and (NRAS) the overall
 result is true for `eat_nonce = hex(gpu_nonce)`.
 
-Development "mock quotes" are `canonical_json({"body": {"tee":"mock","measurements":…,"report_data":hex}, "signature": b64url})`,
+Development "mock quotes" are `canonical_json({"body": {"tee":"mock","measurements":…,"report_data":hex,"platform_id":hex}, "signature": b64url})`,
 signed over `"kuno/v1/mock-quote\n" + canonical_json(body)` with a key listed in the manifest.
+Mock GPU evidence is `canonical_json({"mock_gpu", "nonce", "cc_mode", "gpus": [{"ueid": hex}, …]})`.
 Production manifests list no mock keys, and a production verifier refuses `tee: "mock"` outright.
+
+## Hardware identities
+
+A verdict that passes carries the hardware it proved (`kuno_protocol.hardware`). Identities are
+taken only from evidence that verified. The worker's self-reported `evidence.hardware`
+dictionary is never used for identity.
+
+| kind | TDX + NVIDIA source | mock source |
+|---|---|---|
+| `cpu_platform` | PPID: the 16-byte OCTET STRING at OID `1.2.840.113741.1.13.1.1` in the PCK leaf certificate carried in the quote's certification data (type 6 → type 5 PEM chain). The DCAP verifier has already checked that certificate up to Intel's root. dcap-qvl ≥ 0.6 returns the same value as `VerifiedReport.ppid`. | `body.platform_id` of the signed mock quote |
+| `gpu` | The `ueid` claim of each GPU's EAT: NRAS detached tokens with a verified ES384 signature, or `nvattest` claims | `gpus[].ueid` of mock GPU evidence, which REPORTDATA binds to the quote |
+
+Each raw identifier is published only as a token:
+
+```
+token = "hw1:" + hex(HMAC-SHA256(key = "kuno/v1/hardware-id", kind | "\n" | raw))[:40]
+raw   = PPID bytes | lowercase(strip(ueid)) as UTF-8 | "mock:" + platform_id or ueid
+```
+
+The key is a public protocol constant, so every gateway and validator derives the same token.
+It keeps raw serials out of feeds. It does not stop someone who already holds a serial from
+confirming it.
+
+A verdict also carries `gpu_count`, the number of GPUs the verifier attested (`None` if the
+verifier did not count them). Rules:
+
+- Evidence that lists the same GPU twice is refused.
+- Production verifiers also refuse TDX evidence that yields no PPID, or any attested GPU
+  without a `ueid`.
 
 ## Golden manifest
 
@@ -109,6 +139,57 @@ accepted. The verifier takes `nonce`, `enclave_id` and `signing_public_key` from
 evidence (the nonce is the gateway-issued registration nonce), requires `hotkey` to equal
 `miner_hotkey`, and decodes `hotkey` as an SS58 address with network prefix 42.
 
+The answer is `{"enclave_id", "status": "active", "verified_at", "replaced": [enclave_id, …]}`.
+
+## Hardware registry
+
+The gateway records every verified identity against the enclave and hotkey that showed it
+(`hardware_bindings`: token, enclave, kind, hotkey, first and last seen). An identity is
+*held* only by a **fresh** enclave: status `active`, attested within `enclave_ttl_s`
+(default 1800 s), and polled within `enclave_heartbeat_s` (default 60 s).
+
+Registration, after the evidence verifies:
+
+| Situation | Result |
+|---|---|
+| `capacity × max(gpus_per_worker of the claimed profiles) > gpu_count` | `422 capacity_exceeds_hardware` |
+| `gpu_count` is below the largest `gpus_per_worker` | `422 insufficient_gpus` |
+| Any identity is held by a fresh enclave of a **different** `miner_hotkey` | `409 hardware_in_use` (the other hotkey is not named) |
+| Same hotkey, and the enclaves share a GPU, or share the platform while either side has no GPU identities | The older enclave is marked `stale` and listed in `replaced`. A GPU is in one VM at a time, so this is a restart. |
+| Same hotkey, same platform, disjoint GPUs | Both stay active: one host split into several confidential VMs |
+
+- When `gpu_count` is unknown (a development verifier that only answers yes or no), capacity
+  is not checked.
+- The capacity check assumes any running job may be the largest claimed profile.
+
+At every challenge answer the gateway checks the enclave again:
+
+- **Identities differ from the ones bound at registration:** the enclave is marked `stale`.
+  A running VM cannot change CPU platform or GPUs, so the answer is a relay. The response
+  reason is `hardware identity changed since registration`.
+- **Another hotkey's fresh enclave holds one of the identities:** the enclave is marked
+  `stale`, and the answer gets `409 hardware_in_use`.
+
+**Release.** An enclave stops holding its hardware as soon as it is not fresh. That happens
+when it retires (`POST /miner/v1/retire`), is replaced, fails a challenge, stops polling for
+`enclave_heartbeat_s`, or goes `enclave_ttl_s` without re-attesting. No row changes and nothing
+needs cleaning up. The history stays for audit.
+
+**Moving hardware.**
+- A GPU moved to another machine under the **same** hotkey registers straight away and
+  replaces its old enclave.
+- A GPU or machine handed to a **different** hotkey is refused until the old enclave is no
+  longer fresh. That takes at most `enclave_heartbeat_s` once the old VM is gone, and at most
+  `enclave_ttl_s` while it still polls without valid evidence.
+- Validators apply their own window on top of this (VALIDATING.md, "Hardware dedupe").
+
+**Enclave feed.** `GET /validator/v1/enclaves` adds two fields to each enclave:
+`gpu_count` and `hardware_ids: [{"kind", "token", "first_seen", "last_seen"}]`. `hardware` is
+still published, but it is the worker's unverified self-report.
+
+Multi-process gateways serialize these checks with a per-process lock and, on Postgres,
+transaction-scoped advisory locks keyed by token.
+
 ## Enclave-signed requests
 
 Worker calls after registration carry `X-Kuno-Enclave`, `X-Kuno-Timestamp` (Unix seconds,
@@ -131,3 +212,56 @@ video can look it up at `GET /v1/provenance/{sha256}`.
 The owner signs `"kuno/v1/switch\n" + canonical_json(SwitchConfig)` with Ed25519. Modes: `h3`,
 `ltx`, `both`, `auto`. `issued_at` must increase. Validators read the same signed document to
 split serving emissions between families (`emission_split`).
+
+## Verified mode: step commitments and audit openings
+
+Design, rates and privacy rules: [VERIFIED_MODE.md](VERIFIED_MODE.md). Reference implementation:
+`kuno_protocol/verified.py`. All hashes are SHA-256; integers are big-endian.
+
+```
+latent digest  = H("kuno/v1/latent\n" | u32(len(hdr)) | hdr | tensor bytes, in hdr order)
+  hdr          = canonical_json({"v":1, "byte_order":"little", "order":"C",
+                                 "tensors":[{"name","dtype","shape"}, … sorted by name]})
+  dtype        ∈ float16 | bfloat16 | float32 | float64; bytes little-endian, C order
+leaf           = {"index", "stage", "kind": "init"|"denoise", "sigma": 16 hex digits of the float64, "latent": latent digest}
+leaf hash      = H(0x00 | "kuno/v1/step-leaf\n" | salt (32 bytes) | canonical_json(leaf))
+node hash      = H(0x01 | "kuno/v1/step-node\n" | left | right)
+root           = RFC 9162 §2.1.1 tree hash over the leaf hashes in index order
+transcript     = H("kuno/v1/step-transcript\n" | canonical_json(StepTranscript))
+```
+
+Leaves follow the transcript's stages in order. Each stage contributes one `init` leaf (its initial
+latent) and one `denoise` leaf per step; `sigma` is the value the state has reached, from the
+scheduler as actually run. Step `k` is the transition from leaf `k-1` to leaf `k`. The salt is
+random per job and appears only inside openings.
+
+**Receipt field.** `ReceiptBody.step_commitment` is optional:
+`{"v":1, "mode":"verified", "root", "leaves", "steps", "latent_shape", "dtype", "hardware_class", "transcript_digest"}`,
+integers and strings only. When absent the key is omitted from the body (never `null`), so the
+signed message of a receipt without it is unchanged.
+
+**Audit request** (validator → gateway): `{"job_id", "step", "recipient_public_key": b64url(X25519), "include_leaves"}`.
+**Work item** (gateway → enclave): the same fields plus `"kind":"audit"`, `"audit_id"`, `"expires_at"`.
+
+**Opening.**
+
+```
+plaintext  = "KUNOSTEP1\n" | u32(len(hdr)) | hdr | latent bytes
+  hdr      = canonical_json(StepOpening{v, audit_id, job_id, enclave_id, step, commitment, transcript,
+                                        salt: hex, leaves, proofs: [{index, path: [hex, leaf-most sibling first]}],
+                                        latents: [{index, tensors}]})
+  latent bytes: for each latents record in order, its tensors' bytes sorted by name
+HPKE       = base mode, the job suite, info "kuno/v1/audit-opening", to recipient_public_key
+key        = Export("kuno/v1/audit-opening-key", 32)
+ciphertext = blob format (above) under key, label "<job_id>/audit/<audit_id>/<step>"
+sealed     = {v, audit_id, job_id, enclave_id, step, recipient_public_key, enc, ciphertext, ciphertext_sha256, signature}
+signature  = Ed25519 by the enclave signing key over
+             "kuno/v1/audit-opening\n" | canonical_json(sealed without signature and ciphertext)
+```
+
+An opening reveals leaves 0, `k-1` and `k` (all leaves when `include_leaves`), their inclusion
+proofs, and the latents at `k-1` and `k`. Verifiers take the tree size from the signed commitment,
+never from the opening.
+
+**Audit binding.** A sealed payload may carry `options["kuno_audit_key"] = hex(H("kuno/v1/audit-binding\n" | X25519 public key))`;
+the enclave then opens that job only to that key.

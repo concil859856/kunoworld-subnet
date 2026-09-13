@@ -30,15 +30,24 @@ class WorkerConfig:
     miner_hotkey: str | None = None
     # The hotkey's secret, to prove miner_hotkey (see kuno_worker.hotkey).
     hotkey_seed_file: Path | None = None
+    # A signed Turbo submission (JSON): this worker registers as that competition candidate.
+    turbo_submission: Path | None = None
     wallet_name: str | None = None
     wallet_hotkey: str = "default"
     wallet_path: Path | None = None
     wallet_password_file: Path | None = None
     capacity: int = 1
+    # Verified mode: the pinned hardware class this machine runs (see VERIFIED_MODE.md) and the owner-signed
+    # manifest's weights digest. Unset leaves the resident backends in performance mode.
+    verified_hardware_class: str | None = None
+    model_digest: str | None = None
     # "c2pa" embeds a signed C2PA manifest in every video (needs the provenance extra); "off" doesn't.
     provenance: str = "off"
-    # PEM chain, leaf first, issued for this enclave. Unset issues a throwaway dev certificate.
+    # PEM chain, leaf first, issued for this enclave. Unset: the gateway's CA issues one after each
+    # attestation (a mock-TEE worker falls back to a throwaway certificate when the gateway has no CA).
     provenance_cert_chain: Path | None = None
+    # RFC 3161 timestamp authority for C2PA signatures; overrides the one the gateway suggests.
+    provenance_tsa_url: str | None = None
     reattest_s: float = 600.0
     pull_wait_s: float = 15.0
     # Ceiling for the backoff after attestation or registration failures.
@@ -69,13 +78,17 @@ class WorkerConfig:
             nvattest_bin=env.get("KUNO_NVATTEST_BIN", "nvattest"),
             miner_hotkey=env.get("KUNO_MINER_HOTKEY") or None,
             hotkey_seed_file=_path(env.get("KUNO_HOTKEY_SEED_FILE")),
+            turbo_submission=_path(env.get("KUNO_TURBO_SUBMISSION")),
             wallet_name=env.get("KUNO_WALLET_NAME") or None,
             wallet_hotkey=env.get("KUNO_WALLET_HOTKEY", "default"),
             wallet_path=_path(env.get("KUNO_WALLET_PATH")),
             wallet_password_file=_path(env.get("KUNO_WALLET_PASSWORD_FILE")),
             capacity=int(env.get("KUNO_CAPACITY", "1")),
+            verified_hardware_class=env.get("KUNO_VERIFIED_HARDWARE_CLASS") or None,
+            model_digest=env.get("KUNO_MODEL_DIGEST") or None,
             provenance=env.get("KUNO_PROVENANCE", "off"),
             provenance_cert_chain=_path(env.get("KUNO_PROVENANCE_CERT_CHAIN")),
+            provenance_tsa_url=env.get("KUNO_PROVENANCE_TSA_URL") or None,
             reattest_s=float(env.get("KUNO_REATTEST_S", "600")),
             retry_max_s=float(env.get("KUNO_RETRY_MAX_S", "300")),
             workdir=Path(env.get("KUNO_WORKDIR", "/tmp/kuno-worker")),

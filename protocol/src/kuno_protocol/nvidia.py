@@ -29,6 +29,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Callable, Literal, Protocol
 from urllib.parse import urlparse
@@ -78,6 +80,25 @@ class GpuEvidenceCollector(Protocol):
 
 class GpuVerifierUnavailable(RuntimeError):
     pass
+
+
+@dataclass
+class GpuVerification:
+    """A GPU verifier's full answer. `ueids` holds each attested GPU's `ueid` claim (None where a
+    token carried none), taken only from claims whose signature or local verification succeeded."""
+
+    ok: bool
+    detail: str
+    ueids: list[str | None] = dc_field(default_factory=list)
+
+    @property
+    def gpu_count(self) -> int:
+        return len(self.ueids)
+
+
+def _ueid(claims: dict) -> str | None:
+    value = claims.get("ueid")
+    return str(value).strip() if value not in (None, "") else None
 
 
 class GpuTokenError(ValueError):
@@ -226,15 +247,19 @@ class NrasGpuVerifier:
             return verify_es384_jwt(token, self._keys(refresh=True), self._clock())
 
     def verify(self, evidence: bytes, gpu_nonce: bytes) -> tuple[bool, str]:
+        result = self.verify_devices(evidence, gpu_nonce)
+        return result.ok, result.detail
+
+    def verify_devices(self, evidence: bytes, gpu_nonce: bytes) -> GpuVerification:
         try:
             bundle = GpuEvidenceBundle.decode(evidence)
         except ValueError as exc:
-            return False, str(exc)
+            return GpuVerification(False, str(exc))
         if bundle.nonce.lower() != gpu_nonce.hex():
-            return False, "GPU evidence was collected for a different nonce"
+            return GpuVerification(False, "GPU evidence was collected for a different nonce")
         archs = {g.arch for g in bundle.gpus}
         if len(archs) != 1:
-            return False, "GPUs of mixed architectures must be attested separately"
+            return GpuVerification(False, "GPUs of mixed architectures must be attested separately")
         body = {
             "nonce": gpu_nonce.hex(),
             "arch": archs.pop(),
@@ -247,12 +272,12 @@ class NrasGpuVerifier:
         try:
             status, payload = self._http("POST", self.url, json.dumps(body).encode(), headers, self.timeout_s)
             if status != 200:
-                return False, f"NRAS returned HTTP {status}: {payload[:200].decode('utf-8', 'replace')}"
+                return GpuVerification(False, f"NRAS returned HTTP {status}: {payload[:200].decode('utf-8', 'replace')}")
             overall_token, detached = _split_detached_eat(json.loads(payload))
             overall = self._claims(overall_token)
             per_gpu = {name: self._claims(token) for name, token in detached.items()}
         except (OSError, ValueError) as exc:  # URLError is an OSError; GpuTokenError and JSON errors are ValueErrors
-            return False, f"NRAS verification failed: {exc}"
+            return GpuVerification(False, f"NRAS verification failed: {exc}")
 
         problems = []
         if overall.get("x-nvidia-overall-att-result") is not True:
@@ -264,9 +289,10 @@ class NrasGpuVerifier:
         for name, claims in sorted(per_gpu.items()):
             problems += [f"{name}: {p}" for p in gpu_claim_problems(claims)]
         if problems:
-            return False, "; ".join(problems)
+            return GpuVerification(False, "; ".join(problems))
         models = sorted({str(c.get("hwmodel", "?")) for c in per_gpu.values()})
-        return True, f"{len(per_gpu)} GPU(s) attested by NRAS ({', '.join(models)})"
+        ueids = [_ueid(claims) for _, claims in sorted(per_gpu.items())]
+        return GpuVerification(True, f"{len(per_gpu)} GPU(s) attested by NRAS ({', '.join(models)})", ueids)
 
 
 class NvattestGpuVerifier:
@@ -287,12 +313,16 @@ class NvattestGpuVerifier:
         self._run = run
 
     def verify(self, evidence: bytes, gpu_nonce: bytes) -> tuple[bool, str]:
+        result = self.verify_devices(evidence, gpu_nonce)
+        return result.ok, result.detail
+
+    def verify_devices(self, evidence: bytes, gpu_nonce: bytes) -> GpuVerification:
         try:
             bundle = GpuEvidenceBundle.decode(evidence)
         except ValueError as exc:
-            return False, str(exc)
+            return GpuVerification(False, str(exc))
         if bundle.nonce.lower() != gpu_nonce.hex():
-            return False, "GPU evidence was collected for a different nonce"
+            return GpuVerification(False, "GPU evidence was collected for a different nonce")
         document = {
             "evidences": [{**g.model_dump(), "nonce": gpu_nonce.hex()} for g in bundle.gpus],
             "result_code": 0,
@@ -314,15 +344,15 @@ class NvattestGpuVerifier:
             try:
                 done = self._run(command, capture_output=True, text=True, timeout=self.timeout_s)
             except FileNotFoundError:
-                return False, f"{self.binary} is not installed on this verifier (NVIDIA Attestation SDK CLI)"
+                return GpuVerification(False, f"{self.binary} is not installed on this verifier (NVIDIA Attestation SDK CLI)")
             except subprocess.TimeoutExpired:
-                return False, f"nvattest did not finish within {self.timeout_s:.0f}s"
+                return GpuVerification(False, f"nvattest did not finish within {self.timeout_s:.0f}s")
         try:
             result = json.loads(done.stdout)
         except ValueError:
-            return False, f"nvattest exited {done.returncode} without JSON output"
+            return GpuVerification(False, f"nvattest exited {done.returncode} without JSON output")
         if result.get("result_code") != 0 or done.returncode != 0:
-            return False, f"nvattest: {result.get('result_message', 'attestation failed')} (code {result.get('result_code')})"
+            return GpuVerification(False, f"nvattest: {result.get('result_message', 'attestation failed')} (code {result.get('result_code')})")
         claims = [c for c in result.get("claims", []) if isinstance(c, dict)]
         problems = []
         if len(claims) != len(bundle.gpus):
@@ -332,5 +362,5 @@ class NvattestGpuVerifier:
                 problems.append(f"GPU-{index}: claims are for a different nonce")
             problems += [f"GPU-{index}: {p}" for p in gpu_claim_problems(claim)]
         if problems:
-            return False, "; ".join(problems)
-        return True, f"{len(claims)} GPU(s) attested by nvattest ({self.verifier})"
+            return GpuVerification(False, "; ".join(problems))
+        return GpuVerification(True, f"{len(claims)} GPU(s) attested by nvattest ({self.verifier})", [_ueid(c) for c in claims])

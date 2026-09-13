@@ -20,6 +20,64 @@ It holds the worker only. The model runtime (torch and diffusers for `KUNO_BACKE
 SGLang for H3) and NVIDIA's `nvattest` must be added in a derived image, pinned the same way;
 the worker does not yet declare versions for them, so that layer does not exist.
 
+### Safety classifier weights (pinned here, not yet in an image)
+
+The output safety check (`SECURITY.md`, "Output safety") runs on CPU inside the CVM. Its
+weights must be covered by the measurement like everything else, so they are never
+downloaded at runtime: `from_pretrained(..., local_files_only=True)` reads local directories
+only. Fetch them off-host at a pinned revision, verify every file, and bake them into a
+derived image layer. The worker image digest, and through it RTMR3, then covers them. At
+about 1.8 GB they could also go into the step-2 verity image, which is measured by its root
+hash; either works, as long as the files are checked against the pins below.
+
+| Directory | Source (revision) | License |
+|---|---|---|
+| `nsfw_image_detector` | [Freepik/nsfw_image_detector](https://huggingface.co/Freepik/nsfw_image_detector) @ `15b85477e4fd2000db76ae9aae0f89a72f95e2e3` | MIT |
+| `clip-vit-large-patch14` | [openai/clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) @ `32bd64288804d66eefd0ccbe215aa642df71cc41` | MIT |
+
+`SHA256SUMS` for that tree (model cards omitted; nothing loads them):
+
+```
+39f53e86cc4868e0e11396b523c906f376621f54c1025ffc9ee2ee840542a41b  nsfw_image_detector/config.json
+024a9d4818fae2656403bf626c9f8c9e7789c2da274749fbebb1060d8fdaa7ab  nsfw_image_detector/model.safetensors
+8a09b467700c58138c29d53c605b34ebc69beaadd13274a8a2af8ad2c2f4032a  clip-vit-large-patch14/config.json
+9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a  clip-vit-large-patch14/merges.txt
+a2bf730a0c7debf160f7a6b50b3aaf3703e7e88ac73de7a314903141db026dcb  clip-vit-large-patch14/model.safetensors
+910e70b3956ac9879ebc90b22fb3bc8a75b6a0677814500101a4c072bd7857bd  clip-vit-large-patch14/preprocessor_config.json
+f8c0d6c39aee3f8431078ef6646567b0aba7f2246e9c54b8b99d55c22b707cbf  clip-vit-large-patch14/special_tokens_map.json
+deef455e52fa5e8151e339add0582e4235f066009601360999d3a9cda83b1129  clip-vit-large-patch14/tokenizer_config.json
+a83e0809aa4c3af7208b2df632a7a69668c6d48775b3c3fe4e1b1199d1f8b8f4  clip-vit-large-patch14/tokenizer.json
+3f0c4f7d2086b61b38487075278ea9ed04edb53a03cbb045b86c27190fa8fb69  clip-vit-large-patch14/vocab.json
+```
+
+Only `.safetensors` weights are pinned. Pickled `pytorch_model.bin` files can execute code
+when loaded, which is one more reason `openai/clip-vit-base-patch16`, published only as
+`.bin` on its main branch, is not the default. A derived layer, after the worker's `safety`
+extra (CPU torch, transformers, timm) has been added to `image/uv.lock` (not done yet):
+
+```dockerfile
+FROM kuno-worker@sha256:<worker image digest>
+COPY safety-models/ /opt/kuno-safety/
+RUN cd /opt/kuno-safety && sha256sum --check --strict SHA256SUMS
+ENV KUNO_SAFETY_FRAME_MODEL_PATH=/opt/kuno-safety/nsfw_image_detector \
+    KUNO_SAFETY_MINOR_MODEL_PATH=/opt/kuno-safety/clip-vit-large-patch14 \
+    KUNO_SAFETY_FRAME_DTYPE=bfloat16 \
+    KUNO_SAFETY_REQUIRE_CLASSIFIER=1
+```
+
+`KUNO_SAFETY_REQUIRE_CLASSIFIER=1` makes a worker whose models are missing or broken refuse to
+start. Measured CPU cost per job for 10 sampled frames, on a 6-core AMD EPYC 4244P with 6
+threads (`worker/scripts/benchmark_frame_safety.py`):
+
+| Model | float32 | bfloat16 |
+|---|---|---|
+| Freepik/nsfw_image_detector (448 px) | 419 ms/frame, 4.2 s | 226 ms/frame, 2.3 s |
+| openai/clip-vit-large-patch14 (224 px) | 279 ms/frame, 2.8 s | 122 ms/frame, 1.2 s |
+| Frame sampling (ffmpeg, 5 s clip) | 0.1 s at 720p, 0.4 s at 4K | same |
+
+TDX hosts (Sapphire Rapids and later) have AMX, which should make bfloat16 faster still.
+Measure on the target shape before fixing `KUNO_SAFETY_FRAMES` or the thread count.
+
 ## 2. Model weights on dm-verity (script here, mount unverified)
 
 ```bash

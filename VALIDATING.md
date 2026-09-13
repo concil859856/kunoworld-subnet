@@ -24,6 +24,9 @@ export KUNO_VALIDATOR_API_KEY=...                  # required; sent on every gat
 export KUNO_MANIFEST=/path/to/golden-manifest.json # required
 export KUNO_OWNER_PUBLIC_KEY=...                   # verifies the owner-signed switch
 export KUNO_VALIDATOR_STATE=/var/lib/kuno/validator-state.json  # default $KUNO_DATA_DIR/validator-state.json
+export KUNO_MIN_COLLATERAL_PER_GPU=<alpha>         # locked collateral required per attested GPU; unset or 0 disables
+export KUNO_COLLATERAL_MAX_STALE_S=8640            # how long a failed chain read may reuse the last reading
+export KUNO_CHAIN_ENDPOINT=wss://...               # optional; defaults to the --network's public endpoint
 kuno-validator run --interval 4320 --netuid <netuid> \
   --wallet-name <name> --wallet-hotkey <hotkey> --canary ltx-2.5-fast
 ```
@@ -39,8 +42,10 @@ Without `KUNO_OWNER_PUBLIC_KEY` the validator logs an error at startup and on ev
 it cannot verify the model switch. It refuses to submit live weights in that state unless you pass
 `--allow-unsigned-switch`; dry runs are allowed.
 
-The state file keeps the last accepted switch and recent canary outcomes, so a restart can
-neither accept an older switch nor forget a failed canary. Keep it on persistent storage.
+The state file keeps the last accepted switch, recent canary outcomes, hardware sightings and
+the last collateral readings. A restart can therefore not accept an older switch, forget a
+failed canary, reset who showed some hardware first, or zero every miner because the chain is
+briefly unreachable. Keep it on persistent storage.
 
 `once` runs a single round and prints the weight vector as JSON. `run` loops on an
 interval; one tempo (360 blocks, roughly 72 minutes) is a reasonable cadence.
@@ -60,10 +65,10 @@ vector it would submit.
    nonce to each active one through `/validator/v1/challenges`, and verifies the answer locally:
    quote signature and measurements against the golden manifest, the REPORTDATA binding of
    nonce + enclave keys + GPU evidence, and that the answer comes from the same keys the enclave
-   registered. Nothing is delegated to a central service. The TDX and NVIDIA verifiers now exist
-   in `kuno_protocol` (`policy_from_env`), but the validator does not pass them to
-   `verify_evidence` yet (see [SECURITY.md](SECURITY.md)), so today this step can only pass
-   simulated evidence from a dev manifest.
+   registered. Nothing is delegated to a central service. The validator builds its policy with
+   `policy_from_env`, exactly as the gateway does: `KUNO_ATTESTATION=production` uses the Intel
+   DCAP and NVIDIA verifiers, requires an owner-signed manifest and refuses simulated evidence.
+   Turbo candidates are skipped here; the Turbo track challenges them against their own manifest.
 2. **Canaries.** Ordinary encrypted jobs, indistinguishable from customer traffic, checked as
    described under [Canary policy](#canary-policy). Send H3 canaries from a region where the H3
    licence applies, or they will be rerouted to LTX and prove nothing.
@@ -73,7 +78,9 @@ vector it would submit.
    weight times the seconds the customer *requested*. They are split across model families by
    the owner-signed switch and gated on three things: a live attestation, reliability (at least
    98% success once a miner has 20 finished jobs, counting only failures the miner caused), and
-   no penalty in the window.
+   no penalty in the window. Penalties include [hardware dedupe](#hardware-dedupe) and
+   [collateral](#collateral) as well as canaries and replays. Every zeroed hotkey is logged with
+   its reasons (`miner <hotkey>: score=0.0000 … <reasons>`).
 5. **Weights.** Set for registered hotkeys, renormalized over those actually on the subnet.
    Never to the owner hotkey and never to a burn UID: burned miner emission cuts the
    subnet's TAO emission share. When nothing qualifies, the previous weights stand.
@@ -137,6 +144,93 @@ as failed but not attributed.
 Keep your canary prompt set private and rotate it, drawn from the same distribution as real
 traffic. The prompts in `canaries.py` are a public fallback: miners can read them.
 
+## Hardware dedupe
+
+One machine or GPU must not earn as many miners. After every round the validator records,
+from **its own** successful challenge verdicts, which hotkey showed which verified hardware
+token: the CPU platform's PPID and each GPU's `ueid` (PROTOCOL.md, "Hardware identities").
+The gateway's `hardware_ids` feed is only compared against these records, and a mismatch is
+logged. A gateway cannot frame a miner by publishing fake overlaps.
+
+**Rule, per token, over the scoring window (24 h):**
+
+- The hotkey that showed the token strictly first keeps it. Every other hotkey that showed it
+  gets zero weight: `shares N verified hardware identities (…) first attested by <hotkey>`.
+- Hotkeys that showed it first in the same round are **all** zeroed: `… also attested by
+  <hotkey> in the same round`.
+- A hotkey not seen with a token for a whole window is forgotten for that token. If it shows
+  the token again, its first sighting starts over.
+
+Why earliest-keeps rather than zero-both:
+- Two hotkeys can only share a verified identity by actually using the same hardware. A PPID
+  comes from the platform's own PCK certificate and a `ueid` from the GPU's own device key, so
+  nobody can put someone else's identity into their evidence.
+- Zeroing the first user would punish whoever sold or stopped renting a machine for what the
+  next user does with it.
+- Keeping the first user means a machine that alternates between hotkeys earns for one of them
+  at most, which is the goal.
+- A legitimate hand-over costs the new hotkey one window. MINING.md tells miners this.
+- Same-round sightings get no benefit of the doubt: one GPU can't be in two VMs at once, so
+  that is either a relay or one host split across hotkeys.
+
+## Collateral
+
+Miners must keep **locked registration collateral** worth at least `KUNO_MIN_COLLATERAL_PER_GPU`
+alpha for every GPU they attest. GPUs are counted once per hotkey across its enclaves, and
+counted but unnamed GPUs still count, with at least one per enclave. Hotkeys below the
+requirement get zero weight.
+
+**What is read.** At the finalized head, `SubtensorModule.Owner(hotkey)` gives the coldkey,
+then `SubtensorModule.MinerCollateral(netuid, hotkey, coldkey).locked` gives the amount in
+alpha base units (1 alpha = 1e9). These storage items were checked against live finney
+metadata (runtime spec_version 455) and against bittensor 11.1.0's own collateral reader. The
+reader uses `substrate-interface` when installed, otherwise the `async-substrate-interface`
+that `kuno-validator[chain]` brings. Only the owning coldkey can add collateral, so the owner's
+position is the one that counts.
+
+**Why alpha, not TAO.**
+- The chain locks alpha.
+- Valuing it in TAO needs the pool's spot price, which a trade inside a block can move.
+  Someone could use that to push miners under the requirement just as a validator reads.
+- The owner revisits the per-GPU number instead.
+
+**Failing closed.**
+- If a chain read fails, each hotkey's last reading is used for up to
+  `KUNO_COLLATERAL_MAX_STALE_S` (default 8640 s, two tempos).
+- After that, or for a hotkey that was never read, the hotkey is zeroed with `collateral unknown
+  (chain read failed: …)`.
+- Setting the requirement without `--netuid` zeroes every miner, and startup logs it.
+- Readings persist in the state file only for the same netuid.
+
+Collateral drains as a miner earns: `collateral_drain_ratio` alpha is released per alpha
+earned. A miner who doesn't set a floor slowly falls below the requirement, which is why
+MINING.md tells miners to run `btcli collateral set-min`.
+
+### Subnet owner: recommended settings
+
+| Setting | Recommendation | Why |
+|---|---|---|
+| `collateral_lock_share` | `39321` (0.6 of the registration price) | Two-fifths of the price is still burned, so squatting stays costly. A caught cheat forfeits most of what it paid. |
+| `collateral_drain_ratio` | `1.0` | Collateral is released one-for-one with earnings. A cheat's detection budget is `max(T/(1+k), (1−p)·T)` = half the lock's worth of emission (research_bittensor.md §2.4). |
+| `KUNO_MIN_COLLATERAL_PER_GPU` | About 7 days of a GPU's median emission, in alpha, re-set monthly | Covers what one fake or double-counted GPU could earn before the 24 h dedupe window, a canary, or a failed challenge catches it. Pick a number from live emission data before enabling. There is no safe default for a new subnet's alpha price. |
+
+The two chain parameters apply to **future registrations** only; each miner snapshots the drain
+ratio at registration. Set them with the btcli that ships in bittensor 11.1.0; btcli 9.x has no
+collateral commands. This syntax was checked against the 11.1.0 source, not run against a
+live subnet:
+
+```bash
+btcli sudo set --netuid <netuid> --name collateral_lock_share --value 39321
+btcli sudo set --netuid <netuid> --name collateral_drain_ratio --value 1.0
+btcli sudo get --netuid <netuid> --name collateral_lock_share
+```
+
+The underlying extrinsics, present in finney metadata at spec_version 455, need the subnet owner
+coldkey (or root):
+- `AdminUtils.sudo_set_collateral_lock_share(netuid, lock_share: u16)`. At most 62258 (95%).
+- `AdminUtils.sudo_set_collateral_drain_ratio(netuid, drain_ratio: U64F64)`. The value is passed
+  as raw bits (1.0 = 2^64) and must be above 0 and at most 10.
+
 ## Model switch rules
 
 - With `KUNO_OWNER_PUBLIC_KEY` set, a switch is used only if the owner's signature verifies.
@@ -157,3 +251,86 @@ Receipts and switches are signed by keys the gateway does not hold, so two valid
 this code over the same window should agree. Canary penalties are the exception: each validator
 runs its own canaries. If yours disagrees with the metagraph, recompute from the ledger and say
 so publicly rather than quietly adjusting.
+
+## Turbo track (mechanism 1)
+
+The Turbo competition (`validator/src/kuno_validator/turbo.py`, rules in [TURBO.md](TURBO.md))
+sets weights on mechanism 1 on its own cadence (default every 15 minutes), independently of
+serving rounds. Each step it:
+
+1. accepts the owner-signed Turbo spec from `/turbo/v1/spec`, with the same monotonic
+   `issued_at` rule as the switch. Without `KUNO_OWNER_PUBLIC_KEY` it refuses the spec, and
+   mechanism 1 mirrors the serving weights;
+2. reads every hotkey's on-chain commitment, fetches each `kt1:` submission document, and keeps
+   only those matching the committed digest and signed by the committing hotkey;
+3. challenges each candidate enclave from `/turbo/v1/enclaves` with its own nonce and verifies the
+   answer against a manifest built from the spec's base measurements plus the submission's
+   RTMR3. Only enclaves attesting exactly the submitted image, for exactly the target profile,
+   within the spec's GPU limit, get benchmark jobs;
+4. sends prompts from the window's hidden eval set (`/turbo/v1/eval-sets/...`, checked against
+   the spec's commitment) as ordinary sealed jobs pinned with `pin_image_digest`, one at a time
+   with random spacing;
+5. judges every result. It checks the receipt signature against the self-certifying enclave
+   key, then the receipt's profile, image, params digest and hotkey, the content digest, a
+   playable MP4 of the requested length and size, and receipt timings inside the gateway's
+   pull-to-complete interval. Latency is the longer of the two intervals. It then scores prompt
+   alignment with the spec's metric;
+6. scores each window once it ends and sets weights to the mean share over the last
+   `smoothing_windows` windows. A window with no record counts as zero.
+
+Sample verdicts: `ok`; `failed` (the pinned enclave did not deliver, which counts toward the
+failure rate); `fraud` (a receipt verified against the enclave key contradicts the job, which
+zeroes the window); `void` (nothing proves fault, such as a bad signature or relay damage, so
+excluded and logged). A job still pending when its window is scored counts as failed.
+
+The quality metric must be the one the spec names. `dev-caption` needs nothing. `clip` and
+`xclip` need `torch`, `transformers`, `av` and `pillow`. `vlm-judge` needs `av`, `pillow` and an
+OpenAI-compatible endpoint you trust with the hidden prompts.
+
+Benchmark jobs appear in the ledger like any other job. Exclude them from serving scores with
+`turbo.exclude_benchmark_rows`, so the same work is not paid twice.
+
+The Turbo state file (samples, attestation per window, finalized windows) is as important as the
+serving state file: it is what makes a missed job count against a miner after a restart. Keep it
+on persistent storage. `TurboTrack.report()` exports the finalized windows and samples; publish
+it after each reveal so others can recompute, and the owner can use it for adoption.
+
+Wiring into `kuno-validator run` is pending. Until then, drive `TurboTrack.step()` from your own
+loop and submit its result with
+`chain.set_weights(weights, netuid, wallet, hotkey, network, mechid=track.mechid)`. Check the mapping
+first with `dry_run=True`.
+
+## Step-replay audits (verified mode)
+
+In a verified profile, every receipt commits to the latent state after each denoising step. A
+validator re-executes one random step of its **own** canaries and compares the result bit for bit
+(`validator/src/kuno_validator/audits.py`). The full design is in [VERIFIED_MODE.md](VERIFIED_MODE.md).
+
+- **What gets audited.** `Auditor.select` samples canaries whose receipts carry a step commitment,
+  at `AuditPolicy.rate` or the profile's `verified.audit_rate` (2–5 %). 10 % of audits also open
+  every leaf and re-run the whole trajectory.
+- **Which jobs.** The gateway refuses audits of any job your validator account did not create.
+  Openings are sealed to a fresh key you send with each request.
+- **Checks.** Each opening must be:
+  1. signed by the enclave's key;
+  2. consistent with the root signed in the receipt (Merkle proofs, transcript digest, schedule);
+  3. a transcript of this canary: params digest, seed, weights identity, determinism pins,
+     conditioning;
+  4. started from the seed's noise.
+
+  The replayed step must reproduce the committed latent exactly. There is no tolerance mode.
+- **Penalty.** Same as canaries: any attributable failure in the scoring window zeroes the miner.
+  - Attributable: a signed opening that fails any check, a declined audit, and (by default) no
+    opening within 10 minutes.
+  - Not attributable, only logged: an unsigned opening, a gateway refusal, a missing executor.
+- **Executors.** Dev networks use the reference executor for the mock backend's toy denoiser, so
+  audits really run without a GPU. LTX-2.5 and MiniMax H3 need `executors.LtxStepExecutor` /
+  `H3StepExecutor` on the **same hardware class** as the miner (same GPU SKU, count and parallel
+  layout), with the pinned weights. Those executors have not run on a GPU yet, so keep them off
+  until the class passes its golden-set check.
+- **Golden sets.** `python -m kuno_validator.golden compute|check` records and compares per-step
+  latent hashes for fixed prompts and seeds per hardware class, to certify a miner image.
+- **State.** Keep audit outcomes on persistent storage (`Auditor(state_path=…)`), like the canary
+  history.
+
+Wiring into `Validator.step()` and `score()` is pending (see VERIFIED_MODE.md, "Integration").

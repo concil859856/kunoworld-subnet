@@ -113,6 +113,66 @@ class Pricing(BaseModel):
     usd_per_second: dict[str, float]
 
 
+class HardwareClass(BaseModel):
+    """One reproducibility domain. Bits match only within a class: same GPU SKU and form
+    factor, same GPU count, same parallel layout, same pinned image."""
+
+    id: str
+    tier: str  # the README's C1/C2/C4/C8 serving class this belongs to ("dev" for simulated)
+    gpu_sku: str
+    gpu_count: int
+    # Parallel degrees the runtime is pinned to, e.g. {"ulysses": 4}. Changing any changes bits.
+    parallel: dict[str, int] = Field(default_factory=dict)
+    interconnect: str | None = None
+    # Simulated classes exist for dev networks; production validators refuse them.
+    dev: bool = False
+
+
+class DeterminismSettings(BaseModel):
+    """What a verified-mode runtime pins before its first step (see VERIFIED_MODE.md)."""
+
+    use_deterministic_algorithms: bool = True
+    cublas_workspace_config: str = ":4096:8"
+    allow_tf32: bool = False
+    cudnn_deterministic: bool = True
+    cudnn_benchmark: bool = False
+    float32_matmul_precision: str = "highest"
+    torch_compile: bool = False
+    kernel_autotuning: bool = False
+    # TeaCache / MagCache / Cache-DiT style step skipping; always off in verified mode.
+    data_dependent_caching: bool = False
+    attention_backend: str = "sdpa"
+    # The initial latent comes from torch.Generator("cpu") seeded with the job seed.
+    noise: str = "torch-cpu-generator"
+    latent_dtype: str = "bfloat16"
+    env: dict[str, str] = Field(default_factory=dict)
+
+
+class VerifiedMode(BaseModel):
+    """The deterministic variant of a profile that commits to every denoising step."""
+
+    variant: str
+    runtime: str
+    scheduler: str
+    # Denoising steps per stage, e.g. [8, 3] for distilled + refine; leaves = Σ (steps + 1).
+    stage_steps: list[int]
+    # Stages a single-step re-executor supports (stage transitions such as upsampling are not steps).
+    replayable_stages: list[int] = Field(default_factory=lambda: [0])
+    hardware_classes: list[HardwareClass]
+    determinism: DeterminismSettings = Field(default_factory=DeterminismSettings)
+    # Retain every k-th latent and recompute the rest on audit (1 = retain every step).
+    retention_checkpoint_every: int = 1
+    # Share of a validator's own canaries to step-audit.
+    audit_rate: float = 0.03
+
+    def hardware_class(self, class_id: str) -> HardwareClass | None:
+        return next((h for h in self.hardware_classes if h.id == class_id), None)
+
+    @property
+    def leaves(self) -> int:
+        return sum(steps + 1 for steps in self.stage_steps)
+
+
 class ModelProfile(BaseModel):
     id: str
     family: str
@@ -133,6 +193,8 @@ class ModelProfile(BaseModel):
     vcu_per_output_second: float
     timeout_s: int = 1800
     provisional: bool = False
+    # Deterministic variant with per-step commitments; None where no verified mode is defined.
+    verified: VerifiedMode | None = None
 
     def size_for(self, resolution: str, aspect_ratio: str) -> tuple[int, int]:
         try:

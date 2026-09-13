@@ -7,7 +7,14 @@ Writes into the data directory:
   manifest.signed.json  the same manifest, signed by the owner key
   switch.json           initial signed switch (auto mode, H3 preferred)
   hotkey.seed           a throwaway sr25519 miner hotkey seed, so dev workers send hotkey proofs
+  c2pa_root.key/.pem    development C2PA root CA (in production the root never leaves the owner)
+  c2pa_ca.key           development C2PA issuing (intermediate) CA key, for the gateway
+  c2pa_ca_chain.pem     the intermediate then the root certificate, for the gateway
   dev.env               environment variables for gateway, worker, validator, SDK
+
+Production C2PA hierarchy, run offline by the subnet owner (see subnet/PROVENANCE.md):
+  kuno-devkit c2pa-root --out-key root.key --out-cert root.pem
+  kuno-devkit c2pa-intermediate --root-key root.key --root-cert root.pem --out-key issuing.key --out-chain chain.pem
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ import os
 import secrets
 from pathlib import Path
 
+from . import c2pa_certs
 from .attestation import AllowedMeasurement, GoldenManifest, SignedManifest, mock_measurements, parse_manifest, sign_manifest
 from .canonical import b64d, b64e
 from .crypto import generate_signing_key, public_key_bytes, signing_key_bytes, signing_key_from_bytes
@@ -59,6 +67,7 @@ def init(data_dir: Path, force: bool = False) -> dict[str, str]:
     (data_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2))
     (data_dir / "manifest.signed.json").write_text(sign_manifest(owner, manifest).model_dump_json(indent=2))
     (data_dir / "switch.json").write_text(sign_switch(owner, SwitchConfig()).model_dump_json(indent=2))
+    ca_key_path, ca_chain_path = create_dev_c2pa_ca(data_dir)
 
     env = {
         "KUNO_DATA_DIR": str(data_dir.resolve()),
@@ -76,9 +85,55 @@ def init(data_dir: Path, force: bool = False) -> dict[str, str]:
         "KUNO_MINER_HOTKEY": Sr25519Signer.from_seed(hotkey_seed).ss58_address,
         "KUNO_HOTKEY_SEED_FILE": str((data_dir / "hotkey.seed").resolve()),
         "KUNO_GATEWAY_URL": "http://127.0.0.1:8080",
+        "KUNO_C2PA_CA_KEY": str(ca_key_path.resolve()),
+        "KUNO_C2PA_CA_CHAIN": str(ca_chain_path.resolve()),
     }
     env_path.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
     return env
+
+
+def create_dev_c2pa_ca(data_dir: Path) -> tuple[Path, Path]:
+    """A development root and issuing CA. Readers trust it only when given c2pa_root.pem as an anchor."""
+    root_key, root = c2pa_certs.generate_root("KunoWorld development C2PA root (untrusted)")
+    ca_key, intermediate = c2pa_certs.generate_intermediate(root_key, root, "KunoWorld development C2PA issuing CA")
+    _write_secret(data_dir / "c2pa_root.key", c2pa_certs.private_key_pem(root_key).decode())
+    (data_dir / "c2pa_root.pem").write_text(c2pa_certs.certificate_pem(root))
+    _write_secret(data_dir / "c2pa_ca.key", c2pa_certs.private_key_pem(ca_key).decode())
+    chain_path = data_dir / "c2pa_ca_chain.pem"
+    chain_path.write_text(c2pa_certs.certificate_pem(intermediate) + c2pa_certs.certificate_pem(root))
+    return data_dir / "c2pa_ca.key", chain_path
+
+
+def _refuse_overwrite(paths: list[Path], force: bool) -> None:
+    existing = [str(p) for p in paths if p.exists()]
+    if existing and not force:
+        raise SystemExit(f"refusing to overwrite {', '.join(existing)} (pass --force)")
+
+
+def c2pa_root(out_key: Path, out_cert: Path, common_name: str, algorithm: str, days: int, force: bool = False):
+    """An offline C2PA root CA. Keep the key off every networked machine; publish only the certificate."""
+    _refuse_overwrite([out_key, out_cert], force)
+    key, cert = c2pa_certs.generate_root(common_name, algorithm, days)
+    _write_secret(out_key, c2pa_certs.private_key_pem(key).decode())
+    out_cert.write_text(c2pa_certs.certificate_pem(cert))
+    return cert
+
+
+def c2pa_intermediate(
+    root_key_path: Path, root_cert_path: Path, out_key: Path, out_chain: Path, common_name: str, algorithm: str, days: int,
+    force: bool = False,
+):
+    """An issuing CA signed by the root: its key and chain (intermediate, root) go to the gateway."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    _refuse_overwrite([out_key, out_chain], force)
+    root_key = serialization.load_pem_private_key(root_key_path.read_bytes(), password=None)
+    root = x509.load_pem_x509_certificate(root_cert_path.read_bytes())
+    key, cert = c2pa_certs.generate_intermediate(root_key, root, common_name, algorithm, days)
+    _write_secret(out_key, c2pa_certs.private_key_pem(key).decode())
+    out_chain.write_text(c2pa_certs.certificate_pem(cert) + c2pa_certs.certificate_pem(root))
+    return cert
 
 
 def main() -> None:
@@ -91,6 +146,22 @@ def main() -> None:
     sign_cmd.add_argument("--key", type=Path, required=True, help="owner Ed25519 key file (base64url)")
     sign_cmd.add_argument("--manifest", type=Path, required=True, help="bare or previously signed manifest JSON")
     sign_cmd.add_argument("--out", type=Path, required=True)
+    root_cmd = sub.add_parser("c2pa-root", help="generate an offline C2PA root CA (run offline)")
+    root_cmd.add_argument("--out-key", type=Path, required=True)
+    root_cmd.add_argument("--out-cert", type=Path, required=True)
+    root_cmd.add_argument("--name", default="KunoWorld C2PA Root CA")
+    root_cmd.add_argument("--algorithm", choices=c2pa_certs.CA_ALGORITHMS, default="p384")
+    root_cmd.add_argument("--days", type=int, default=c2pa_certs.ROOT_DAYS)
+    root_cmd.add_argument("--force", action="store_true")
+    inter_cmd = sub.add_parser("c2pa-intermediate", help="generate the gateway's issuing CA, signed by the root key (run offline)")
+    inter_cmd.add_argument("--root-key", type=Path, required=True)
+    inter_cmd.add_argument("--root-cert", type=Path, required=True)
+    inter_cmd.add_argument("--out-key", type=Path, required=True, help="becomes KUNO_C2PA_CA_KEY")
+    inter_cmd.add_argument("--out-chain", type=Path, required=True, help="becomes KUNO_C2PA_CA_CHAIN")
+    inter_cmd.add_argument("--name", default="KunoWorld C2PA Issuing CA")
+    inter_cmd.add_argument("--algorithm", choices=c2pa_certs.CA_ALGORITHMS, default="p384")
+    inter_cmd.add_argument("--days", type=int, default=c2pa_certs.INTERMEDIATE_DAYS)
+    inter_cmd.add_argument("--force", action="store_true")
     args = parser.parse_args()
     if args.command == "init":
         env = init(args.data, args.force)
@@ -99,6 +170,15 @@ def main() -> None:
     elif args.command == "sign-manifest":
         signed = sign_manifest_file(args.key, args.manifest, args.out)
         print(f"Wrote {args.out} ({len(signed.manifest.allowed)} allowed measurement(s))")
+    elif args.command == "c2pa-root":
+        cert = c2pa_root(args.out_key, args.out_cert, args.name, args.algorithm, args.days, args.force)
+        print(f"Wrote {args.out_cert} (valid until {cert.not_valid_after_utc:%Y-%m-%d}) and its key {args.out_key}")
+    elif args.command == "c2pa-intermediate":
+        cert = c2pa_intermediate(
+            args.root_key, args.root_cert, args.out_key, args.out_chain, args.name, args.algorithm, args.days, args.force
+        )
+        print(f"Wrote {args.out_chain} (valid until {cert.not_valid_after_utc:%Y-%m-%d}) and its key {args.out_key}")
+        print(f"Gateway: KUNO_C2PA_CA_KEY={args.out_key.resolve()} KUNO_C2PA_CA_CHAIN={args.out_chain.resolve()}")
 
 
 def sign_manifest_file(key_path: Path, manifest_path: Path, out_path: Path) -> SignedManifest:

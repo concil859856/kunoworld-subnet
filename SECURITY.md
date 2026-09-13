@@ -15,14 +15,14 @@ land.
 |---|---|---|
 | End-to-end encryption | the platform, the network, the GPU host | HPKE to a key that exists only inside the enclave; the output is sealed to a key only the customer holds |
 | Parameter binding | a relay silently changing what you asked for | the public job parameters are the AEAD associated data, so any change makes decryption fail inside the enclave |
-| Attestation | a miner running different code or fake hardware | Intel TDX quote (DCAP, via dcap-qvl) plus NVIDIA GPU evidence (NRAS or `nvattest`), bound to a fresh validator nonce and to the enclave's own keys, checked against an owner-signed manifest of measurements — *verifiers built and tested against sample quotes and simulated NVIDIA responses; not yet run against a live TDX + NVIDIA CC machine or wired into the gateway* |
-| Hotkey proof | claiming another miner's hotkey (and its rewards) | the worker signs the registration nonce, enclave id and enclave signing key with the miner's sr25519 hotkey — *verification is built; the gateway does not require it yet* |
+| Attestation | a miner running different code or fake hardware | Intel TDX quote (DCAP, via dcap-qvl) plus NVIDIA GPU evidence (NRAS or `nvattest`), bound to a fresh validator nonce and to the enclave's own keys, checked against an owner-signed manifest of measurements. The gateway and every validator build the same policy (`KUNO_ATTESTATION=production` refuses to start without both verifiers) — *tested against sample quotes and simulated NVIDIA responses; not yet run against a live TDX + NVIDIA CC machine* |
+| Hotkey proof | claiming another miner's hotkey (and its rewards) | the worker signs the registration nonce, enclave id and enclave signing key with the miner's sr25519 hotkey; the gateway credits an enclave's hotkey only when the proof verifies, and production requires it |
 | Signed receipts | claims about work that never happened; a gateway misreporting work | every result is signed by the attested enclave key. Validators re-verify each ledger receipt against a key bound to the enclave id, pay only the duration the customer requested, and treat a digest delivered twice as a replay |
-| Canary audits | a miner serving a cheaper or broken model behind a valid quote | validator jobs indistinguishable from customer traffic. The output is checked against its receipt and its own MP4 structure; a failure attributable to a miner zeroes its weight for the window. Step replay comes once GPUs are available |
+| Canary audits | a miner serving a cheaper or broken model behind a valid quote | validator jobs indistinguishable from customer traffic. The output is checked against its receipt and its own MP4 structure; a failure attributable to a miner zeroes its weight for the window. In verified mode every receipt also commits to each denoising step, and validators open and bitwise-replay a random step of their own canaries ([VERIFIED_MODE.md](VERIFIED_MODE.md)) — *the GPU executors have not run on real hardware* |
 | Owner-signed switch | a gateway redirecting emissions between model families | validators accept only an owner-signed switch whose `issued_at` does not go backwards |
-| Content safeguards | generating material that breaks the acceptable use policy | a normalized blocklist and a pluggable prompt classifier inside the enclave, with an optional frame check — *no classifier weights ship in an image yet* |
-| C2PA provenance | a clip losing its origin once separated from its receipt | a C2PA manifest in the MP4, signed with the enclave key — *implemented as a module but not yet called by the worker; certificates are self-issued* |
-| Uniqueness rules | one machine posing as many miners | one hardware identity per miner UID, plus registration collateral — *planned; neither is implemented* |
+| Content safeguards | generating material that breaks the acceptable use policy | a normalized blocklist and a pluggable prompt classifier inside the enclave, and a check of frames sampled from every finished video before it is signed or sealed ([Output safety](#output-safety)) — *no classifier weights ship in an image yet* |
+| C2PA provenance | a clip losing its origin once separated from its receipt | a C2PA manifest embedded before sealing, signed with the enclave key under a short-lived certificate that the gateway's CA issues only to a freshly attested enclave, timestamped so it outlives the certificate ([PROVENANCE.md](PROVENANCE.md)) — *the root is not on the C2PA Trust List* |
+| Uniqueness rules | one machine posing as many miners | verified hardware identities (the TDX platform's PPID, each GPU's UEID) bound to one hotkey's live enclave at the gateway, deduplicated again by validators from their own challenges, plus per-GPU registration collateral read from the chain — *the collateral amount per GPU is not set yet* |
 
 ## What is not protected
 
@@ -45,28 +45,97 @@ land.
   - **Prompt classifier.** The recommended model is Qwen3Guard-Gen-0.6B, Apache-2.0, run on
     CPU from local weights. Once configured, any failure to load or answer refuses the job;
     it never lets the job through.
-  - **Frame check.** An optional classifier over sampled output frames.
+  - **Frame check.** Classifiers over frames sampled from the rendered video, run before
+    the video is signed, sealed or uploaded. See [Output safety](#output-safety).
 
   The limits today:
-  - No classifier weights are in an image, and neither adapter has run against real weights.
-  - No frame model has been chosen.
-  - A worker without `KUNO_SAFETY_CLASSIFIER` runs on the blocklist alone. It logs that as an
-    error, but does not refuse work unless `KUNO_SAFETY_REQUIRE_CLASSIFIER=1`, which
-    production images must set.
+  - No classifier weights are in an image. The prompt adapters have not run against real
+    weights; the frame adapters have, on benign synthetic clips only.
+  - A worker without `KUNO_SAFETY_CLASSIFIER` or `KUNO_SAFETY_FRAME_MODEL_PATH` logs that as
+    an error but keeps serving, unless `KUNO_SAFETY_REQUIRE_CLASSIFIER=1`. With that set,
+    which production images must do, it refuses to start without both.
   - A blocklist catches known phrasings, not intent.
 - **The gateway's account of failures.** Failed jobs carry no receipt, so the reliability gate
   trusts the gateway's error codes, and a canary that never returns cannot be pinned on a miner.
-  Ledger rows without full `params` also trust the gateway's `duration_s`. Replay detection sees
-  only the scoring window.
-- **Provenance identity.** Until an issuing CA and C2PA trust-list membership exist, C2PA readers
-  report KunoWorld manifests as intact but `signingCredential.untrusted`. The binding to an
-  attested enclave comes from the enclave-signed KunoWorld assertion and the receipt, not from
-  the certificate. Any tool that re-encodes a video strips the manifest.
+  Replay detection sees only the scoring window. Validators map enclaves to hotkeys from the
+  gateway's feed.
+- **Provenance identity.** Readers that trust the KunoWorld root (served at `GET /v1/c2pa/trust`)
+  see manifests as trusted; everyone else sees them as intact but `signingCredential.untrusted`
+  until the root is on the C2PA Trust List. Revocation relies on day-long certificates, not CRLs.
+  Any tool that re-encodes a video strips the manifest.
 - **The customer's own device.** The output key lives in the browser or the SDK process. If
   that machine is compromised, so is the video.
 - **Metadata the platform needs to bill.** The gateway sees account, model, duration,
   resolution and input roles — never content.
 - **Availability.** A miner can refuse work; it cannot read it.
+
+## Output safety
+
+A prompt filter cannot see what a model actually renders, and nobody outside the enclave can
+see the video, so `Worker.process()` checks it inside the enclave after generation. The check
+runs before provenance, sealing and signing. A blocked video is discarded: nothing is
+uploaded, no receipt is signed, and the gateway receives `safety_blocked` with a fixed
+message. Code: `worker/src/kuno_worker/safety_frames.py`, driven by `SafetyGate.check_output`.
+
+**Sampling.** The worker picks `KUNO_SAFETY_FRAMES` frames, default 10, spread evenly across
+the clip, always including the first and last. ffmpeg decodes them inside the enclave. Each
+frame is squashed to a square at the largest input size any model needs; squashing, not
+center-cropping, keeps the edges of a 16:9 frame in view. Frames are never logged or written
+anywhere except a private temporary file for ffmpeg.
+
+**Models.** Both run on CPU, because the GPUs are busy generating, and load only from local
+directories.
+
+| Role | Recommended | License | Size | Alternatives |
+|---|---|---|---|---|
+| Sexual content (`KUNO_SAFETY_FRAME_MODEL_PATH`) | [Freepik/nsfw_image_detector](https://huggingface.co/Freepik/nsfw_image_detector), EVA02-base at 448 px with classes neutral, low, medium and high | MIT | 173 MB, bf16 | [Falconsai/nsfw_image_detection](https://huggingface.co/Falconsai/nsfw_image_detection): ViT-B/16, Apache-2.0, 343 MB. Its vendor-reported accuracy on AI-generated content is weak. [Marqo/nsfw-image-detection-384](https://huggingface.co/Marqo/nsfw-image-detection-384): ViT-tiny, Apache-2.0, 22 MB. It scores random noise around 0.17, too close to the thresholds. |
+| Apparent minors (`KUNO_SAFETY_MINOR_MODEL_PATH`) | [openai/clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14), zero-shot | MIT ([LICENSE](https://github.com/openai/CLIP/blob/main/LICENSE)) | 1.7 GB | [openai/clip-vit-base-patch16](https://huggingface.co/openai/clip-vit-base-patch16): MIT, 599 MB, faster and weaker |
+
+The minor detector scores each frame against prompts for children and teenagers, adults, and
+scenes without people. Its `minor` score is the probability mass on the child and teen
+prompts, including drawn, animated and rendered children. LAION's CLIP NSFW head
+([LAION-AI/CLIP-based-NSFW-Detector](https://github.com/LAION-AI/CLIP-based-NSFW-Detector)) was
+also considered and not adopted: it is an Autokeras/TensorFlow model and would add a second
+ML runtime to the image.
+
+**Policy.** Scores are reduced to their maximum over all sampled frames, so a minor in one
+frame and sexual content in another block together.
+
+| Rule | Default | Why |
+|---|---|---|
+| Sexual content with an apparent minor blocks | `minor` ≥ 0.3 and (`sexual` ≥ 0.15 or `suggestive` ≥ 0.5) | This is the absolute prohibition, so the thresholds sit far below "probably". A young-looking adult is treated as a minor here. On the recommended models, benign clips peaked at 0.012 `sexual` (a flat grey frame). `minor` reached 0.22 on a photo of cats and 0.20 on an adult seen from behind, so the 0.3 margin is thin. |
+| With no minor model configured, or a prompt that names a minor (blocklist match) | a minor is assumed present | Errs toward blocking when the detector is missing or the request has already said what it wants. |
+| Explicit sexual content blocks | `sexual` ≥ 0.5 unless `KUNO_SAFETY_ALLOW_NSFW=1` | The terms draft does not ban adult content outright. It does ban non-consensual intimate imagery of real people, which frames cannot tell apart from consensual content, and the model licenses carry their own acceptable use policies. Strict is the default; allowing adult content is a deliberate owner decision. |
+| Any other category a frame model reports | the ordinary `KUNO_SAFETY_THRESHOLDS` | — |
+
+Thresholds can be overridden with `KUNO_SAFETY_FRAME_THRESHOLDS`, for example
+`{"minor": 0.25, "minor_sexual": 0.1}`. Here `sexual` covers explicit content and nudity
+(Freepik's medium and high). `suggestive` covers sexualized content that is not explicit
+(low, medium and high).
+
+**Failing closed.** A configured frame model that is missing, unloadable, or has labels the
+policy does not recognize makes the worker refuse every job before generation. So do a
+minor model configured without a sexual-content model, a video that cannot be decoded, a
+classifier that crashes, drops a frame, or returns a score outside [0, 1]. The gateway sees
+`internal_error`, the miner's fault, not `safety_blocked`. Exceptions keep only their type
+in logs.
+
+**Limits.**
+- *No accuracy evaluation has been run.* Latency and benign behaviour were measured with
+  `worker/scripts/benchmark_frame_safety.py` on synthetic clips. Measuring recall on the
+  content this exists for needs a vetted evaluation set handled under the subnet owner's
+  legal process. Never assemble one ad hoc.
+- *Zero-shot age estimation is coarse.* Expect false positives on young-looking adults,
+  which block adult content when adult content is allowed. Expect false negatives on
+  partially visible, stylized or unusually lit children. OpenAI's CLIP model card calls
+  deployed use out of scope without in-domain testing.
+- *Evasion.* The check only sees sampled frames. A few flashed frames between samples,
+  content that appears only at small scale, or adversarial perturbations can pass. More
+  frames cost CPU linearly.
+- *Audio and reference inputs are not checked.* Uploaded reference images are judged only
+  through the video they produce.
+- *CPU cost.* See `image/CVM.md` for the measured numbers. This work competes with anything
+  else the CVM runs on CPU.
 
 ## Keys
 
@@ -93,20 +162,22 @@ can send us.
 Not implemented yet:
 - running attestation end to end on a real TDX host with NVIDIA GPUs in CC mode: nothing
   below has produced or verified a live quote or live GPU evidence;
-- the gateway and validators using the verifiers, the production policy, the signed manifest
-  and the hotkey proof (the protocol pieces exist; the call sites still pass no verifier);
 - the confidential VM image and its measured boot chain (only the worker container layer is
-  built), published golden measurements, and the hardware-identity registry;
-- registration collateral, output padding, and the enterprise tier;
-- shipped classifier weights and a chosen frame model;
-- the worker calling C2PA embedding, the attestation-gated C2PA issuing CA, and C2PA
-  trust-list membership.
+  built), and published golden measurements;
+- a chosen per-GPU collateral amount, output padding, and the enterprise tier;
+- shipped classifier weights (frame models are chosen and their hashes pinned in
+  `image/CVM.md`, but no image bakes them in yet), and any accuracy evaluation of them;
+- C2PA Trust List membership for the KunoWorld root.
 
 What is in place and tested against a simulated TEE:
-- the attestation types, bindings and policy checks;
+- the attestation types, bindings and policy checks, used by the gateway and validators;
+- hotkey proofs, the hardware-identity registry and validator dedupe, and collateral gating
+  (the chain read was checked read-only against finney);
 - validator receipt re-verification, the replay and canary penalties, and the switch rules;
-- the safety pipeline, with fake classifiers;
-- C2PA embed and verify, with a self-issued certificate.
+- the safety pipeline, with fake classifiers, including the output check wired into the
+  worker; the frame adapters also load and score real weights on CPU (benign clips only);
+- C2PA manifests signed under gateway-issued certificates that verify as trusted against the
+  KunoWorld root.
 
 Until the real verifiers land, no deployment of this code provides the guarantees above;
 dev networks accept simulated quotes by design and earn nothing.

@@ -16,6 +16,8 @@ from test_receipt_ledger import FakeEnclave
 
 
 class RecordingPolicy:
+    production = False
+
     def __init__(self, enclave_id: str):
         self.enclave_id = enclave_id
         self.nonces: list[bytes | None] = []

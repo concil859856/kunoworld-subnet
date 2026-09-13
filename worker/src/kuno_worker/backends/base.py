@@ -3,12 +3,15 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from kuno_protocol.media import EXTENSIONS
 from kuno_protocol.profiles import InputRole, ModelProfile
 from kuno_protocol.receipts import VideoInfo
 from kuno_protocol.schemas import GenerationParams, InputRef
+from kuno_protocol.verified import StepCommitment, Tensor
+
+from ..verified import OpeningsHandle, RetentionStore, StepRecorder, shared_retention
 
 ProgressFn = Callable[[float, str], None]
 
@@ -56,13 +59,54 @@ class GenerationTask:
 class VideoResult:
     data: bytes
     info: VideoInfo
+    # Verified mode: the per-step commitment to sign into the receipt (ReceiptBody.step_commitment)
+    # and the handle to the retained trajectory audit openings are produced from.
+    step_commitment: StepCommitment | None = None
+    openings: OpeningsHandle | None = None
+
+
+class StepSink(Protocol):
+    """The step hook: a verified-mode backend reports the latent state after every step.
+
+    Leaf 0 of each stage is the stage's initial latent (kind "init"); every later leaf is
+    the state after one denoising step (kind "denoise"), with the sigma it has reached.
+    Tensors are (TensorSpec, little-endian bytes) pairs, e.g. from `tensor_from_array`.
+    """
+
+    def report(self, index: int, stage: int, kind: str, sigma: float, tensors: list[Tensor]) -> None: ...
 
 
 class Backend(ABC):
     name: str = "backend"
+    # Verified mode is on for a profile when the backend knows its hardware class and the
+    # profile pins a deterministic variant for that class.
+    hardware_class: str | None = None
+    retention: RetentionStore | None = None
 
     def warm(self, profile: ModelProfile) -> None:
         """Load weights ahead of the first job. TEE model loads are slow; do it once."""
+
+    def verified_enabled(self, profile: ModelProfile) -> bool:
+        return (
+            profile.verified is not None
+            and self.hardware_class is not None
+            and profile.verified.hardware_class(self.hardware_class) is not None
+        )
+
+    def step_recorder(self, task: GenerationTask, context: bytes = b"") -> StepRecorder | None:
+        """A recorder for this job when verified mode applies, else None."""
+        if not self.verified_enabled(task.profile):
+            return None
+        from kuno_protocol.verified import AUDIT_BINDING_OPTION
+
+        binding = task.options.get(AUDIT_BINDING_OPTION)
+        return StepRecorder(
+            self.retention or shared_retention(),
+            task.job_id,
+            checkpoint_every=task.profile.verified.retention_checkpoint_every,
+            context=context,
+            audit_binding=binding if isinstance(binding, str) else None,
+        )
 
     @abstractmethod
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult: ...

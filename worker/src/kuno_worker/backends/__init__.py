@@ -26,8 +26,9 @@ def build_backends(kind: str, config) -> dict[str, Backend]:
         # SGLang is the documented H3 serving path and is already resident; it forwards
         # the Turbo profile to the LoRA runtime, which SGLang does not support.
         h3 = H3SglangBackend(config.h3_fl2va_url, config.h3_ref2va_url, config.workdir)
-        h3.turbo = H3ResidentBackend(config.workdir, turbo_lora=config.h3_turbo_lora)
-        return {"minimax-h3": h3, "ltx-2.5": LtxResidentBackend(config.ltx_models_dir, config.workdir)}
+        verified = {"hardware_class": config.verified_hardware_class, "model_digest": config.model_digest}
+        h3.turbo = H3ResidentBackend(config.workdir, turbo_lora=config.h3_turbo_lora, **verified)
+        return {"minimax-h3": h3, "ltx-2.5": LtxResidentBackend(config.ltx_models_dir, config.workdir, **verified)}
 
     if kind == "cold":
         from .h3 import H3SglangBackend

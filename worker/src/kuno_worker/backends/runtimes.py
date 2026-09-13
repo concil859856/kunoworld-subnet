@@ -39,7 +39,9 @@ class LtxAdapter:
 
         kind = call.pop("pipeline")
         pipeline = self.pipelines.get(kind) or self.pipelines["text"]
-        generator = torch.Generator(device=self.device).manual_seed(int(call.pop("seed")))
+        tap = call.pop("kuno_trajectory_tap", None)
+        # Verified mode draws noise on the CPU, so every GPU of a hardware class starts from identical latents.
+        generator = torch.Generator(device="cpu" if tap is not None else self.device).manual_seed(int(call.pop("seed")))
 
         conditions = call.pop("conditions", None)
         if conditions:
@@ -53,7 +55,13 @@ class LtxAdapter:
             if key in call:
                 call[key] = str(call[key])
         call.pop("generate_audio", None)  # these pipelines always produce their audio track
-        result = pipeline(generator=generator, **call)
+        if tap is not None:
+            from .verified_gpu import ltx_verified
+
+            with ltx_verified(pipeline, call, tap):
+                result = pipeline(generator=generator, **call)
+        else:
+            result = pipeline(generator=generator, **call)
         return {
             "videos": getattr(result, "frames", None),
             "audio": getattr(result, "audio", None),
@@ -93,11 +101,19 @@ class H3Adapter:
     def __init__(self, pipeline: Any, device: str = "cuda"):
         self.pipeline = pipeline
         self.device = device
+        self._tap = None
+        self._hooked = False
 
     def __call__(self, **call: Any) -> dict[str, Any]:
         import torch
 
-        generator = torch.Generator(device=self.device).manual_seed(int(call.pop("seed")))
+        tap = call.pop("kuno_trajectory_tap", None)
+        generator = torch.Generator(device="cpu" if tap is not None else self.device).manual_seed(int(call.pop("seed")))
+        if tap is not None and not self._hooked:
+            from .verified_gpu import install_h3_commit_blocks
+
+            install_h3_commit_blocks(self.pipeline, lambda: self._tap)
+            self._hooked = True
         for key in ("image", "last_image"):
             if call.get(key):
                 call[key] = _load_image(call[key])
@@ -117,7 +133,11 @@ class H3Adapter:
             }
             call["references"] = [builders[r["type"]].from_file(r["path"]) for r in references]
         call.pop("aspect_ratio", None)  # size comes from width/height
-        result = self.pipeline(generator=generator, output=["videos", "audio", "sampling_rate"], **call)
+        self._tap = tap  # the commit blocks report to it only for this call
+        try:
+            result = self.pipeline(generator=generator, output=["videos", "audio", "sampling_rate"], **call)
+        finally:
+            self._tap = None
         return dict(result) if isinstance(result, dict) else {"videos": result}
 
     def unload(self) -> None:

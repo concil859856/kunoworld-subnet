@@ -73,11 +73,19 @@ class GatewayClient:
         return bytes.fromhex(self._send("GET", "/miner/v1/nonce", signed=False).json()["nonce"])
 
     def register(
-        self, evidence: AttestationEvidence, miner_hotkey: str | None, capacity: int, hotkey_proof: HotkeyProof | None = None
+        self,
+        evidence: AttestationEvidence,
+        miner_hotkey: str | None,
+        capacity: int,
+        hotkey_proof: HotkeyProof | None = None,
+        turbo_submission: dict | None = None,
     ) -> dict:
         body = {"evidence": evidence.model_dump(mode="json"), "miner_hotkey": miner_hotkey, "capacity": capacity}
         if hotkey_proof is not None:
             body["hotkey_proof"] = hotkey_proof.model_dump(mode="json")
+        if turbo_submission is not None:
+            # A Turbo candidate registers against its submission's measurements and earns for its hotkey.
+            return self._send("POST", "/turbo/v1/enclaves", self._json({"registration": body, "submission": turbo_submission})).json()
         return self._send("POST", "/miner/v1/enclaves", self._json(body)).json()
 
     def pull(self, wait: float) -> dict:
@@ -107,6 +115,12 @@ class GatewayClient:
         """Tell the gateway this enclave is leaving, so queued jobs are released at once."""
         return self._send("POST", "/miner/v1/retire", timeout=10).json()
 
-    def answer_challenge(self, challenge_id: str, evidence: AttestationEvidence) -> dict:
+    def request_certificate(self, csr_pem: str) -> dict:
+        """A C2PA signing certificate for this enclave's attested key: {certificate_chain_pem, not_after, ...}.
+        The gateway issues only while its verification of this enclave's attestation is fresh."""
+        return self._send("POST", "/miner/v1/certificate", self._json({"csr_pem": csr_pem}), timeout=30).json()
+
+    def answer_challenge(self, challenge_id: str, evidence: AttestationEvidence, candidate: bool = False) -> dict:
         body = self._json({"evidence": evidence.model_dump(mode="json")})
-        return self._send("POST", f"/miner/v1/challenges/{challenge_id}", body).json()
+        prefix = "/turbo/v1" if candidate else "/miner/v1"
+        return self._send("POST", f"{prefix}/challenges/{challenge_id}", body).json()

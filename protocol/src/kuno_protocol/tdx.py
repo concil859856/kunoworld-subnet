@@ -54,6 +54,8 @@ class TdxQuoteResult:
     detail: str
     status: str | None = None
     advisory_ids: list[str] = field(default_factory=list)
+    # The platform's PPID from the PCK certificate dcap-qvl verified to Intel's root (dcap-qvl >= 0.6).
+    ppid: bytes | None = None
 
 
 def _timestamp(text: str) -> float:
@@ -166,7 +168,8 @@ def verify_tdx_quote(
     if blocked:
         return TdxQuoteResult(False, f"platform is affected by rejected advisories {', '.join(blocked)}", status, advisories)
     detail = f"TCB status {status}" + (f", advisories {', '.join(advisories)}" if advisories else "")
-    return TdxQuoteResult(True, detail, status, advisories)
+    ppid = getattr(report, "ppid", None)
+    return TdxQuoteResult(True, detail, status, advisories, bytes(ppid) if ppid else None)
 
 
 class DcapQuoteVerifier:
@@ -196,7 +199,12 @@ class DcapQuoteVerifier:
         self.cache = CollateralCache(fetcher, collateral_ttl_s, clock)
 
     def verify(self, quote: bytes) -> tuple[bool, str]:
-        result = verify_tdx_quote(
+        result = self.verify_quote(quote)
+        return result.ok, result.detail
+
+    def verify_quote(self, quote: bytes) -> TdxQuoteResult:
+        """The full result, including the verified PPID `verify_evidence` turns into a hardware identity."""
+        return verify_tdx_quote(
             quote,
             cache=self.cache,
             pccs_url=self.pccs_url,
@@ -205,4 +213,3 @@ class DcapQuoteVerifier:
             rejected_advisories=self.rejected_advisories,
             root_ca_der=self.root_ca_der,
         )
-        return result.ok, result.detail

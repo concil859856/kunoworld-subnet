@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -31,6 +32,16 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .canonical import b64d, b64e, canonical_json, sha256_hex
 from .crypto import verify_signature
+from .hardware import (
+    SOURCE_MOCK,
+    SOURCE_NVIDIA_UEID,
+    SOURCE_TDX_PPID,
+    HardwareIdentity,
+    identity,
+    mock_gpu_ueids,
+    mock_platform_id,
+    pck_ppid_from_quote,
+)
 from .nvidia import GpuEvidenceBundle, GpuEvidenceCollector
 
 TeeKind = Literal["mock", "tdx"]
@@ -192,22 +203,46 @@ def mock_measurements(image_digest: str) -> dict[str, str]:
     }
 
 
+# Enough simulated GPUs for the largest profile in the catalog (gpus_per_worker).
+MOCK_GPUS = 4
+
+
 class MockTEE:
-    """Development stand-in for a TDX VM. Never accepted by a production manifest."""
+    """Development stand-in for a TDX VM. Never accepted by a production manifest.
+
+    It simulates one machine: a platform id in the signed quote body (the PPID's stand-in) and
+    `gpus` GPU ueids in its GPU evidence, which REPORTDATA binds to the quote. Each instance is
+    a new machine unless `machine_id` (or KUNO_MOCK_MACHINE_ID) names one, so tests and dev
+    networks can put two workers on the same simulated hardware.
+    """
 
     kind: TeeKind = "mock"
 
-    def __init__(self, quote_key, image_digest: str):
+    def __init__(self, quote_key, image_digest: str, machine_id: str | None = None, gpus: int = MOCK_GPUS):
         self._key = quote_key
         self._measurements = mock_measurements(image_digest)
+        self.machine_id = machine_id or os.environ.get("KUNO_MOCK_MACHINE_ID") or uuid.uuid4().hex
+        self.gpus = gpus
 
     def quote(self, report_data: bytes) -> bytes:
-        body = {"tee": "mock", "measurements": self._measurements, "report_data": report_data.hex()}
+        body = {
+            "tee": "mock",
+            "measurements": self._measurements,
+            "report_data": report_data.hex(),
+            "platform_id": mock_platform_id(self.machine_id),
+        }
         signature = self._key.sign(b"kuno/v1/mock-quote\n" + canonical_json(body))
         return canonical_json({"body": body, "signature": b64e(signature)})
 
     def gpu_evidence(self, gpu_nonce: bytes) -> bytes | None:
-        return canonical_json({"mock_gpu": "NVIDIA H200 (simulated)", "nonce": gpu_nonce.hex(), "cc_mode": "on"})
+        return canonical_json(
+            {
+                "mock_gpu": "NVIDIA H200 (simulated)",
+                "nonce": gpu_nonce.hex(),
+                "cc_mode": "on",
+                "gpus": [{"ueid": ueid} for ueid in mock_gpu_ueids(self.machine_id, self.gpus)],
+            }
+        )
 
 
 class TdxTEE:
@@ -326,6 +361,21 @@ class Verdict:
     enclave_id: str
     reasons: list[str] = field(default_factory=list)
     measurements: dict[str, str] = field(default_factory=dict)
+    # Verified hardware identities (kuno_protocol.hardware) and the attested GPU count. Both are
+    # filled only when the verdict is ok; gpu_count stays None when no verifier counted GPUs.
+    hardware: list[HardwareIdentity] = field(default_factory=list)
+    gpu_count: int | None = None
+
+    def hardware_tokens(self, kind: str | None = None) -> set[str]:
+        return {h.token for h in self.hardware if kind is None or h.kind == kind}
+
+
+def _seal(verdict: Verdict, reasons: list[str], hardware: list[HardwareIdentity], gpu_count: int | None) -> Verdict:
+    verdict.reasons = reasons
+    verdict.ok = not reasons
+    # Identities from a refused verdict must not be used for anything, so they aren't kept.
+    verdict.hardware, verdict.gpu_count = (hardware, gpu_count) if verdict.ok else ([], None)
+    return verdict
 
 
 def verify_evidence(
@@ -354,22 +404,44 @@ def verify_evidence(
     if now - evidence.created_at > manifest.max_evidence_age_s:
         reasons.append("evidence is older than the manifest allows")
 
-    measurements, report_data = _quote_claims(evidence.tee, quote, manifest, quote_verifier, reasons)
+    measurements, report_data, platform = _quote_claims(evidence.tee, quote, manifest, quote_verifier, reasons)
     verdict.measurements = measurements
+    hardware: list[HardwareIdentity] = [platform] if platform is not None else []
 
     expected_rd = report_data_for(nonce, hpke_pk, sign_pk, gpu).hex()
-    if report_data is not None and report_data != expected_rd:
+    bound = report_data is not None and report_data == expected_rd
+    if report_data is not None and not bound:
         reasons.append("REPORTDATA does not bind this nonce, these keys and this GPU evidence")
 
+    gpu_ueids: list[str | None] | None = None
     if evidence.tee == "tdx":
         if gpu is None:
             reasons.append("GPU evidence is required on TDX workers")
         elif gpu_verifier is None:
             reasons.append("no GPU evidence verifier configured")
         else:
-            ok, detail = gpu_verifier.verify(gpu, gpu_nonce_for(nonce, hpke_pk, sign_pk))
+            gpu_nonce = gpu_nonce_for(nonce, hpke_pk, sign_pk)
+            verify_devices = getattr(gpu_verifier, "verify_devices", None)
+            if callable(verify_devices):
+                result = verify_devices(gpu, gpu_nonce)
+                ok, detail = result.ok, result.detail
+                gpu_ueids = list(result.ueids) if ok else None
+            else:  # a verifier that only answers yes or no: GPUs are verified but not counted
+                ok, detail = gpu_verifier.verify(gpu, gpu_nonce)
             if not ok:
                 reasons.append(f"GPU evidence rejected: {detail}")
+    elif evidence.tee == "mock" and gpu is not None and bound:
+        gpu_ueids = _mock_gpu_ueids(gpu)
+
+    gpu_count = None
+    if gpu_ueids is not None:
+        gpu_count = len(gpu_ueids)
+        prefix, source = ("mock:", SOURCE_MOCK) if evidence.tee == "mock" else ("", SOURCE_NVIDIA_UEID)
+        gpus = [identity("gpu", prefix + ueid, source) for ueid in gpu_ueids if ueid]
+        if len({g.token for g in gpus}) != len(gpus):
+            # Repeating one GPU's evidence must not count it twice.
+            reasons.append("the same GPU appears more than once in the GPU evidence")
+        hardware.extend(gpus)
 
     if measurements:
         allowed = [
@@ -384,46 +456,72 @@ def verify_evidence(
         elif not set(evidence.profiles) <= set(allowed[0].profiles):
             reasons.append("image is not approved for all claimed profiles")
 
-    verdict.reasons = reasons
-    verdict.ok = not reasons
-    return verdict
+    return _seal(verdict, reasons, hardware, gpu_count)
+
+
+def _mock_gpu_ueids(gpu: bytes) -> list[str | None] | None:
+    try:
+        document = json.loads(gpu)
+        gpus = document["gpus"]
+    except (ValueError, KeyError, TypeError):
+        return None  # simulated evidence from before identities: verified, not counted
+    if not isinstance(gpus, list):
+        return None
+    return [str(g["ueid"]) if isinstance(g, dict) and g.get("ueid") else None for g in gpus]
 
 
 def _quote_claims(
     tee: str, quote: bytes, manifest: GoldenManifest, quote_verifier: QuoteVerifier | None, reasons: list[str]
-) -> tuple[dict[str, str], str | None]:
+) -> tuple[dict[str, str], str | None, HardwareIdentity | None]:
     if tee == "mock":
         try:
             doc = json.loads(quote)
             body, signature = doc["body"], b64d(doc["signature"])
         except (ValueError, KeyError, TypeError):
             reasons.append("malformed mock quote")
-            return {}, None
+            return {}, None, None
         message = b"kuno/v1/mock-quote\n" + canonical_json(body)
         if not any(verify_signature(b64d(k), signature, message) for k in manifest.mock_quote_keys):
             reasons.append("mock quote not signed by a key in the manifest")
-            return {}, None
-        return dict(body.get("measurements", {})), body.get("report_data")
+            return {}, None, None
+        platform_id = body.get("platform_id")
+        platform = identity("cpu_platform", f"mock:{platform_id}", SOURCE_MOCK) if isinstance(platform_id, str) and platform_id else None
+        return dict(body.get("measurements", {})), body.get("report_data"), platform
 
     if tee == "tdx":
         try:
             fields = parse_tdx_quote(quote)
         except ValueError as exc:
             reasons.append(str(exc))
-            return {}, None
+            return {}, None, None
         if int(fields["tdattributes"][:2], 16) & _TD_DEBUG_BIT:
             reasons.append("TD runs in debug mode, so the host can read its memory")
+        platform = None
         if quote_verifier is None:
             reasons.append("no TDX quote verifier configured")
         else:
-            ok, detail = quote_verifier.verify(quote)
+            verify_quote = getattr(quote_verifier, "verify_quote", None)
+            if callable(verify_quote):
+                result = verify_quote(quote)
+                ok, detail, ppid = result.ok, result.detail, getattr(result, "ppid", None)
+            else:
+                (ok, detail), ppid = quote_verifier.verify(quote), None
             if not ok:
                 reasons.append(f"TDX quote rejected: {detail}")
+            else:
+                if ppid is None:
+                    # The verifier accepted the PCK chain carried in this quote, so its leaf names the platform.
+                    try:
+                        ppid = pck_ppid_from_quote(quote)
+                    except ValueError:
+                        ppid = None
+                if ppid:
+                    platform = identity("cpu_platform", bytes(ppid), SOURCE_TDX_PPID)
         measurements = {k: fields[k] for k in ("mrtd", "rtmr0", "rtmr1", "rtmr2", "rtmr3")}
-        return measurements, fields["reportdata"]
+        return measurements, fields["reportdata"], platform
 
     reasons.append(f"unsupported TEE {tee!r}")
-    return {}, None
+    return {}, None, None
 
 
 # ---------------------------------------------------------------- policy
@@ -488,8 +586,15 @@ class AttestationPolicy:
                 extra.append(f"{evidence.tee} evidence is not accepted in production")
             if manifest.trusts_mock():
                 extra.append("the manifest trusts the simulated TEE, which production forbids")
-            verdict.reasons[:0] = extra
-            verdict.ok = not verdict.reasons
+            if verdict.ok:
+                # Production dedupes miners on hardware, so evidence that names no hardware can't register.
+                if not verdict.hardware_tokens("cpu_platform"):
+                    extra.append("the quote verified but yielded no platform identity (PPID)")
+                if verdict.gpu_count is None:
+                    extra.append("the GPU verifier did not report which GPUs it attested")
+                elif len(verdict.hardware_tokens("gpu")) < verdict.gpu_count or verdict.gpu_count == 0:
+                    extra.append("an attested GPU carries no device identity (ueid)")
+            _seal(verdict, extra + verdict.reasons, verdict.hardware, verdict.gpu_count)
         return verdict
 
 

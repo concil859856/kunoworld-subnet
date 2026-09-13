@@ -9,7 +9,8 @@ score_m = Σ_family split_f × (VCU_m,f / Σ_miners VCU_f)     for miners that p
   split_f    the owner-signed switch's emission share for each family in use
   gates      a currently attested enclave; success rate ≥ min_success once a miner has
              at least min_samples finished jobs in the window; and no penalty in the
-             window (a failed canary or a cross-miner replay zeroes the miner)
+             window (a failed canary or a cross-miner replay zeroes the miner, and so do
+             `hardware_conflicts` and an unmet collateral requirement, see collateral.py)
 
 Only failures the miner is responsible for count against it: crashes, timeouts,
 or going offline with work assigned. Customer errors (safety blocks, bad inputs)
@@ -106,6 +107,45 @@ def compute_scores(
         for miner in eligible:
             miner.score += split[family] / total_split * miner.work.get(family, 0.0) / family_total
     return miners
+
+
+def hardware_conflicts(sightings: Mapping[str, Mapping], now: float, window_s: float) -> dict[str, list[str]]:
+    """One machine, one miner: zero-weight reasons for hotkeys that shared verified hardware.
+
+    `sightings` maps a hardware token to {"kind": ..., "hotkeys": {hotkey: [first_seen, last_seen]}},
+    recorded only from the validator's own successful challenge verdicts. Among the hotkeys
+    that showed a token inside the window, the one that showed it strictly first keeps it
+    and every later hotkey is zeroed. If several hotkeys showed it first in the same round,
+    all of them are zeroed: one device can't be in two VMs at once, so a concurrent sighting
+    means a relay or a split host serving several hotkeys, and there is no honest first one.
+    """
+    lost: dict[str, dict[str, set[str]]] = {}
+    for token, sighting in sorted(sightings.items()):
+        seen = {
+            hotkey: (float(first), float(last))
+            for hotkey, (first, last) in (sighting.get("hotkeys") or {}).items()
+            if float(last) >= now - window_s
+        }
+        if len(seen) < 2:
+            continue
+        earliest = min(first for first, _ in seen.values())
+        keepers = sorted(hotkey for hotkey, (first, _) in seen.items() if first == earliest)
+        kind = str(sighting.get("kind", "hardware"))
+        for hotkey in sorted(seen):
+            if keepers == [hotkey]:
+                continue
+            if hotkey in keepers:
+                why = f"also attested by {', '.join(k for k in keepers if k != hotkey)} in the same round"
+            else:
+                why = f"first attested by {', '.join(keepers)}"
+            lost.setdefault(hotkey, {}).setdefault(why, set()).add(f"{kind}:{token}")
+    penalties: dict[str, list[str]] = {}
+    for hotkey, groups in lost.items():
+        for why, items in sorted(groups.items()):
+            kinds = ", ".join(sorted({item.split(":", 1)[0].replace("_", " ") for item in items}))
+            noun = "identity" if len(items) == 1 else "identities"
+            penalties.setdefault(hotkey, []).append(f"shares {len(items)} verified hardware {noun} ({kinds}) {why}")
+    return penalties
 
 
 def normalize(scores: dict[str, MinerScore]) -> dict[str, float]:

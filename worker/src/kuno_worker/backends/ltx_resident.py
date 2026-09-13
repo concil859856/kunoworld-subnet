@@ -16,6 +16,7 @@ from typing import Any, Callable
 from kuno_protocol.profiles import InputRole, Mode, ModelProfile, ltx_num_frames
 from kuno_protocol.receipts import VideoInfo
 
+from ..verified import RetentionStore, context_bytes
 from .base import Backend, GenerationTask, ProgressFn, VideoResult
 from .media_tools import BackendError, encode_video
 from .resident import ModelStore, PipelineResult
@@ -110,7 +111,18 @@ def build_call(task: GenerationTask) -> dict[str, Any]:
 class LtxResidentBackend(Backend):
     name = "ltx-2.5/resident"
 
-    def __init__(self, models_dir: Path | None, workdir: Path, loader: Callable[[ModelProfile], Any] | None = None, capacity: int = 1):
+    def __init__(
+        self,
+        models_dir: Path | None,
+        workdir: Path,
+        loader: Callable[[ModelProfile], Any] | None = None,
+        capacity: int = 1,
+        hardware_class: str | None = None,
+        retention: RetentionStore | None = None,
+        model_digest: str | None = None,
+    ):
+        """`hardware_class` turns on verified mode for profiles that pin it (see VERIFIED_MODE.md);
+        `model_digest` is the weights identity from the owner-signed manifest."""
         if loader is None:
             if models_dir is None:
                 raise ValueError("KUNO_LTX_MODELS_DIR must point at the LTX-2.5 weights")
@@ -119,8 +131,20 @@ class LtxResidentBackend(Backend):
             loader = ltx_loader(Path(models_dir))
         self.store = ModelStore(loader, capacity=capacity)
         self.workdir = Path(workdir)
+        self.hardware_class = hardware_class
+        self.retention = retention
+        self.model_digest = model_digest
+        self._determinism: dict[str, Any] | None = None
+
+    def _pin(self, profile: ModelProfile) -> None:
+        """Determinism must be pinned before weights touch the GPU (cuBLAS reads its workspace config once)."""
+        if self.verified_enabled(profile) and self._determinism is None:
+            from kuno_protocol.torch_verified import apply_determinism
+
+            self._determinism = apply_determinism(profile.verified.determinism)
 
     def warm(self, profile: ModelProfile) -> None:
+        self._pin(profile)
         self.store.warm(profile)
 
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
@@ -130,9 +154,29 @@ class LtxResidentBackend(Backend):
             for item in task.inputs:
                 item.save(directory)
             call = build_call(task)
+            recorder = self.step_recorder(task, context_bytes(prompt=task.prompt, negative_prompt=task.negative_prompt))
+            tap = None
+            if recorder is not None:
+                from .verified_gpu import TrajectoryTap
+
+                self._pin(task.profile)
+                tap = call["kuno_trajectory_tap"] = TrajectoryTap(recorder)
             progress(0.05, "denoising")
-            with self.store.acquire(task.profile) as pipeline:
-                raw = pipeline(**call)
+            try:
+                with self.store.acquire(task.profile) as pipeline:
+                    raw = pipeline(**call)
+                if recorder is not None:
+                    from .verified_gpu import finish_trajectory
+
+                    commitment, openings = finish_trajectory(
+                        task, recorder, tap, model_digest=self.model_digest, hardware_class=self.hardware_class, determinism=self._determinism
+                    )
+                else:
+                    commitment, openings = None, None
+            except BaseException:
+                if recorder is not None:
+                    recorder.abort()
+                raise
             result = PipelineResult.from_pipeline(raw)
             if not len(result.frames):
                 raise BackendError("pipeline returned no frames")
@@ -149,7 +193,7 @@ class LtxResidentBackend(Backend):
                 audio=task.params.audio and result.audio is not None,
             )
             progress(1.0, "encoded")
-            return VideoResult(data=data, info=info)
+            return VideoResult(data=data, info=info, step_commitment=commitment, openings=openings)
         finally:
             import shutil
 

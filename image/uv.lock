@@ -199,6 +199,7 @@ requires-dist = [
     { name = "kuno-protocol" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "nvidia-ml-py", marker = "extra == 'nvidia'", specifier = ">=12.535" },
+    { name = "timm", marker = "extra == 'safety'", specifier = ">=1.0.15" },
     { name = "torch", marker = "extra == 'safety'", specifier = ">=2.4" },
     { name = "transformers", marker = "extra == 'safety'", specifier = ">=4.51" },
 ]

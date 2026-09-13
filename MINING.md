@@ -159,10 +159,104 @@ The CVM image, a production golden manifest and a gateway that enforces the veri
 released yet, and the attestation path has not run on real TDX + NVIDIA CC hardware; this
 section describes the design so you can plan hardware.
 
+## 5. Collateral and hardware binding
+
+**Collateral per GPU.** Validators give zero weight to a hotkey whose locked registration
+collateral on the subnet is less than `KUNO_MIN_COLLATERAL_PER_GPU` alpha times the GPUs it
+attests. The subnet owner publishes that number; see VALIDATING.md, "Collateral".
+
+- **Registration already locks some.** `collateral_lock_share` of the registration price is
+  locked as alpha on your hotkey.
+- **Only earning releases it.** It is released as you earn (`collateral_drain_ratio` alpha per
+  alpha earned), survives deregistration, is credited when you register again, and there is no
+  other way to withdraw it.
+- **A miner caught cheating forfeits whatever is still locked.**
+
+Add collateral and set a floor with the btcli from bittensor ≥ 11.1.0. btcli 9.x has no
+collateral commands. The coldkey that owns the hotkey signs:
+
+```bash
+# required = KUNO_MIN_COLLATERAL_PER_GPU × your attested GPUs, e.g. 25 alpha × 8 GPUs
+btcli collateral show    --netuid <netuid>                     # what is locked now and the subnet policy
+btcli collateral add     --netuid <netuid> --amount-alpha 200  # uses free stake on the hotkey first, buys the rest
+btcli collateral set-min --netuid <netuid> --min-alpha 200     # never drain below 200; earnings refill it
+```
+
+These commands and their flags come from bittensor 11.1.0's source; run `--help` to see how
+to pick the wallet and hotkey. The extrinsics they submit are:
+- `SubtensorModule.add_collateral(netuid, hotkey, alpha, limit_price)`. Any TAO→alpha shortfall
+  buy is fill-or-kill at `limit_price` and must be MEV-shielded.
+- `SubtensorModule.set_min_collateral(netuid, hotkey, min_locked)`.
+
+Set the floor. Without it, earning drains your lock below the requirement and your weight
+drops to zero.
+
+**Hardware binding.** The gateway and every validator identify your machine by its CPU
+platform (the PPID in its Intel PCK certificate) and each GPU (its NVIDIA `ueid`), taken from
+verified attestation. What this means in practice:
+
+- **One machine serves one hotkey.** Registering a second hotkey on a machine or GPU that
+  another hotkey's worker is using fails with `409 hardware_in_use`. That includes splitting
+  one host into several VMs for different hotkeys.
+- **Restarts are fine.** A restarted worker gets new enclave keys. Under the same hotkey its
+  registration replaces the old enclave at once. Splitting one host into VMs with separate GPUs
+  under the *same* hotkey is also fine.
+- **Moving GPUs between your own machines under the same hotkey** needs nothing special: the
+  new enclave replaces the old one.
+- **Selling or re-renting hardware to another hotkey.**
+  1. Stop the old worker first; it retires on SIGTERM. Otherwise the gateway refuses the new
+     hotkey until the old enclave has missed its heartbeat (60 s by default) or its attestation
+     lapses (30 minutes).
+  2. Validators give the hardware to the hotkey that showed it first within their 24-hour
+     window, so the new hotkey earns nothing until 24 hours after the old one last used it.
+  3. Before renting, ask whether the machine was mining on this subnet recently.
+- **Capacity is capped by GPUs.** `KUNO_CAPACITY` × the largest `gpus_per_worker` of your
+  profiles can't exceed the attested GPUs (`422 capacity_exceeds_hardware`).
+- **Collateral counts attested GPUs, not what you claim.**
+
+On a dev network each mock worker is its own simulated machine. Set `KUNO_MOCK_MACHINE_ID` on
+two workers to put them on the same simulated hardware.
+
 ## What earns
 
 Validators score verified video compute units from enclave-signed receipts, split between
-model families by the owner-signed switch, gated on a live attestation and on reliability
-(at least 98% success once you have 20 finished jobs in the 24-hour window). Jobs that fail
-because of your machine (crash, timeout, going offline with work assigned) count against
-that rate; customer-side failures such as a blocked prompt do not.
+model families by the owner-signed switch. Scores are gated on:
+- a live attestation;
+- reliability: at least 98% success once you have 20 finished jobs in the 24-hour window;
+- enough locked collateral for your attested GPUs;
+- not sharing hardware with a hotkey that showed it first.
+
+Jobs that fail because of your machine (crash, timeout, going offline with work assigned)
+count against the success rate. Customer-side failures such as a blocked prompt do not.
+
+## Turbo track (mechanism 1): make a pipeline faster
+
+Serving pays mechanism 0. Mechanism 1 is a standing competition: the owner signs a Turbo spec
+naming a target profile (for example `ltx-2.5-fast`), a quality floor and a speed baseline, and
+pays winner-take-most to miners whose attested pipeline beats the baseline by the required
+factor without dropping below the floor. The winner is adopted as a new profile that every
+miner can then serve. Full rules: [TURBO.md](TURBO.md).
+
+To compete:
+
+1. Build your pipeline as a worker image on the owner's published CVM base (the spec pins the
+   base measurements; only your application layer, RTMR3, may differ) and record its image
+   digest and RTMR3.
+2. Describe it in `pipeline.json` (runtime, steps, precision, techniques, extra weight hashes, a
+   reproducible source URL), then sign it with your hotkey:
+   `uv run kuno-turbo submit --hotkey-seed-file hotkey.seed --spec spec.signed.json --image-digest sha256:... --rtmr3 <hex> --platform tdx --variant ltx-2.5-fast+myopt.1 --pipeline pipeline.json --location https://you.example/turbo.json --out turbo.json`
+3. Host `turbo.json` at that location (any HTTPS host or `ipfs://`; validators check it against
+   the digest, so the host needs no trust), and publish the printed commitment from the same hotkey:
+   `uv run kuno-turbo commit --commitment "kt1:...@https://you.example/turbo.json" --netuid <netuid> --wallet-name <name> --wallet-hotkey <hotkey>`.
+   One commitment per hotkey; committing anything else later replaces your entry, and a
+   re-commit moves you behind earlier entries for tie-breaking.
+4. Run the image with your profile set to exactly the target profile and register it at
+   `POST /turbo/v1/enclaves` with the signed submission alongside the usual registration. It
+   receives only validator benchmark jobs, through the ordinary pull path.
+
+You earn nothing on mechanism 1 unless an enclave running exactly the committed image answers
+validator challenges, delivers at least the spec's minimum number of verified samples in a window,
+keeps miner-caused failures under the limit, stays above the quality floor and beats the
+baseline. A receipt that contradicts the job (another image, altered timings or output) zeroes
+the window. Copying an earlier entry's image is refused, and a later entry must be faster by
+more than the displacement margin to rank above an earlier one.
