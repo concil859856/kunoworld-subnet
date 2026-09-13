@@ -7,7 +7,13 @@ dependencies = [
     "pydantic>=2.7",
     "pyhpke>=0.6",
     "cryptography>=42",
+    # sr25519, to verify Bittensor hotkey proofs (small Rust wheel, no dependencies).
+    "py-sr25519-bindings>=0.2.4",
 ]
+
+[project.optional-dependencies]
+# Intel DCAP quote verification for gateways and validators (Rust wheel, no dependencies).
+tdx = ["dcap-qvl>=0.6.3"]
 
 [project.scripts]
 kuno-devkit = "kuno_protocol.devkit:main"

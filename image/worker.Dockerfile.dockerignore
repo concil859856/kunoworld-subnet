@@ -1,0 +1,12 @@
+# Test runs leave bytecode and caches in the source tree; they would end up in the wheels
+# built for the image and change its digest from one checkout state to the next.
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/*.egg-info
+**/tests
+.git
+.github
+.venv
+data
+validator

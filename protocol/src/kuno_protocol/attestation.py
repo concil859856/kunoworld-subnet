@@ -11,9 +11,10 @@ this measured VM, on this GPU evidence, owns these keys, right now.
 Two TEE backends:
   * MockTEE — development only. "Quotes" are Ed25519-signed JSON with synthetic
     measurements; the golden manifest lists which mock signing keys to trust.
-  * TdxTEE  — real Intel TDX via the Linux configfs-tsm interface. Quote
-    signature/TCB verification and NVIDIA GPU evidence verification plug in via
-    QuoteVerifier / GpuVerifier (dcap-qvl and NVAT in production).
+  * TdxTEE  — real Intel TDX via the Linux configfs-tsm interface, with NVIDIA GPU
+    evidence from a pluggable collector. Quote and GPU evidence verification plug in via
+    QuoteVerifier / GpuVerifier (`kuno_protocol.tdx`, `kuno_protocol.nvidia`), and an
+    AttestationPolicy decides what a production network accepts.
 """
 
 from __future__ import annotations
@@ -26,12 +27,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .canonical import b64d, b64e, canonical_json, sha256_hex
 from .crypto import verify_signature
+from .nvidia import GpuEvidenceBundle, GpuEvidenceCollector
 
 TeeKind = Literal["mock", "tdx"]
+
+
+class AttestationUnavailable(RuntimeError):
+    """This machine cannot produce attestation evidence; the message tells the operator what to fix."""
+
+
+class TdxQuoteUnavailable(AttestationUnavailable):
+    pass
+
+
+class GpuEvidenceUnavailable(AttestationUnavailable):
+    pass
 
 
 def enclave_id_for(hpke_public_key: bytes, signing_public_key: bytes) -> str:
@@ -87,13 +101,71 @@ class AllowedMeasurement(BaseModel):
 
 
 class GoldenManifest(BaseModel):
-    """Published, signed list of measurements the network accepts."""
+    """Published list of measurements the network accepts; the owner signs it as a SignedManifest."""
 
     version: int = 1
     issued_at: int = Field(default_factory=lambda: int(time.time()))
     allowed: list[AllowedMeasurement] = Field(default_factory=list)
     mock_quote_keys: list[str] = Field(default_factory=list)
     max_evidence_age_s: int = 3600
+
+    def trusts_mock(self) -> bool:
+        return bool(self.mock_quote_keys) or any(a.platform == "mock" for a in self.allowed)
+
+
+# ---------------------------------------------------------------- signed manifest
+
+
+class ManifestError(ValueError):
+    pass
+
+
+def manifest_message(manifest: GoldenManifest) -> bytes:
+    return b"kuno/v1/manifest\n" + canonical_json(manifest.model_dump(mode="json"))
+
+
+class SignedManifest(BaseModel):
+    manifest: GoldenManifest
+    signature: str | None = None
+
+    def verify(self, owner_public_key: bytes) -> bool:
+        return self.signature is not None and verify_signature(
+            owner_public_key, b64d(self.signature), manifest_message(self.manifest)
+        )
+
+
+def sign_manifest(owner_key, manifest: GoldenManifest) -> SignedManifest:
+    return SignedManifest(manifest=manifest, signature=b64e(owner_key.sign(manifest_message(manifest))))
+
+
+def parse_manifest(text: str | bytes, owner_public_key: bytes | None = None, require_signature: bool = False) -> GoldenManifest:
+    """Reads a golden manifest, either bare (development) or owner-signed.
+
+    A signed manifest must verify whenever an owner key is configured. `require_signature`
+    (production) refuses bare manifests and signed ones there is no key to check.
+    """
+    try:
+        document = json.loads(text)
+    except ValueError as exc:
+        raise ManifestError("manifest is not JSON") from exc
+    try:
+        if isinstance(document, dict) and "manifest" in document:
+            signed = SignedManifest.model_validate(document)
+            if owner_public_key is not None:
+                if not signed.verify(owner_public_key):
+                    raise ManifestError("manifest signature does not verify against the owner key")
+            elif require_signature:
+                raise ManifestError("no owner public key is configured to check the manifest signature")
+            return signed.manifest
+        if require_signature:
+            raise ManifestError("unsigned manifest refused: production requires an owner-signed manifest")
+        return GoldenManifest.model_validate(document)
+    except ValidationError as exc:
+        raise ManifestError(f"malformed manifest: {exc.errors()[:3]}") from exc
+
+
+def load_manifest(path: str | Path, owner_public_key: bytes | None = None, require_signature: bool = False) -> GoldenManifest:
+    return parse_manifest(Path(path).read_text(), owner_public_key, require_signature)
 
 
 # ---------------------------------------------------------------- providers
@@ -139,32 +211,60 @@ class MockTEE:
 
 
 class TdxTEE:
-    """Intel TDX guest. Requires Linux ≥ 6.7 with configfs-tsm inside the confidential VM."""
+    """Intel TDX guest. Requires Linux ≥ 6.7 with configfs-tsm inside the confidential VM,
+    and NVIDIA GPUs in confidential-computing mode passed through to it."""
 
     kind: TeeKind = "tdx"
     TSM_ROOT = Path("/sys/kernel/config/tsm/report")
 
+    def __init__(self, gpu_collector: GpuEvidenceCollector | None = None, tsm_root: Path | None = None):
+        self.gpu_collector = gpu_collector
+        self.tsm_root = tsm_root or self.TSM_ROOT
+
     def quote(self, report_data: bytes) -> bytes:
         if len(report_data) != 64:
             raise ValueError("TDX REPORTDATA is exactly 64 bytes")
-        entry = self.TSM_ROOT / f"kuno-{uuid.uuid4().hex}"
-        entry.mkdir()
+        if not self.tsm_root.is_dir():
+            raise TdxQuoteUnavailable(
+                f"{self.tsm_root} does not exist: run inside a TDX guest on Linux ≥ 6.7 with CONFIG_TSM_REPORTS "
+                "and configfs mounted (mount -t configfs none /sys/kernel/config)"
+            )
+        entry = self.tsm_root / f"kuno-{uuid.uuid4().hex}"
+        try:
+            entry.mkdir()
+        except PermissionError as exc:
+            raise TdxQuoteUnavailable(f"no permission to request quotes under {self.tsm_root}: the worker needs write access") from exc
         try:
             (entry / "inblob").write_bytes(report_data)
             return (entry / "outblob").read_bytes()
+        except OSError as exc:
+            raise TdxQuoteUnavailable(
+                f"the TDX quote request failed ({exc.strerror or exc}): check that the host runs the quote "
+                "generation service (QGS) and exposes it to the guest"
+            ) from exc
         finally:
-            entry.rmdir()
+            try:
+                entry.rmdir()
+            except OSError:
+                pass
 
     def gpu_evidence(self, gpu_nonce: bytes) -> bytes | None:
-        raise NotImplementedError(
-            "NVIDIA GPU evidence collection is not wired yet: integrate the NVIDIA attestation SDK (NVAT) "
-            "inside the CVM and return the SPDM evidence for every GPU, bound to gpu_nonce."
-        )
+        if self.gpu_collector is None:
+            raise GpuEvidenceUnavailable(
+                "no NVIDIA GPU evidence collector is configured: put NVIDIA's nvattest CLI in the image "
+                "or install kuno-worker[nvidia]"
+            )
+        gpus = self.gpu_collector.collect(gpu_nonce)
+        if not gpus:
+            raise GpuEvidenceUnavailable("the GPU evidence collector found no GPUs: check GPU passthrough into the CVM")
+        return GpuEvidenceBundle(nonce=gpu_nonce.hex(), gpus=gpus).encode()
 
 
 # ---------------------------------------------------------------- TDX quote parsing
 
 _TDX_HEADER_LEN = 48
+_TDX_V5_BODY_DESCRIPTOR_LEN = 6
+_TDX_V5_TD_REPORT_TYPES = (2, 3)  # TDX 1.0 and TDX 1.5 TD reports; both start with the same fields
 _TDX_BODY_FIELDS = [
     ("tee_tcb_svn", 16),
     ("mrseam", 48),
@@ -182,18 +282,26 @@ _TDX_BODY_FIELDS = [
     ("rtmr3", 48),
     ("reportdata", 64),
 ]
+_TD_DEBUG_BIT = 0x01
 
 
 def parse_tdx_quote(quote: bytes) -> dict[str, str]:
-    """Extracts measurements from a DCAP v4 TD quote. Does NOT verify the signature."""
-    body_len = sum(size for _, size in _TDX_BODY_FIELDS)
-    if len(quote) < _TDX_HEADER_LEN + body_len:
-        raise ValueError("quote too short for a TDX v4 quote")
+    """Extracts TD report fields from a DCAP v4 or v5 TD quote. Does NOT verify the signature."""
+    if len(quote) < _TDX_HEADER_LEN:
+        raise ValueError("quote too short for a TDX quote")
     version = int.from_bytes(quote[0:2], "little")
     tee_type = int.from_bytes(quote[4:8], "little")
-    if version != 4 or tee_type != 0x81:
-        raise ValueError(f"not a TDX v4 quote (version={version}, tee_type={tee_type:#x})")
-    fields, offset = {}, _TDX_HEADER_LEN
+    if version not in (4, 5) or tee_type != 0x81:
+        raise ValueError(f"not a TDX v4/v5 quote (version={version}, tee_type={tee_type:#x})")
+    offset = _TDX_HEADER_LEN
+    if version == 5:
+        body_type = int.from_bytes(quote[offset : offset + 2], "little")
+        if body_type not in _TDX_V5_TD_REPORT_TYPES:
+            raise ValueError(f"v5 quote body type {body_type} is not a TD report")
+        offset += _TDX_V5_BODY_DESCRIPTOR_LEN
+    if len(quote) < offset + sum(size for _, size in _TDX_BODY_FIELDS):
+        raise ValueError(f"quote too short for a TDX v{version} quote")
+    fields = {}
     for name, size in _TDX_BODY_FIELDS:
         fields[name] = quote[offset : offset + size].hex()
         offset += size
@@ -303,6 +411,8 @@ def _quote_claims(
         except ValueError as exc:
             reasons.append(str(exc))
             return {}, None
+        if int(fields["tdattributes"][:2], 16) & _TD_DEBUG_BIT:
+            reasons.append("TD runs in debug mode, so the host can read its memory")
         if quote_verifier is None:
             reasons.append("no TDX quote verifier configured")
         else:
@@ -314,6 +424,73 @@ def _quote_claims(
 
     reasons.append(f"unsupported TEE {tee!r}")
     return {}, None
+
+
+# ---------------------------------------------------------------- policy
+
+
+class PolicyError(ValueError):
+    pass
+
+
+@dataclass
+class AttestationPolicy:
+    """What a gateway or validator accepts.
+
+    Development (`production=False`) behaves exactly like bare `verify_evidence`: simulated
+    quotes pass if the manifest trusts their key, and TDX evidence is rejected per request
+    when a verifier is missing. Production refuses to start without both verifiers and the
+    owner key, only loads owner-signed manifests that trust no simulated TEE, and rejects
+    anything but TDX evidence.
+    """
+
+    production: bool = False
+    quote_verifier: QuoteVerifier | None = None
+    gpu_verifier: GpuVerifier | None = None
+    owner_public_key: bytes | None = None
+
+    def __post_init__(self) -> None:
+        if self.production:
+            missing = [
+                name
+                for name, value in (
+                    ("a TDX quote verifier", self.quote_verifier),
+                    ("a GPU evidence verifier", self.gpu_verifier),
+                    ("the owner public key", self.owner_public_key),
+                )
+                if value is None
+            ]
+            if missing:
+                raise PolicyError("production attestation policy needs " + ", ".join(missing))
+
+    def check_manifest(self, manifest: GoldenManifest) -> GoldenManifest:
+        if self.production and manifest.trusts_mock():
+            raise ManifestError("production manifests must not trust the simulated TEE")
+        return manifest
+
+    def parse_manifest(self, text: str | bytes) -> GoldenManifest:
+        return self.check_manifest(parse_manifest(text, self.owner_public_key, require_signature=self.production))
+
+    def load_manifest(self, path: str | Path) -> GoldenManifest:
+        return self.parse_manifest(Path(path).read_text())
+
+    def verify(
+        self,
+        evidence: AttestationEvidence,
+        manifest: GoldenManifest,
+        expected_nonce: bytes | None = None,
+        now: float | None = None,
+    ) -> Verdict:
+        verdict = verify_evidence(evidence, manifest, expected_nonce, now, self.quote_verifier, self.gpu_verifier)
+        if self.production:
+            extra = []
+            if evidence.tee != "tdx":
+                extra.append(f"{evidence.tee} evidence is not accepted in production")
+            if manifest.trusts_mock():
+                extra.append("the manifest trusts the simulated TEE, which production forbids")
+            verdict.reasons[:0] = extra
+            verdict.ok = not verdict.reasons
+        return verdict
 
 
 def build_evidence(

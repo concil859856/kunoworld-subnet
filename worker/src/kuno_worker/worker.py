@@ -10,10 +10,11 @@ import time
 import httpx
 from pydantic import ValidationError
 
-from kuno_protocol.attestation import AttestationEvidence, TEEProvider, build_evidence
+from kuno_protocol.attestation import AttestationEvidence, AttestationUnavailable, TEEProvider, build_evidence
 from kuno_protocol.blobs import decrypt_blob, encrypt_blob
 from kuno_protocol.canonical import b64d, canonical_json, sha256_hex
 from kuno_protocol.crypto import DecryptionError, RecipientSession
+from kuno_protocol.hotkey import HotkeySigner, sign_hotkey_proof
 from kuno_protocol.media import ROLE_TYPES, sniff_mime
 from kuno_protocol.profiles import ModelProfile, ParamError, load_profiles, validate_params
 from kuno_protocol.receipts import Receipt, ReceiptBody, input_digest, sign_receipt
@@ -48,11 +49,17 @@ class Worker:
         backends: dict[str, Backend],
         identity: EnclaveIdentity | None = None,
         transport=None,
+        hotkey: HotkeySigner | None = None,
     ):
         catalog = load_profiles()
         unknown = [p for p in config.profiles if p not in catalog]
         if unknown:
             raise ValueError(f"unknown profiles: {', '.join(unknown)}")
+        if hotkey is not None and config.miner_hotkey and config.miner_hotkey != hotkey.ss58_address:
+            raise ValueError(f"KUNO_MINER_HOTKEY is {config.miner_hotkey} but the configured hotkey secret is {hotkey.ss58_address}")
+        self.hotkey = hotkey
+        self.miner_hotkey = hotkey.ss58_address if hotkey is not None else config.miner_hotkey
+        self.failures = 0
         self.config = config
         self.tee = tee
         self.backends = backends
@@ -60,6 +67,7 @@ class Worker:
         for profile in self.profiles.values():
             self.backend_for(profile)
         self.identity = identity or EnclaveIdentity.generate()
+        self._provenance_signer = self._build_provenance_signer()
         self.client = GatewayClient(config.gateway_url, self.identity.signing_key, self.identity.enclave_id, transport=transport)
         self.evidence: AttestationEvidence | None = None
         self.last_attested = 0.0
@@ -88,8 +96,12 @@ class Worker:
         )
 
     def register(self) -> None:
-        evidence = self.attest(self.client.nonce())
-        self.client.register(evidence, self.config.miner_hotkey, self.config.capacity)
+        nonce = self.client.nonce()
+        evidence = self.attest(nonce)
+        proof = None
+        if self.hotkey is not None:
+            proof = sign_hotkey_proof(self.hotkey, nonce, self.identity.enclave_id, self.identity.signing_public)
+        self.client.register(evidence, self.miner_hotkey, self.config.capacity, proof)
         self.evidence = evidence
         self.last_attested = time.time()
         self.ready.set()
@@ -98,26 +110,69 @@ class Worker:
     # ------------------------------------------------------------ main loop
 
     def run(self, stop: threading.Event | None = None) -> None:
+        """Serves until `stop` is set. Attestation, registration and gateway failures are
+        logged and retried with capped exponential backoff; they never end the loop."""
         stop = stop or threading.Event()
         for profile in self.profiles.values():
             self.backend_for(profile).warm(profile)
-        backoff = 1.0
         while not stop.is_set():
+            step = "register"
             try:
                 if not self.ready.is_set() or time.time() - self.last_attested > self.config.reattest_s:
                     self.register()
+                step = "pull"
                 work = self.client.pull(wait=self.config.pull_wait_s)
-                backoff = 1.0
-            except (httpx.HTTPError, GatewayError) as exc:
-                log.warning("gateway unavailable (%s); retrying in %.0fs", type(exc).__name__, backoff)
-                stop.wait(backoff)
-                backoff = min(backoff * 2, 30.0)
+                self.failures = 0
+            except Exception as exc:
+                if step == "pull" and isinstance(exc, GatewayError) and exc.status in (401, 403):
+                    self.ready.clear()  # the gateway no longer knows this enclave: attest again
+                delay = self._retry_delay(exc)
+                self._log_failure(step, exc, delay)
+                stop.wait(delay)
                 continue
             kind = work.get("kind")
-            if kind == "job":
-                self.handle_job(MinerJob.model_validate(work))
-            elif kind == "challenge":
-                self.handle_challenge(MinerChallenge.model_validate(work))
+            try:
+                if kind == "job":
+                    self.handle_job(MinerJob.model_validate(work))
+                elif kind == "challenge":
+                    self.handle_challenge(MinerChallenge.model_validate(work))
+            except ValidationError:
+                log.error("the gateway sent a malformed %s; ignoring it", kind)
+
+    RETRY_BASE_S = 1.0
+    # Network blips and gateway restarts clear quickly; a broken attestation setup does not.
+    TRANSIENT_RETRY_CAP_S = 30.0
+
+    @staticmethod
+    def _transient(exc: Exception) -> bool:
+        if isinstance(exc, httpx.HTTPError):
+            return True
+        return isinstance(exc, GatewayError) and (exc.status >= 500 or exc.status in (401, 429) or exc.code == "bad_nonce")
+
+    def _retry_delay(self, exc: Exception) -> float:
+        cap = self.TRANSIENT_RETRY_CAP_S if self._transient(exc) else max(self.config.retry_max_s, self.RETRY_BASE_S)
+        delay = min(self.RETRY_BASE_S * 2 ** min(self.failures, 16), cap)
+        self.failures += 1
+        return delay
+
+    def _log_failure(self, step: str, exc: Exception, delay: float) -> None:
+        """Operator-facing and actionable. Registration never touches customer content, so its
+        errors are safe to print; a failed pull is logged by type only, like a failed job."""
+        if isinstance(exc, AttestationUnavailable):
+            log.error("cannot attest on this machine: %s (retrying in %.0fs)", exc, delay)
+        elif isinstance(exc, GatewayError) and exc.code == "attestation_failed":
+            log.error(
+                "the gateway rejected this enclave's attestation: %s — check KUNO_IMAGE_DIGEST, KUNO_PROFILES and "
+                "the golden manifest (retrying in %.0fs)", exc.message, delay,
+            )
+        elif isinstance(exc, GatewayError) and not self._transient(exc):
+            log.error("the gateway refused the %s (%s): %s (retrying in %.0fs)", step, exc.code, exc.message, delay)
+        elif self._transient(exc):
+            log.warning("gateway unavailable during %s (%s); retrying in %.0fs", step, type(exc).__name__, delay)
+        elif step == "register":
+            log.error("registration failed: %s: %s (retrying in %.0fs)", type(exc).__name__, exc, delay)
+        else:
+            log.error("pulling work failed with %s; retrying in %.0fs", type(exc).__name__, delay)
 
     def retire(self) -> None:
         """Best-effort goodbye on shutdown; the gateway releases anything still queued for us."""
@@ -132,6 +187,8 @@ class Worker:
     def handle_challenge(self, challenge: MinerChallenge) -> None:
         try:
             self.client.answer_challenge(challenge.challenge_id, self.attest(bytes.fromhex(challenge.nonce)))
+        except AttestationUnavailable as exc:
+            log.error("challenge %s failed: %s", challenge.challenge_id, exc)
         except (httpx.HTTPError, GatewayError, ValueError) as exc:
             log.warning("challenge %s failed: %s", challenge.challenge_id, type(exc).__name__)
 
@@ -221,30 +278,69 @@ class Worker:
         )
 
         self._progress(job.job_id, 0.92, "sealing", force=True)
-        sealed = encrypt_blob(session.output_key, output_label(job.job_id), result.data)
-        blob_id = self.client.upload_blob(job.job_id, sealed)
-        finished = time.time()
         assert self.evidence is not None
-        body = ReceiptBody(
+        rendered = result.data
+        # A draft describing the rendered file; the sealed-output fields are filled in below.
+        draft = ReceiptBody(
             job_id=job.job_id,
             enclave_id=self.identity.enclave_id,
             profile_id=profile.id,
             image_digest=self.config.image_digest,
             params_digest=sha256_hex(canonical_json(job.params.model_dump(mode="json"))),
             input_digest=input_digest(enc, ciphertext, blobs),
-            output_digest=sha256_hex(sealed),
-            output_bytes=len(sealed),
-            content_digest=sha256_hex(result.data),
+            output_digest=sha256_hex(rendered),
+            output_bytes=len(rendered),
+            content_digest=sha256_hex(rendered),
             attestation_digest=self.evidence.digest(),
             started_at=started,
-            finished_at=finished,
-            gpu_seconds=round((finished - started) * profile.gpus_per_worker, 3),
+            finished_at=started,
+            gpu_seconds=0.0,
             video=result.info,
-            miner_hotkey=self.config.miner_hotkey,
+            miner_hotkey=self.miner_hotkey,
         )
+        # Provenance goes in before sealing, so the receipt's content digest covers the delivered file.
+        final = self._embed_provenance(rendered, draft)
+        sealed = encrypt_blob(session.output_key, output_label(job.job_id), final)
+        blob_id = self.client.upload_blob(job.job_id, sealed)
+        finished = time.time()
+        body = draft.model_copy(update={
+            "content_digest": sha256_hex(final),
+            "output_digest": sha256_hex(sealed),
+            "output_bytes": len(sealed),
+            "finished_at": finished,
+            "gpu_seconds": round((finished - started) * profile.gpus_per_worker, 3),
+        })
         receipt = sign_receipt(self.identity.signing_key, body)
         self.client.complete(job.job_id, blob_id, receipt)
         return receipt
+
+    def _embed_provenance(self, rendered: bytes, draft: ReceiptBody) -> bytes:
+        if self._provenance_signer is None:
+            return rendered
+        from .provenance import ProvenanceError, embed_provenance
+
+        try:
+            return embed_provenance(rendered, draft, self._provenance_signer)
+        except ProvenanceError as exc:
+            log.error("C2PA embedding failed for job %s: %s", draft.job_id, exc)
+            raise JobRejected("internal_error", "The worker could not sign the video's provenance.") from None
+
+    def _build_provenance_signer(self):
+        mode = self.config.provenance
+        if mode == "off":
+            return None
+        if mode != "c2pa":
+            raise ValueError(f"KUNO_PROVENANCE must be 'off' or 'c2pa', not {mode!r}")
+        from .provenance import ProvenanceSigner, _c2pa, issue_dev_certificate
+
+        _c2pa()  # fail at start-up, not on the first job, when the extra is missing
+        if self.config.provenance_cert_chain is not None:
+            chain = self.config.provenance_cert_chain.read_text()
+        else:
+            if self.config.tee != "mock":
+                log.error("no KUNO_PROVENANCE_CERT_CHAIN: C2PA readers will report this worker's videos as untrusted")
+            chain, _root = issue_dev_certificate(self.identity.signing_key, self.identity.enclave_id)
+        return ProvenanceSigner(self.identity.signing_key, chain)
 
     def _open_inputs(self, job: MinerJob, payload: SealedPayload, input_key: bytes, blobs: list[bytes]) -> list[InputFile]:
         refs = sorted(payload.inputs, key=lambda r: r.index)

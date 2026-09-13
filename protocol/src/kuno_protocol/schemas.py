@@ -16,7 +16,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .attestation import AttestationEvidence
 from .canonical import canonical_json
+from .hotkey import HotkeyProof
 from .profiles import InputRole, Mode
 from .receipts import Receipt
 
@@ -129,6 +131,19 @@ class MinerChallenge(BaseModel):
     kind: Literal["challenge"] = "challenge"
     challenge_id: str
     nonce: str
+
+
+class MinerRegistration(BaseModel):
+    """Body of `POST /miner/v1/enclaves`.
+
+    `hotkey_proof` is optional so older workers still parse; a production gateway requires it
+    and checks it with `verify_hotkey_proof` against the verified evidence.
+    """
+
+    evidence: AttestationEvidence
+    miner_hotkey: str | None = None
+    capacity: int = Field(default=1, ge=1, le=64)
+    hotkey_proof: HotkeyProof | None = None
 
 
 class RouteResponse(BaseModel):

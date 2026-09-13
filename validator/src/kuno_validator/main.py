@@ -12,6 +12,8 @@ from kuno_protocol.canonical import b64d
 
 from .validator import Validator
 
+log = logging.getLogger("kuno.validator")
+
 
 def _read_env_file(path: Path) -> dict[str, str]:
     if not path.exists():
@@ -29,13 +31,30 @@ def main() -> None:
     parser.add_argument("--wallet-hotkey", default="default")
     parser.add_argument("--network", default="finney")
     parser.add_argument("--dry-run", action="store_true", help="resolve hotkeys to UIDs and print the vector without submitting")
+    parser.add_argument(
+        "--allow-unsigned-switch",
+        action="store_true",
+        help="submit weights even though KUNO_OWNER_PUBLIC_KEY is not set (unsafe: the gateway controls the family split)",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    env = {**_read_env_file(Path(os.environ.get("KUNO_DATA_DIR", "data")) / "dev.env"), **os.environ}
-    manifest = GoldenManifest.model_validate_json(Path(env["KUNO_MANIFEST"]).read_text())
+    data_dir = Path(os.environ.get("KUNO_DATA_DIR", "data"))
+    env = {**_read_env_file(data_dir / "dev.env"), **os.environ}
+    if not env.get("KUNO_VALIDATOR_API_KEY"):
+        parser.error("KUNO_VALIDATOR_API_KEY is required: the gateway authenticates every validator request")
     owner = env.get("KUNO_OWNER_PUBLIC_KEY")
-    validator = Validator(env.get("KUNO_GATEWAY_URL", "http://127.0.0.1:8080"), env["KUNO_VALIDATOR_API_KEY"], manifest, b64d(owner) if owner else None)
+    if not owner and args.netuid is not None and not args.dry_run and not args.allow_unsigned_switch:
+        parser.error("refusing to set weights without KUNO_OWNER_PUBLIC_KEY (pass --allow-unsigned-switch to override)")
+    manifest = GoldenManifest.model_validate_json(Path(env["KUNO_MANIFEST"]).read_text())
+    state_path = Path(env.get("KUNO_VALIDATOR_STATE", data_dir / "validator-state.json"))
+    validator = Validator(
+        env.get("KUNO_GATEWAY_URL", "http://127.0.0.1:8080"),
+        env["KUNO_VALIDATOR_API_KEY"],
+        manifest,
+        b64d(owner) if owner else None,
+        state_path=state_path,
+    )
 
     while True:
         weights = validator.step(args.canary)

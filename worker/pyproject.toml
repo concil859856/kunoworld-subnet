@@ -10,6 +10,18 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[project.optional-dependencies]
+# GPU evidence through NVML when NVIDIA's nvattest CLI is not in the image.
+nvidia = ["nvidia-ml-py>=12.535"]
+# Load the hotkey from a btcli wallet, a mnemonic or a //URI rather than a hex seed.
+wallet = ["bittensor-wallet>=4.1"]
+# Prompt classifier for the safety gate (Qwen3Guard-Gen-0.6B or a sequence classifier).
+# Weights are never downloaded: point KUNO_SAFETY_MODEL_PATH at a directory baked into the image.
+# Install the CPU build of torch in the image (e.g. from the PyTorch CPU wheel index).
+safety = ["transformers>=4.51", "torch>=2.4"]
+# C2PA manifests embedded in delivered MP4s (Content Authenticity Initiative SDK, ~15 MB wheel).
+provenance = ["c2pa-python>=0.37.10"]
+
 [project.scripts]
 kuno-worker = "kuno_worker.main:main"
 kuno-plan = "kuno_worker.plan:main"

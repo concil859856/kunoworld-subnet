@@ -16,5 +16,5 @@ jobs:
       # Installed directly rather than as a workspace: this repo is also a member of the
       # development workspace, and a package can only belong to one.
       - run: uv venv
-      - run: uv pip install -e protocol -e worker -e validator pytest
+      - run: uv pip install -e "protocol[tdx]" -e worker -e validator pytest
       - run: uv run pytest protocol/tests worker/tests validator/tests -q

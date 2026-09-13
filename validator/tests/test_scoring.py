@@ -15,13 +15,15 @@ PROFILES = load_profiles()
 NOW = 1_800_000_000.0
 
 
-def job(hotkey: str, profile_id: str, duration_s: float = 5.0, *, status: str = "succeeded", error_code: str | None = None, age_s: float = 60.0) -> dict:
-    receipt = {"body": {"video": {"duration_s": duration_s}}} if status == "succeeded" else None
+def job(hotkey: str, profile_id: str, duration_s: float = 5.0, *, status: str = "succeeded", error_code: str | None = None, age_s: float = 60.0, claimed_s: float | None = None) -> dict:
+    """An already-audited ledger row. `duration_s` is the public (paid) duration; `claimed_s` is what the miner says."""
+    receipt = {"body": {"video": {"duration_s": duration_s if claimed_s is None else claimed_s}}} if status == "succeeded" else None
     return {
         "miner_hotkey": hotkey,
         "profile_id": profile_id,
         "status": status,
         "error_code": error_code,
+        "duration_s": duration_s,
         "finished_at": NOW - age_s,
         "receipt": receipt,
     }
@@ -103,6 +105,30 @@ def test_weights_sum_to_one_or_are_empty():
 def test_unknown_profiles_in_the_ledger_are_ignored():
     scores = score([job("A", "some-retired-profile"), job("B", "ltx-2.5-fast")])
     assert normalize(scores) == {"B": pytest.approx(1.0)}
+
+
+def test_pay_follows_the_public_duration_not_the_miners_claim():
+    scores = score([job("A", "ltx-2.5-fast", 5, claimed_s=500), job("B", "ltx-2.5-fast", 5)])
+    assert normalize(scores) == {"A": pytest.approx(0.5), "B": pytest.approx(0.5)}
+
+
+def test_uncredited_entries_count_for_reliability_but_earn_nothing():
+    ledger = [dict(job("A", "ltx-2.5-fast"), credit=False), job("B", "ltx-2.5-fast")]
+    scores = score(ledger)
+    assert scores["A"].succeeded == 1 and scores["A"].score == 0 and not scores["A"].reasons
+    assert normalize(scores) == {"B": pytest.approx(1.0)}
+
+
+def test_a_penalty_zeroes_a_miner_for_the_window():
+    ledger = [job("A", "ltx-2.5-fast", 15), job("B", "ltx-2.5-fast", 5)]
+    scores = score(ledger, penalties={"A": ["failed canary ltx-2.5-fast (output does not match the receipt's content digest)"]})
+    assert scores["A"].score == 0 and any("failed canary" in r for r in scores["A"].reasons)
+    assert normalize(scores) == {"B": pytest.approx(1.0)}
+
+
+def test_flags_are_reported_without_disqualifying():
+    scores = score([job("A", "ltx-2.5-fast")], flags={"A": ["job x: receipt reports 1s for a 5s request"]})
+    assert scores["A"].flags and not scores["A"].reasons and scores["A"].score > 0
 
 
 def test_a_stale_now_does_not_resurrect_old_work():

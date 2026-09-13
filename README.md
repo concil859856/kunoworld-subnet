@@ -47,8 +47,9 @@ KUNO_DATA_DIR=data uv run kuno-worker --profiles ltx-2.5-fast,h3-turbo
 
 Production is meant to run inside the published CVM image with `KUNO_TEE=tdx` and
 `KUNO_BACKEND=real`: the official SGLang server for H3 and resident pipelines for LTX-2.5. None
-of it has run on GPUs yet, `KUNO_TEE=tdx` cannot yet collect NVIDIA GPU evidence, and the image,
-its golden measurements and the TDX/NVIDIA verifiers are not released.
+of it has run on GPUs yet. `KUNO_TEE=tdx` collects NVIDIA GPU evidence through `nvattest` or
+NVML, and `kuno_protocol` has TDX (DCAP) and NVIDIA verifiers, but neither has run against real
+TDX + NVIDIA CC hardware, and the CVM image and its golden measurements are not released.
 
 ## For validators
 

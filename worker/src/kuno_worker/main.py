@@ -11,8 +11,10 @@ from kuno_protocol.attestation import MockTEE, TdxTEE
 from kuno_protocol.canonical import b64d
 from kuno_protocol.crypto import signing_key_from_bytes
 
+from .attestation import build_gpu_collector
 from .backends import build_backends
 from .config import WorkerConfig
+from .hotkey import HotkeyConfigError, load_hotkey
 from .worker import Worker
 
 log = logging.getLogger("kuno.worker")
@@ -23,7 +25,10 @@ SHUTDOWN_GRACE_S = 120.0
 
 def build_tee(config: WorkerConfig):
     if config.tee == "tdx":
-        return TdxTEE()
+        try:
+            return TdxTEE(gpu_collector=build_gpu_collector(config.gpu_evidence, config.nvattest_bin))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
     if config.tee == "mock":
         if config.mock_quote_key_file is None:
             raise SystemExit("KUNO_MOCK_QUOTE_KEY_FILE is required for the mock TEE (run `kuno-devkit init`).")
@@ -44,7 +49,22 @@ def main() -> None:
         config.profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
     if args.backend:
         config.backend = args.backend
-    worker = Worker(config, build_tee(config), build_backends(config.backend, config))
+    try:
+        hotkey = load_hotkey(config)
+    except HotkeyConfigError as exc:
+        raise SystemExit(f"hotkey: {exc}") from None
+    if hotkey is None and config.tee == "tdx":
+        log.warning(
+            "no hotkey secret configured (KUNO_HOTKEY_SEED_FILE or KUNO_WALLET_NAME): "
+            "production gateways refuse registrations without a hotkey proof"
+        )
+    try:
+        from .safety import default_gate
+
+        default_gate()  # load any configured classifier now, not on the first job
+        worker = Worker(config, build_tee(config), build_backends(config.backend, config), hotkey=hotkey)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
 
     stop = threading.Event()
 
@@ -62,7 +82,7 @@ def main() -> None:
     loop.start()
     while not stop.wait(1.0):
         if not loop.is_alive():
-            raise SystemExit("worker loop exited unexpectedly")
+            raise SystemExit("worker loop exited unexpectedly (a backend failed to warm up?)")
     deadline = time.time() + SHUTDOWN_GRACE_S
     while worker.busy and time.time() < deadline:
         time.sleep(0.5)

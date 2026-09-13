@@ -12,6 +12,7 @@ import httpx
 from kuno_protocol.attestation import AttestationEvidence
 from kuno_protocol.canonical import b64e
 from kuno_protocol.crypto import request_signature_message
+from kuno_protocol.hotkey import HotkeyProof
 from kuno_protocol.receipts import Receipt
 
 
@@ -71,8 +72,12 @@ class GatewayClient:
     def nonce(self) -> bytes:
         return bytes.fromhex(self._send("GET", "/miner/v1/nonce", signed=False).json()["nonce"])
 
-    def register(self, evidence: AttestationEvidence, miner_hotkey: str | None, capacity: int) -> dict:
+    def register(
+        self, evidence: AttestationEvidence, miner_hotkey: str | None, capacity: int, hotkey_proof: HotkeyProof | None = None
+    ) -> dict:
         body = {"evidence": evidence.model_dump(mode="json"), "miner_hotkey": miner_hotkey, "capacity": capacity}
+        if hotkey_proof is not None:
+            body["hotkey_proof"] = hotkey_proof.model_dump(mode="json")
         return self._send("POST", "/miner/v1/enclaves", self._json(body)).json()
 
     def pull(self, wait: float) -> dict:

@@ -1,0 +1,14 @@
+# Pins the exact Python environment baked into the worker image. Not a workspace member:
+# it locks on its own so the image build needs only this repository.
+[project]
+name = "kuno-worker-image"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = ["kuno-worker[nvidia]", "kuno-protocol"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+kuno-protocol = { path = "../protocol", editable = false }
+kuno-worker = { path = "../worker", editable = false }

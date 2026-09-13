@@ -118,15 +118,45 @@ actually hold.
 ## 4. Mainnet
 
 1. Boot the published KunoWorld confidential VM image on a TDX host with the GPUs in CC
-   mode. The image is measured; its expected measurements are published in the golden
-   manifest and checked by the gateway and by every validator.
-2. Set `KUNO_TEE=tdx`, `KUNO_BACKEND=real`, your `KUNO_MINER_HOTKEY`, and the profiles you
-   serve. The worker generates its keys inside the VM, attests with a fresh nonce, and
-   re-attests every 10 minutes and whenever a validator challenges it.
+   mode. The image is measured; its expected measurements are published in the owner-signed
+   golden manifest and checked by the gateway and by every validator.
+2. Set `KUNO_TEE=tdx`, `KUNO_BACKEND=real` and the profiles you serve, and give the worker
+   your hotkey so it can prove it (below). The worker generates its keys inside the VM,
+   attests with a fresh nonce, and re-attests every 10 minutes and whenever a validator
+   challenges it.
 3. The VM only makes outbound connections; it exposes no ports. Do not attempt to attach a
    debugger or a sidecar — that changes the measurements and your work stops counting.
 
-The CVM image, the golden manifest and the TDX/NVIDIA verifiers are not released yet; this
+**GPU evidence.** The worker collects NVIDIA evidence for every GPU with NVIDIA's `nvattest`
+CLI (the NVIDIA Attestation SDK; NVIDIA's Python SDK reaches end of support on 15 September
+2026) and falls back to NVML through `kuno-worker[nvidia]`. `KUNO_GPU_EVIDENCE=auto|nvattest|nvml`
+picks one; `KUNO_NVATTEST_BIN` points at the binary.
+
+**Hotkey proof.** Registration carries an sr25519 signature by your hotkey over the gateway's
+nonce and the enclave's keys, so nobody else can register work under your hotkey. Provide
+the hotkey secret one of two ways, and use a hotkey, never a coldkey:
+
+```bash
+export KUNO_HOTKEY_SEED_FILE=/run/secrets/hotkey.seed   # 0x-prefixed 32-byte hex seed, chmod 600
+# or a btcli wallet (needs kuno-worker[wallet]):
+export KUNO_WALLET_NAME=miner KUNO_WALLET_HOTKEY=default KUNO_WALLET_PATH=~/.bittensor/wallets
+```
+
+`KUNO_MINER_HOTKEY` is optional once a secret is configured; if set, it must match. The secret
+is never logged.
+
+**When something is wrong** the worker does not exit. It logs what to fix — no configfs-tsm
+device, `nvattest` missing, GPUs not in CC mode, measurements not in the manifest — and retries
+with exponential backoff up to `KUNO_RETRY_MAX_S` (default 300 s; gateway outages retry within
+30 s). SIGTERM or Ctrl-C still stops it at once.
+
+**The image.** `image/build.sh` builds the worker container from pinned base-image digests
+and `image/uv.lock`, runs as a non-root user and downloads nothing at runtime, and prints the
+digest to use as `KUNO_IMAGE_DIGEST`. `image/CVM.md` describes how that container becomes a
+measured confidential VM and which steps need a TDX host.
+
+The CVM image, a production golden manifest and a gateway that enforces the verifiers are not
+released yet, and the attestation path has not run on real TDX + NVIDIA CC hardware; this
 section describes the design so you can plan hardware.
 
 ## What earns

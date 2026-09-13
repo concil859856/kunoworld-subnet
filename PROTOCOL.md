@@ -54,14 +54,60 @@ enclave_id  = hex(SHA-256(hpke_public_key | signing_public_key))[:32]
 `report_data` is the 64-byte TDX `REPORTDATA`. GPU evidence is collected inside the CVM for
 `gpu_nonce`, so a quote proves this measured VM, on this GPU evidence, holds these keys now.
 Verifiers check: quote signature chain and TCB (TDX, via DCAP) or the manifest's mock keys
-(development); the binding above; MRTD and RTMR0–3 against the signed golden manifest entry
-for the claimed image digest; that the image is approved for every claimed profile; evidence
-age. TD quote body offsets (DCAP v4, after the 48-byte header): MRTD 136, RTMR0–3 328–520,
-REPORTDATA 520.
+(development); that the TD is not in debug mode (`TDATTRIBUTES` bit 0); the binding above;
+the GPU evidence (NVIDIA NRAS or `nvattest`); MRTD and RTMR0–3 against the signed golden
+manifest entry for the claimed image digest; that the image is approved for every claimed
+profile; evidence age.
+
+TD quote body offsets, counted from the start of the TD report: MRTD 136, RTMR0–3 328–520,
+REPORTDATA 520. The report starts after the 48-byte header in a DCAP v4 quote, and after the
+header plus a 6-byte body descriptor (type 2 = TDX 1.0, 3 = TDX 1.5) in a v5 quote.
+
+GPU evidence (`gpu_evidence`, base64url of these bytes) is:
+
+```
+canonical_json({"format": "kuno/v1/nvidia-gpu", "nonce": hex(gpu_nonce),
+                "gpus": [{"arch": "HOPPER"|"BLACKWELL", "evidence": base64(SPDM report), "certificate": base64(PEM chain)}]})
+```
+
+`evidence` and `certificate` use standard base64, as NVIDIA's `nvattest collect-evidence` and NRAS
+do. A verifier accepts it only if every GPU reports `measres` success, debug disabled, secure
+boot on, a matching report nonce and a verified report signature, and (NRAS) the overall
+result is true for `eat_nonce = hex(gpu_nonce)`.
 
 Development "mock quotes" are `canonical_json({"body": {"tee":"mock","measurements":…,"report_data":hex}, "signature": b64url})`,
 signed over `"kuno/v1/mock-quote\n" + canonical_json(body)` with a key listed in the manifest.
-Production manifests list no mock keys.
+Production manifests list no mock keys, and a production verifier refuses `tee: "mock"` outright.
+
+## Golden manifest
+
+The owner signs `"kuno/v1/manifest\n" + canonical_json(GoldenManifest)` with Ed25519 and publishes
+`{"manifest": GoldenManifest, "signature": b64url}`. Verifiers that have the owner key refuse a
+signed manifest whose signature does not verify; production verifiers also refuse unsigned
+manifests and any manifest that trusts the simulated TEE. A bare `GoldenManifest` document is
+still accepted on development networks.
+
+## Miner registration and hotkey proof
+
+`POST /miner/v1/enclaves` takes `{"evidence", "miner_hotkey", "capacity", "hotkey_proof"?}`.
+`hotkey_proof` is optional on the wire so older workers still register; production gateways
+require it. It is
+
+```
+{"v": 1, "crypto": "sr25519", "hotkey": ss58, "nonce": hex, "enclave_id": hex, "signing_public_key": b64url, "signature": b64url}
+```
+
+where `signature` is the hotkey's sr25519 signature (Schnorrkel, `substrate` signing context, as
+`bittensor_wallet.Keypair.sign` produces) over
+
+```
+"kuno/v1/hotkey-proof\n" + canonical_json({"v":1, "hotkey", "nonce", "enclave_id", "signing_public_key"})
+```
+
+A polkadot.js `signRaw` signature over the same bytes wrapped in `<Bytes>…</Bytes>` is also
+accepted. The verifier takes `nonce`, `enclave_id` and `signing_public_key` from the verified
+evidence (the nonce is the gateway-issued registration nonce), requires `hotkey` to equal
+`miner_hotkey`, and decodes `hotkey` as an SS58 address with network prefix 42.
 
 ## Enclave-signed requests
 
