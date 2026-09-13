@@ -19,7 +19,7 @@ RFC 9180 base mode: `DHKEM(X25519, HKDF-SHA256)`, `HKDF-SHA256`, `ChaCha20-Poly1
 | `info` | `kuno/v1/job` |
 | input key | `Export("kuno/v1/input-key", 32)` |
 | output key | `Export("kuno/v1/output-key", 32)` |
-| plaintext | canonical JSON of `SealedPayload` (prompt, negative prompt, seed, input manifest, options) |
+| plaintext | UTF-8 JSON of `SealedPayload` (prompt, negative prompt, seed, input manifest, options); unlike the AAD it need not be canonical |
 | AAD | `canonical_json({"v":1,"job_id":…,"enclave_id":…,"params":GenerationParams,"inputs":[blob ids]})` |
 
 The client generates the job id (lowercase UUIDv4). Because the public `GenerationParams`

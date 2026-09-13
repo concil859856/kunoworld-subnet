@@ -1,8 +1,9 @@
 # Running a KunoWorld miner
 
-You rent GPUs; KunoWorld gives you the exact image they run. You never see customer
-prompts, media or videos, and the network can prove your machine is running the image
-it claims. This guide covers a first run on a dev network and the mainnet requirements.
+You rent GPUs; KunoWorld is designed to give you the exact image they run, so that you never
+see customer prompts, media or videos and the network can prove your machine is running the
+image it claims. That image and the attestation verifiers are not released yet (see section 4).
+This guide covers a first run on a dev network and the mainnet requirements.
 
 ## 1. What to rent
 
@@ -19,8 +20,11 @@ reachability, then lists which profiles the machine can serve and what is missin
 | Profile | GPUs | VRAM per GPU | Notes |
 |---|---|---|---|
 | `ltx-2.5-fast`, `ltx-2.5-pro` | 1 | 80 GB | cheapest entry; an H100 80GB or H200 works |
-| `ltx-2.5-4k` | 1 | 141 GB | H200 or a Blackwell card |
+| `ltx-2.5-4k` | 1 | 141 GB | an H200 or a B200; the 96 GB RTX PRO 6000 is too small |
 | `h3-turbo`, `h3`, `h3-reference` | 4 | 80 GB | official recipe is 4 GPUs with Ulysses sequence parallelism |
+
+The subnet README's hardware classes (C1, C2, C4) are how the network groups these profiles;
+the VRAM column is the minimum each one needs.
 
 Mainnet additionally requires an Intel TDX host (Xeon 5th gen "Emerald Rapids" or Xeon 6
 "Granite Rapids") with the GPUs in NVIDIA confidential-computing mode. Consumer cards

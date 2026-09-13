@@ -35,7 +35,7 @@ def build_tee(config: WorkerConfig):
 def main() -> None:
     parser = argparse.ArgumentParser(prog="kuno-worker", description="KunoWorld miner worker (runs inside the confidential VM)")
     parser.add_argument("--profiles", help="comma-separated profile ids (default: KUNO_PROFILES)")
-    parser.add_argument("--backend", choices=["mock", "real"], help="default: KUNO_BACKEND or mock")
+    parser.add_argument("--backend", choices=["mock", "real", "cold"], help="default: KUNO_BACKEND or mock")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 

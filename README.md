@@ -10,8 +10,10 @@ inside a confidential VM, and the validator.
 
 ## For miners
 
-You provide GPU servers. KunoWorld provides the exact image they run; you never see
-customer prompts, media or videos, and the network can prove the image is unmodified.
+You provide GPU servers. KunoWorld is designed so that you run an exact, measured image, never
+see customer prompts, media or videos, and the network can prove the image is unmodified.
+That image and the attestation verifiers are not released yet, so today workers run against a
+simulated TEE on dev networks.
 **[MINING.md](MINING.md)** is the step-by-step guide: what to rent, where the weights go,
 a first run on a dev network, and the mainnet requirements.
 
@@ -33,8 +35,8 @@ confidential VM. Consumer GPUs (RTX 4090/5090) have no confidential mode and can
 - Attests with a fresh gateway nonce, then re-attests every 10 minutes and answers
   validator challenges at any time.
 - Only makes outbound connections; the VM exposes no ports.
-- Rejects replayed jobs, tampered requests and mismatched inputs, runs the in-enclave
-  safety gate, and never logs content.
+- Rejects replayed jobs, tampered requests and mismatched inputs, runs the safety gate
+  (currently a placeholder filter), and never logs content.
 
 Local development with a simulated TEE:
 
@@ -43,9 +45,10 @@ uv run kuno-devkit init --data data
 KUNO_DATA_DIR=data uv run kuno-worker --profiles ltx-2.5-fast,h3-turbo
 ```
 
-Production (`KUNO_TEE=tdx`, `KUNO_BACKEND=real`) runs inside the published CVM image with the
-official SGLang (H3) and `ltx_pipelines` (LTX-2.5) runtimes. The image, its golden
-measurements and the TDX/NVIDIA verifiers are not released yet.
+Production is meant to run inside the published CVM image with `KUNO_TEE=tdx` and
+`KUNO_BACKEND=real`: the official SGLang server for H3 and resident pipelines for LTX-2.5. None
+of it has run on GPUs yet, `KUNO_TEE=tdx` cannot yet collect NVIDIA GPU evidence, and the image,
+its golden measurements and the TDX/NVIDIA verifiers are not released.
 
 ## For validators
 
@@ -61,7 +64,7 @@ Each round the validator:
 
 ```bash
 KUNO_DATA_DIR=data uv run kuno-validator once --canary h3-turbo --canary ltx-2.5-fast
-uv run --extra chain kuno-validator run --netuid <netuid> --wallet-name <name> --wallet-hotkey <hotkey>
+uv run --package kuno-validator --extra chain kuno-validator run --netuid <netuid> --wallet-name <name> --wallet-hotkey <hotkey>
 ```
 
 Validators must send H3 canaries from a region where the H3 license applies.
