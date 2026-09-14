@@ -240,7 +240,7 @@ uv run python subnet/image/cvm/publish.py entry --shapes subnet/image/cvm/shapes
     --model-digest ltx-2.5-fast@C2.h200-141gb.x1=<digest> --base manifest.json --out manifest.json
 uv run kuno-devkit sign-manifest --key owner.key --manifest manifest.json --out manifest.signed.json
 uv run python subnet/image/cvm/publish.py verify --manifest manifest.signed.json \
-    --owner-public-key <b64url> --measurements out/cvm/a/measurements/c2.h200-141gb.x1.json
+    --owner-public-key=<b64url> --measurements out/cvm/a/measurements/c2.h200-141gb.x1.json
 ```
 
 `entry` adds an `AllowedMeasurement`: `platform: "tdx"`, the worker image digest RTMR3 records, the

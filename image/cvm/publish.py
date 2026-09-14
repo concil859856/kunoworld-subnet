@@ -9,7 +9,7 @@
 
     # anyone: the signed manifest parses under the production policy and contains these measurements
     uv run python subnet/image/cvm/publish.py verify --manifest manifest.signed.json \
-        --owner-public-key <b64url> --measurements out/cvm/measurements/c2.h200-141gb.x1.json
+        --owner-public-key=<b64url> --measurements out/cvm/measurements/c2.h200-141gb.x1.json
 
     # operator on a TDX host: a live quote's registers against the published measurements
     uv run python subnet/image/cvm/publish.py compare-quote --quote quote.bin \
@@ -248,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     entry.add_argument("--out", type=Path, required=True)
     verify = sub.add_parser("verify", help="check a signed manifest under the production policy")
     verify.add_argument("--manifest", type=Path, required=True)
-    verify.add_argument("--owner-public-key", required=True, help="base64url Ed25519 public key")
+    verify.add_argument("--owner-public-key", required=True, help="base64url Ed25519 public key; pass it as --owner-public-key=KEY, since a key can start with -")
     verify.add_argument("--measurements", type=Path, action="append", default=[])
     quote = sub.add_parser("compare-quote", help="compare a raw TD quote with published measurements")
     quote.add_argument("--quote", type=Path, required=True)

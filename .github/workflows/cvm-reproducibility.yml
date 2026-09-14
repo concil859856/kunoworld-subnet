@@ -107,5 +107,5 @@ jobs:
           uv run python image/cvm/publish.py entry --shapes image/cvm/shapes.json "${args[@]}" --dev --out manifest.json
           uv run kuno-devkit sign-manifest --key "$throwaway/owner.key" --manifest manifest.json --out manifest.signed.json
           public_key="$(grep '^KUNO_OWNER_PUBLIC_KEY=' "$throwaway/dev.env" | cut -d= -f2)"
-          uv run python image/cvm/publish.py verify --manifest manifest.signed.json --owner-public-key "$public_key" "${args[@]}"
+          uv run python image/cvm/publish.py verify --manifest manifest.signed.json --owner-public-key="$public_key" "${args[@]}"
           rm -rf "$throwaway"

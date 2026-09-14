@@ -3,7 +3,7 @@
 Owner (offline, with the owner key):
   kuno-turbo eval-set   --competition ID --window N --prompts prompts.txt --durations 4,8 --out w0.json
   kuno-turbo spec       --key owner.key --config spec.json --eval-set w0.json [--eval-set w1.json ...] --out spec.signed.json
-  kuno-turbo verify-spec --spec spec.signed.json --owner-public-key <b64url>
+  kuno-turbo verify-spec --spec spec.signed.json --owner-public-key=<b64url>
   kuno-turbo adopt      --spec spec.signed.json --submission winner.json --report turbo-report.json \\
                         --profiles profiles.json --manifest manifest.json [--eval-set wN.json] --out-dir adopted/
 
@@ -286,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cmd = sub.add_parser("verify-spec", help="check a signed spec against the owner public key")
     cmd.add_argument("--spec", type=Path, required=True)
-    cmd.add_argument("--owner-public-key", required=True)
+    cmd.add_argument("--owner-public-key", required=True, help="base64url Ed25519 public key; pass it as --owner-public-key=KEY, since a key can start with -")
 
     cmd = sub.add_parser("submit", help="sign a submission with your hotkey and print its commitment")
     cmd.add_argument("--hotkey-seed-file", type=Path, required=True)

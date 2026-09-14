@@ -417,10 +417,10 @@ def test_a_manifest_entry_is_built_signed_offline_and_accepted_by_the_production
     signed = tmp_path / "manifest.signed.json"
     devkit.sign_manifest_file(tmp_path / "dev" / "owner.key", manifest, signed)
     verify = ["verify", "--manifest", str(signed), "--measurements", str(measurements)]
-    assert publish.main(verify + ["--owner-public-key", env["KUNO_OWNER_PUBLIC_KEY"]]) == 0
+    assert publish.main(verify + [f"--owner-public-key={env['KUNO_OWNER_PUBLIC_KEY']}"]) == 0
     other = devkit.init(tmp_path / "other")
-    assert publish.main(verify + ["--owner-public-key", other["KUNO_OWNER_PUBLIC_KEY"]]) == 1
-    assert publish.main(["verify", "--manifest", str(manifest), "--owner-public-key", env["KUNO_OWNER_PUBLIC_KEY"]]) == 1  # unsigned
+    assert publish.main(verify + [f"--owner-public-key={other['KUNO_OWNER_PUBLIC_KEY']}"]) == 1
+    assert publish.main(["verify", "--manifest", str(manifest), f"--owner-public-key={env['KUNO_OWNER_PUBLIC_KEY']}"]) == 1  # unsigned
 
     # Re-running replaces the identical entry instead of duplicating it.
     assert publish.main(args + ["--base", str(signed)]) == 0
