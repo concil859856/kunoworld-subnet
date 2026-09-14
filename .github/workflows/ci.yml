@@ -15,6 +15,7 @@ jobs:
           python-version: "3.12"
       # Installed directly rather than as a workspace: this repo is also a member of the
       # development workspace, and a package can only belong to one.
-      - run: uv venv
+      # setup-uv already creates and activates .venv; --clear keeps this step working either way.
+      - run: uv venv --clear
       - run: uv pip install -e "protocol[tdx]" -e worker -e validator pytest
       - run: uv run pytest protocol/tests worker/tests validator/tests -q

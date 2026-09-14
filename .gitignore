@@ -3,4 +3,5 @@ __pycache__/
 *.egg-info/
 .venv/
 .pytest_cache/
-data/
+# The dev network's KUNO_DATA_DIR at the repo root; test fixtures under */tests/data/ are tracked.
+/data/
