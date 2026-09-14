@@ -167,9 +167,9 @@ class Qwen3GuardClassifier:
     """Qwen/Qwen3Guard-Gen-0.6B (Apache-2.0, https://huggingface.co/Qwen/Qwen3Guard-Gen-0.6B).
 
     About 0.75B parameters (1.5 GB in bf16), CPU-only, weights from a local directory
-    baked into the image. Needs the worker's `safety` extra. Not yet run against the real
-    weights in this repository: latency and the exact output format must be checked on
-    the target CPU before it is relied on.
+    baked into the worker images (image/CVM.md pins the revision). Needs the worker's `safety`
+    extra. `kuno-safety-check` runs it against those weights on a benign prompt only; its
+    accuracy, and its latency on the target CPU, are unmeasured.
     """
 
     name = "qwen3guard-gen"

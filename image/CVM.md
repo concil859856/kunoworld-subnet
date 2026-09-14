@@ -72,37 +72,62 @@ RTMR2 depend on OVMF, the QEMU version, the shape and the OS release (kernel, in
 `kuno-app`), so every worker image built for one OS release and shape shares them. This is what Turbo's base
 measurements rely on (`TURBO.md`, "Base measurements").
 
-## 1. Worker container (built here)
+## 1. Worker containers (built here)
 
 ```bash
-image/lock.sh              # only when dependencies change; pins image/uv.lock
-image/build.sh --check     # two clean builds, same digest, prints KUNO_IMAGE_DIGEST=sha256:…
+image/lock.sh                         # only when dependencies change; pins image/uv.lock and image/sglang/uv.lock
+image/build.sh --variant all          # both images; prints KUNO_IMAGE_DIGEST_LTX=sha256:… and KUNO_IMAGE_DIGEST_H3=sha256:…
+image/build.sh --check                # the LTX image twice, the second without cache; prints KUNO_IMAGE_DIGEST=sha256:…
+image/push.sh docker.io/<namespace>/kunoworld-worker   # pushes ltx-<version> and h3-<version>, prints their digests
 ```
 
-Base images are pinned by digest in `image/worker.Dockerfile`; Python packages come from
-`image/uv.lock` with hashes; the container runs as uid 10001 and fetches nothing at runtime.
-It holds the worker and its Python model runtime for `KUNO_BACKEND=real` (`kuno-worker[gpu]`: CUDA 12.8
-torch, diffusers, transformers, torchao). SGLang for H3 and NVIDIA's `nvattest` must be added in a
-derived image, pinned the same way; that layer does not exist yet.
-`KUNO_IMAGE_OCI_OUT=<path>` makes `build.sh` keep the OCI archive, which the CVM build packs onto the
-worker image disk (§3).
+One Dockerfile, `image/worker.Dockerfile`, has a target per model family:
 
-### Safety classifier weights (pinned here, not yet in an image)
+| Image | Target, local tag | Contents | Entry point | Default `KUNO_PROFILES` |
+|---|---|---|---|---|
+| LTX-2.5 | `ltx`, `kuno-worker:ltx` | the worker venv `/opt/kuno`: `kuno-worker[nvidia,gpu,safety,provenance]` (CUDA 12.8 torch, torchaudio, torchao, diffusers, transformers, timm, PyAV, c2pa-python), and the safety classifiers in `/opt/kuno-safety` | `kuno-worker` | `ltx-2.5-fast` |
+| MiniMax H3 | `h3`, `kuno-worker:h3` | everything in `ltx`, plus SGLang in `/opt/sglang` and g++ ("The MiniMax H3 image", below) | `kuno-h3-worker` | `h3,h3-reference` |
 
-The output safety check (`SECURITY.md`, "Output safety") runs on CPU inside the CVM. Its
-weights must be covered by the measurement like everything else, so they are never
-downloaded at runtime: `from_pretrained(..., local_files_only=True)` reads local directories
-only. Fetch them off-host at a pinned revision, verify every file, and bake them into a
-derived image layer. The worker image digest, and through it RTMR3, then covers them. At
-about 1.8 GB they could also go into a weights verity image, which is measured by its root
-hash; either works, as long as the files are checked against the pins below.
+Sizes as built here:
+- `ltx`: about 6.6 GB to pull and 17.6 GB unpacked, including 3.2 GB of classifier weights.
+- `h3`: about 10.9 GB to pull and 31.6 GB unpacked, including SGLang's 8.9 GB venv.
 
-| Directory | Source (revision) | License |
-|---|---|---|
-| `nsfw_image_detector` | [Freepik/nsfw_image_detector](https://huggingface.co/Freepik/nsfw_image_detector) @ `15b85477e4fd2000db76ae9aae0f89a72f95e2e3` | MIT |
-| `clip-vit-large-patch14` | [openai/clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) @ `32bd64288804d66eefd0ccbe215aa642df71cc41` | MIT |
+What is pinned, and how:
+- **Base images:** by digest.
+- **Python packages:** from `image/uv.lock` and `image/sglang/uv.lock`, with hashes. Every dependency installs
+  from a hashed wheel except one pure-Python sdist in SGLang's venv, built against the locked setuptools (below).
+- **Classifier weights:** fetched at fixed revisions and checked against `image/safety-models/SHA256SUMS` (below).
+- **The H3 image's toolchain:** Debian packages from snapshot.debian.org at `20260721T000000Z`.
 
-`SHA256SUMS` for that tree (model cards omitted; nothing loads them):
+Containers run as uid 10001 and fetch nothing at runtime (`HF_HUB_OFFLINE=1`). Model weights are mounted, never
+baked in (§2). NVIDIA's `nvattest` is in neither image, so workers collect GPU evidence through NVML.
+
+`build.sh` loads each image into Docker from the same OCI archive it takes the digest from, so `docker images`
+shows the published digest. That needs Docker's containerd image store. `KUNO_IMAGE_OCI_OUT=<path>` keeps the
+archive of a single image, which the CVM build packs onto the worker image disk (§3). `KUNO_IMAGE_NO_GIT=1` with
+`SOURCE_DATE_EPOCH` set builds without calling git.
+
+**Reproducibility.** `--check` rebuilds without cache and compares digests. For these images that means
+downloading and writing about 10 GB of CUDA wheels (H3: about 12 GB more) and 3.4 GB of weights a second time, so
+run it in CI or before a release. It has not been run on these images; the layers follow the same rules as the
+worker image before them.
+
+### Safety classifier weights (in both images)
+
+The prompt classifier and the output safety check (`SECURITY.md`, "Output safety") run on CPU inside the CVM.
+Their weights must be covered by the measurement like everything else, so they are never downloaded at
+runtime: `from_pretrained(..., local_files_only=True)` reads local directories only. The Dockerfile's
+`safety-models` stage fetches them at the revisions below, with `image/safety-models/fetch.py`. It then runs
+`sha256sum --check --strict SHA256SUMS`, and any mismatch fails the build. Both images copy the checked tree to
+`/opt/kuno-safety`, so the worker image digest, and through it RTMR3, covers them.
+
+| Directory | Source (revision) | License | Size |
+|---|---|---|---|
+| `nsfw_image_detector` | [Freepik/nsfw_image_detector](https://huggingface.co/Freepik/nsfw_image_detector) @ `15b85477e4fd2000db76ae9aae0f89a72f95e2e3` | MIT | 173 MB |
+| `clip-vit-large-patch14` | [openai/clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) @ `32bd64288804d66eefd0ccbe215aa642df71cc41` | MIT | 1.7 GB |
+| `qwen3guard-gen-0.6b` | [Qwen/Qwen3Guard-Gen-0.6B](https://huggingface.co/Qwen/Qwen3Guard-Gen-0.6B) @ `fada3b2f655b89601929198343c94cd2f64d93cc` | Apache-2.0, its `LICENSE` shipped beside the weights | 1.5 GB |
+
+`image/safety-models/SHA256SUMS` (model cards omitted; nothing loads them):
 
 ```
 39f53e86cc4868e0e11396b523c906f376621f54c1025ffc9ee2ee840542a41b  nsfw_image_detector/config.json
@@ -115,25 +140,51 @@ f8c0d6c39aee3f8431078ef6646567b0aba7f2246e9c54b8b99d55c22b707cbf  clip-vit-large
 deef455e52fa5e8151e339add0582e4235f066009601360999d3a9cda83b1129  clip-vit-large-patch14/tokenizer_config.json
 a83e0809aa4c3af7208b2df632a7a69668c6d48775b3c3fe4e1b1199d1f8b8f4  clip-vit-large-patch14/tokenizer.json
 3f0c4f7d2086b61b38487075278ea9ed04edb53a03cbb045b86c27190fa8fb69  clip-vit-large-patch14/vocab.json
+832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e  qwen3guard-gen-0.6b/LICENSE
+4674816bdf440c113a9ca87aedfa069b67f7cabbd89e71da7d4e4a68adce4af4  qwen3guard-gen-0.6b/config.json
+5f0bc42aae9f779d06bf620ce685a02cb0cde802d0f27f05c7331aaf0e1fd2d7  qwen3guard-gen-0.6b/generation_config.json
+8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5  qwen3guard-gen-0.6b/merges.txt
+4f3ce47ebd968cddb67de08d8764f8ede7c410a7d1fb9e08145a4c7a2f2e5c0f  qwen3guard-gen-0.6b/model.safetensors
+aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4  qwen3guard-gen-0.6b/tokenizer.json
+934e187433b06c5d28519e0347dd293084cf28621f00a86ae7e24e42f8b53e81  qwen3guard-gen-0.6b/tokenizer_config.json
+ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910  qwen3guard-gen-0.6b/vocab.json
 ```
 
-Only `.safetensors` weights are pinned. Pickled `pytorch_model.bin` files can execute code
-when loaded, which is one more reason `openai/clip-vit-base-patch16`, published only as
-`.bin` on its main branch, is not the default. A derived layer, after the worker's `safety`
-extra (CPU torch, transformers, timm) has been added to `image/uv.lock` (not done yet):
+Where the pins come from:
+- **Safetensors files:** their hashes are Hugging Face's LFS SHA-256 at the pinned revision.
+- **Small files:** hashed after download. Their git blob ids match the revision's tree.
 
-```dockerfile
-FROM kuno-worker@sha256:<worker image digest>
-COPY safety-models/ /opt/kuno-safety/
-RUN cd /opt/kuno-safety && sha256sum --check --strict SHA256SUMS
-ENV KUNO_SAFETY_FRAME_MODEL_PATH=/opt/kuno-safety/nsfw_image_detector \
-    KUNO_SAFETY_MINOR_MODEL_PATH=/opt/kuno-safety/clip-vit-large-patch14 \
-    KUNO_SAFETY_FRAME_DTYPE=bfloat16 \
-    KUNO_SAFETY_REQUIRE_CLASSIFIER=1
+Only `.safetensors` weights are pinned, and `fetch.py` refuses any file that isn't safetensors, JSON, text or
+`LICENSE`. Pickled `pytorch_model.bin` files can execute code when loaded. CLIP's repository also carries `.bin`,
+`.h5` and `.msgpack` copies, which are never fetched, and `openai/clip-vit-base-patch16`, published only as `.bin`
+on its main branch, is not the default. `protocol/tests/test_worker_image_pins.py` checks that the Dockerfile's
+revisions, `SHA256SUMS` and this section agree.
+
+Both images set:
+
+```
+KUNO_SAFETY_CLASSIFIER=qwen3guard
+KUNO_SAFETY_MODEL_PATH=/opt/kuno-safety/qwen3guard-gen-0.6b
+KUNO_SAFETY_FRAME_MODEL_PATH=/opt/kuno-safety/nsfw_image_detector
+KUNO_SAFETY_MINOR_MODEL_PATH=/opt/kuno-safety/clip-vit-large-patch14
+KUNO_SAFETY_FRAME_DTYPE=bfloat16
+KUNO_SAFETY_REQUIRE_CLASSIFIER=1
 ```
 
-`KUNO_SAFETY_REQUIRE_CLASSIFIER=1` makes a worker whose models are missing or broken refuse to
-start. Measured CPU cost per job for 10 sampled frames, on a 6-core AMD EPYC 4244P with 6
+`KUNO_SAFETY_REQUIRE_CLASSIFIER=1` makes a worker whose models are missing or broken refuse to start. The
+`kuno-safety-check` command loads the models through the worker's own code with these settings. It classifies one
+fixed benign prompt and one synthetic frame, and prints each model's scores and timings as JSON:
+
+```bash
+docker run --rm --entrypoint kuno-safety-check kuno-worker:ltx
+```
+
+Measured on the 12-thread AMD EPYC 4244P behind the table below, in both images, with `--network none`:
+- **Load:** all three models in 8–9 s.
+- **Qwen3Guard:** answered "Safe" for the benign prompt in 0.76 s.
+- **One bf16 frame:** 0.24 s on Freepik's detector (sexual 0.0007) and 0.14–0.16 s on CLIP (minor 0.04).
+
+Measured CPU cost per job for 10 sampled frames, on a 6-core AMD EPYC 4244P with 6
 threads (`worker/scripts/benchmark_frame_safety.py`):
 
 | Model | float32 | bfloat16 |
@@ -144,6 +195,75 @@ threads (`worker/scripts/benchmark_frame_safety.py`):
 
 TDX hosts (Sapphire Rapids and later) have AMX, which should make bfloat16 faster still.
 Measure on the target shape before fixing `KUNO_SAFETY_FRAMES` or the thread count.
+
+### The MiniMax H3 image
+
+With `KUNO_BACKEND=real`, the H3 profiles run on two runtimes:
+- `h3` and `h3-reference` go to SGLang's official server over loopback (`worker/backends/h3.py`).
+- `h3-turbo` runs in the worker process, through diffusers' MiniMax H3 modular pipeline with LightX2V's LoRA
+  (`backends/h3_resident.py`).
+
+The `h3` target adds SGLang's side:
+
+- **SGLang 0.5.19** (`sglang[diffusion]`, released 2026-09-04), in a venv of its own at `/opt/sglang` and locked
+  by `image/sglang/uv.lock`.
+  - **Version.** H3 support arrived in 0.5.17. 0.5.19 is the latest release and carries the H3 fixes since:
+    cross-request audio determinism and a `dp_size>1` deadlock (#36398), native loading of diffusers-layout H3
+    components (#36067), and Cache-DiT caching on H3 (#33827, in 0.5.18).
+  - **Why a separate venv.** SGLang pins torch 2.13.0, transformers 5.12.1 and diffusers 0.37.0. In one venv they
+    would replace the worker's torch 2.11.0+cu128 and diffusers 0.40, which LTX-2.5 and the Turbo pipeline need.
+  - **Driver.** SGLang's torch is a CUDA 13 build, so the host needs an R580 driver or newer. The CVM ships
+    595.91.07; the worker venv alone needs only CUDA 12.8.
+  - **Prereleases.** SGLang 0.5.19 requires two, and no others are admitted. `flash-attn-4 4.0.0b19` comes from
+    PyPI. `cuda-tile 1.6.0rc5` comes from NVIDIA's index: PyPI has only a stub for it, which downloads the wheel
+    during installation with no hash to check.
+  - **One sdist.** `antlr4-python3-runtime 4.9.3` has no wheel. It comes in through `omegaconf` and
+    `nvidia-modelopt` from `sglang[diffusion]`. The build installs it without build isolation, using the
+    setuptools 84.0.0 wheel from the lock, so building it fetches nothing unpinned.
+- **g++**, from the Debian snapshot. Triton builds its CUDA launcher with gcc the first time a kernel runs, and
+  SGLang's diffusion kernels include Triton and JIT-compiled ones. The H3 DiT calls `fused_inplace_qknorm`.
+- **`kuno-h3-worker`**, the entry point (`worker/src/kuno_worker/h3_servers.py`). kuno-app starts one container per
+  GPU group (§6), so each container brings its own servers.
+  - **What it starts.** One `sglang serve` per checkpoint variant the profiles route to: fl2va for `h3`, ref2va for
+    `h3-reference`. Each runs with the official recipe:
+    ```
+    /opt/sglang/bin/sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va --num-gpus 4 \
+        --ulysses-degree 4 --performance-mode speed --host 127.0.0.1 --port 30010 --master-port 31010 --scheduler-port 32010
+    ```
+  - **Ports.** The HTTP port comes from `KUNO_H3_FL2VA_URL` or `KUNO_H3_REF2VA_URL`, which must be
+    `http://127.0.0.1:<port>`. SGLang otherwise picks its master and scheduler ports by looking for free ones,
+    which two servers starting at once can race for. So those are fixed 1000 and 2000 above the HTTP port.
+  - **Order.** It waits for every server's `/health` before starting `kuno-worker`, so the worker never registers
+    capacity it can't serve yet.
+  - **Failures.** If any process exits it stops the others, sending SIGTERM to the worker first so an in-flight job
+    can finish.
+  - **Logs.** Server output is discarded unless `KUNO_SGLANG_LOG=inherit`, which kuno-app doesn't pass into the VM.
+    Nothing guarantees SGLang keeps prompts out of its logs.
+  - **Environment.** The servers get none of the `KUNO_*` settings. `KUNO_H3_NUM_GPUS`, `KUNO_SGLANG_ARGS` and
+    `KUNO_SGLANG_START_TIMEOUT_S` (default 3600 s) adjust them.
+- **Weights.** The image sets `HF_HUB_CACHE=/models/h3` and `HF_HUB_OFFLINE=1`. Mount a Hugging Face hub cache that
+  holds `MiniMaxAI/MiniMax-H3` there (`hf download MiniMaxAI/MiniMax-H3 --cache-dir <dir>`), for example as the
+  `h3` weights image. SGLang recognizes H3 by that repository id and resolves it from the cache. Its cookbook says
+  not to point `--model-path` at a subdirectory of a manual download. `KUNO_H3_MODEL_ID` replaces the id for SGLang
+  and the Turbo pipeline alike.
+
+**`h3-turbo` is in the image but not in its default profiles.**
+- **No lightx2v.** `real` serves h3-turbo in the worker process through diffusers 0.40, already in `/opt/kuno`.
+  LightX2V's `inference_minimax_h3.py` is only the `cold` backend, which reloads about 124 GB for every job.
+- **Why it's off by default.**
+  - Its loader puts H3 on one device, beside two SGLang servers that hold the same four GPUs. Nobody has
+    measured whether that fits.
+  - It needs the LoRA file mounted (`KUNO_H3_TURBO_LORA`).
+- **Turning it on.** Set `KUNO_PROFILES=h3-turbo,h3,h3-reference` once it has run on GPUs.
+
+**Not verified: nothing in this image has run on a GPU.** In particular:
+- SGLang loading H3 from a read-only, offline hub cache, and both variants fitting side by side on four GPUs.
+- SGLang's JIT kernels compiling with the CUDA 13 toolkit that pip wheels put in `/opt/sglang`. `kuno-h3-worker` sets
+  the servers' `CUDA_HOME` to it (`site-packages/nvidia/cu13`, holding `nvcc` and the runtime headers), and g++ is
+  the host compiler. Whether those wheels hold everything the kernels include and link is unchecked.
+- The Turbo pipeline's memory, and a CUDA 13 torch (SGLang) sharing the GPUs with a CUDA 12.8 torch (the worker).
+- Shared memory for NCCL between four GPUs in one container. kuno-app sets no `--shm-size`, and podman's default
+  `/dev/shm` is 64 MB.
 
 ## 2. Model weights on dm-verity
 
@@ -209,7 +329,8 @@ sudo image/cvm/build.sh --out out/cvm --weights weights.json --check    # writes
 
 `build.sh` steps:
 1. Hash-check the inputs.
-2. Build the worker image twice, via `image/build.sh --check`.
+2. Build the worker image twice, via `image/build.sh --check`: the LTX image, or the H3 image with
+   `KUNO_IMAGE_VARIANT=h3`.
 3. `pack-image.sh`: the worker image disk, `worker.img.verity`, with its root hash, data size and image digest.
    The build stops unless the disk holds the digest step 2 built.
 4. Build the mkosi root filesystem tree and kernel. Nothing of the worker release goes into the tree, and the
@@ -429,9 +550,12 @@ continuing, the way dstack-vmm does (`configure_gpus`: GPUs, then bridges). The 
 `worker.env` sets the layout, and `kuno-app` starts one container per group:
 
 ```
-KUNO_PROFILES=h3-turbo,h3,h3-reference
+KUNO_PROFILES=h3,h3-reference
 KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7
 ```
+
+Add `h3-turbo` to `KUNO_PROFILES` once it has run on GPUs (§1, "The MiniMax H3 image"). The shapes already
+list it.
 
 - **Devices.** Each container gets its group's CDI devices, `nvidia.com/gpu=<index>`, and in Protected PCIe mode
   the NVSwitch device nodes and the root filesystem's NSCQ library.
@@ -439,8 +563,9 @@ KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7
   listed profile's `gpus_per_worker`. The table it checks against is on the worker image disk, measured into RTMR3.
 - **Supervision.** If one worker exits, `kuno-app` stops the other and fails, and systemd restarts both.
 - **H3 runtime ports.** The workers share the host network namespace, so worker *i* gets
-  `KUNO_H3_FL2VA_URL=http://127.0.0.1:30010+10i` and `KUNO_H3_REF2VA_URL=…:30011+10i`. Its runtime servers must
-  listen there.
+  `KUNO_H3_FL2VA_URL=http://127.0.0.1:30010+10i` and `KUNO_H3_REF2VA_URL=…:30011+10i`. The H3 image's
+  `kuno-h3-worker` starts that container's SGLang servers there, with their master and scheduler ports 1000 and
+  2000 higher (§1, "The MiniMax H3 image").
 - **No layout set.** One worker with every GPU, as before.
 
 Why a hostile layout can't claim more GPUs than it has:
@@ -493,8 +618,10 @@ places BARs bottom-up from there. Confirm both from the first TD's event log (`m
   - `/dev/disk/by-id/virtio-kuno-image` appearing from the virtio serial, and mounting the squashfs read-only.
   - `podman load` from the archive on that mount, and the loaded image's id being its config digest.
   - `tar -xOf` seeking through a multi-gigabyte archive instead of reading it.
-  - That buildx's OCI archive (`image/build.sh`) has an `index.json` naming exactly the image manifest, which
-    `pack-image.sh` requires. `image/build.sh` reads `manifests[0]`, but no archive was built here.
+  - `pack-image.sh` on a real worker image archive. `image/build.sh` now builds the images' OCI archives here.
+    Each `index.json` names exactly one manifest, as `pack-image.sh` requires. It also carries the name
+    annotations `docker load` tags by, which `pack-image.sh` drops when it writes its fixed index.
+    `pack-image.sh` itself has not run on them.
   - `pack-image.sh`'s archive bytes come from python3's `tarfile`, which the mkosi tools tree does not pin.
     Two builders with different Python versions have not been compared.
 - **The mkosi build.**

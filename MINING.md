@@ -67,9 +67,10 @@ server, so H3 runs as one 8-GPU TD with two workers of four GPUs each:
 - `c8.b200-180gb.x8` or `c8.b300-288gb.x8`: CC mode on, with Fabric Manager on the host set to
   `PARTITION_RAIL_POLICY=symmetric`. Traffic between the GPUs is encrypted.
 
-Plan it with `plan-host.py --shape c8.…`, and put `KUNO_PROFILES=h3-turbo,h3,h3-reference` and
-`KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7` in `worker.env`. The second worker's SGLang servers listen on
-ports 30020 and 30021.
+Plan it with `plan-host.py --shape c8.…`, and put `KUNO_PROFILES=h3,h3-reference` and
+`KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7` in `worker.env`. Add `h3-turbo` only once it has run on your GPUs
+([section 3c](#3c-worker-images)). Each worker container starts its own SGLang servers; the second
+worker's listen on ports 30020 and 30021.
 
 ## 2. Get the weights
 
@@ -105,6 +106,10 @@ sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
   --performance-mode speed --port 30011 --model-variant ref2va    # h3-reference
 ```
+
+The H3 worker image starts these servers itself ([section 3c](#3c-worker-images)). It reads the
+weights from a Hugging Face hub cache mounted at `/models/h3`, for example one written by
+`hf download MiniMaxAI/MiniMax-H3 --cache-dir /models/h3`.
 
 Never enable MiniMax's hosted prompt rewriter or 2K regenerator: both are API-only and
 would send customer content out of the enclave.
@@ -193,6 +198,79 @@ in-process pipeline. Serving several profiles on one machine loads them in turn 
 the least recently used when VRAM runs out, so pin `KUNO_PROFILES` to what the card can
 actually hold.
 
+## 3c. Worker images
+
+Two images come from one Dockerfile (`image/build.sh --variant all`). They are published as tags of
+one repository, `<registry>/<namespace>/kunoworld-worker`, by `image/push.sh`:
+
+| Tag | Built locally as | Serves | Default `KUNO_PROFILES` | Entry point |
+|---|---|---|---|---|
+| `ltx-<version>` | `kuno-worker:ltx` | `ltx-2.5-fast`, `ltx-2.5-pro`, `ltx-2.5-4k` | `ltx-2.5-fast` | `kuno-worker` |
+| `h3-<version>` | `kuno-worker:h3` | `h3`, `h3-reference`; `h3-turbo` when you enable it | `h3,h3-reference` | `kuno-h3-worker`: SGLang's servers, then the worker |
+
+They are about 6.6 GB (`ltx`) and 10.9 GB (`h3`) to pull, and 17.6 GB and 31.6 GB unpacked.
+`<version>` is the worker package's version and the commit it was built from, for example
+`0.1.0-1a2b3c4d5e6f`. Run an image by digest (`…@sha256:…`), the value the golden manifest lists,
+not by tag. No digest is published yet.
+
+**Weights are not in the images.** Mount them read-only, readable by uid 10001:
+
+| Image | Mount | What it holds |
+|---|---|---|
+| `ltx` | `/models/ltx-2.5` (`KUNO_LTX_MODELS_DIR`) | the diffusers layout from [section 2](#2-get-the-weights), about 66 GB |
+| `h3` | `/models/h3` (`HF_HUB_CACHE`) | a Hugging Face hub cache holding `MiniMaxAI/MiniMax-H3`, about 124 GB; `KUNO_H3_TURBO_LORA` names the Turbo LoRA's path if you enable `h3-turbo` |
+
+**Already set in the images:**
+- `KUNO_BACKEND=real` and `KUNO_TEE=tdx`.
+- `HF_HUB_OFFLINE=1`: nothing is downloaded at runtime.
+- The content safety classifiers, baked into `/opt/kuno-safety` with `KUNO_SAFETY_REQUIRE_CLASSIFIER=1`, so a
+  worker without them refuses to start ([image/CVM.md](image/CVM.md)).
+
+**You set:**
+- `KUNO_GATEWAY_URL`.
+- `KUNO_TEE`: `open` on a box without TDX, or `mock` on a dev network.
+- Your hotkey: `KUNO_HOTKEY_SEED_FILE`, pointing at a mounted file.
+- `KUNO_PROFILES`, `KUNO_VERIFIED_HARDWARE_CLASS` and `KUNO_MODEL_DIGEST`.
+- H3 only, all optional:
+  - `KUNO_H3_NUM_GPUS`: default 4.
+  - `KUNO_SGLANG_ARGS`: extra `sglang serve` flags.
+  - `KUNO_SGLANG_START_TIMEOUT_S`: default 3600.
+  - `KUNO_SGLANG_LOG=inherit`: shows the servers' output on a dev box. It is discarded otherwise, because
+    SGLang may log prompts.
+
+Before anything else, check the classifiers on the machine you rented:
+
+```bash
+docker run --rm --entrypoint kuno-safety-check <image>   # exits 0 only if every classifier loaded and answered
+```
+
+LTX-2.5 on the open tier ([section 6](#6-open-tier-mining-without-a-tee)):
+
+```bash
+docker run --rm --gpus all \
+  -v /models/ltx-2.5:/models/ltx-2.5:ro -v "$PWD/hotkey.seed:/run/secrets/hotkey.seed:ro" \
+  -e KUNO_TEE=open -e KUNO_HOTKEY_SEED_FILE=/run/secrets/hotkey.seed -e KUNO_GATEWAY_URL=https://api.kunoworld.com \
+  -e KUNO_PROFILES=ltx-2.5-fast -e KUNO_VERIFIED_HARDWARE_CLASS=O1.rtx-pro-6000-bw-96gb.x1 \
+  -e KUNO_MODEL_DIGEST=<digest> -e KUNO_PROVENANCE=off \
+  <registry>/<namespace>/kunoworld-worker@sha256:<ltx digest>
+```
+
+MiniMax H3 on four GPUs. H3 has no open-tier class, so outside a CVM this is a dev-network run
+([section 3](#3-first-run-on-a-dev-network)) with that network's settings added:
+
+```bash
+docker run --rm --gpus '"device=0,1,2,3"' --ipc host \
+  -v /models/h3:/models/h3:ro -e KUNO_PROFILES=h3,h3-reference … \
+  <registry>/<namespace>/kunoworld-worker@sha256:<h3 digest>
+```
+
+What the H3 image needs from the host:
+- **Driver:** its SGLang runs a CUDA 13 torch, so the driver must be R580 or newer.
+- **Shared memory:** `--ipc host` (or a large `--shm-size`) gives NCCL shared memory across the four GPUs.
+
+**Neither image has run on a GPU yet.** Treat the first run as a validation run; image/CVM.md lists what is
+unverified.
+
 ## 4. Mainnet
 
 1. Boot the published KunoWorld confidential VM image on a TDX host with the GPUs in CC
@@ -228,10 +306,11 @@ device, `nvattest` missing, GPUs not in CC mode, measurements not in the manifes
 with exponential backoff up to `KUNO_RETRY_MAX_S` (default 300 s; gateway outages retry within
 30 s). SIGTERM or Ctrl-C still stops it at once.
 
-**The image.** `image/build.sh` builds the worker container from pinned base-image digests
-and `image/uv.lock`, runs as a non-root user and downloads nothing at runtime, and prints the
-digest to use as `KUNO_IMAGE_DIGEST`. `image/CVM.md` describes how that container becomes a
-measured confidential VM and which steps need a TDX host.
+**The images.** `image/build.sh --variant all` builds the LTX-2.5 and MiniMax H3 worker images
+([section 3c](#3c-worker-images)). It uses pinned base-image digests, `image/uv.lock` and `image/sglang/uv.lock`,
+and classifier weights checked against their hashes. The images run as a non-root user and download nothing
+at runtime. The script prints the digest to use as `KUNO_IMAGE_DIGEST`. `image/CVM.md` describes how a
+worker image becomes a measured confidential VM and which steps need a TDX host.
 
 The CVM image, a production golden manifest and a gateway that enforces the verifiers are not
 released yet, and the attestation path has not run on real TDX + NVIDIA CC hardware; this

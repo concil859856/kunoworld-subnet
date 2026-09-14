@@ -53,6 +53,10 @@ kuno-worker = "kuno_worker.main:main"
 kuno-plan = "kuno_worker.plan:main"
 kuno-preflight = "kuno_worker.preflight:main"
 kuno-bench = "kuno_worker.bench:main"
+# Loads the safety classifiers from KUNO_SAFETY_* and runs each once on synthetic inputs (an image self-test).
+kuno-safety-check = "kuno_worker.safety_check:main"
+# The H3 image's entry point: MiniMax H3's SGLang servers and kuno-worker, supervised together.
+kuno-h3-worker = "kuno_worker.h3_servers:main"
 
 [tool.uv.sources]
 # CUDA 12.8 builds for the RTX 5090 and the other Blackwell cards. PyTorch's cu128 index carries torch up to 2.11.0

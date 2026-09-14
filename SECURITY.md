@@ -22,7 +22,7 @@ land.
 | Signed receipts | claims about work that never happened; a gateway misreporting work | every result is signed by the attested enclave key. Validators re-verify each ledger receipt against a key bound to the enclave id, pay only the duration the customer requested, and treat a digest delivered twice as a replay |
 | Canary audits | a miner serving a cheaper or broken model behind a valid quote | validator jobs indistinguishable from customer traffic. The output is checked against its receipt and its own MP4 structure; a failure attributable to a miner zeroes its weight for the window. In verified mode every receipt also commits to each denoising step, and validators open and bitwise-replay a random step of their own canaries ([VERIFIED_MODE.md](VERIFIED_MODE.md)) — *the GPU executors have not run on real hardware* |
 | Owner-signed switch | a gateway redirecting emissions between model families | validators accept only an owner-signed switch whose `issued_at` does not go backwards |
-| Content safeguards | generating material that breaks the acceptable use policy, including any sexual content, which is banned in both modes | the shared content policy (`kuno_protocol.content_policy`: the same list at the gateway and in the enclave), a pluggable prompt classifier inside the enclave, and a check of frames sampled from every finished video before it is signed or sealed ([Output safety](#output-safety)). No setting allows sexual content — *no classifier weights ship in an image yet* |
+| Content safeguards | generating material that breaks the acceptable use policy, including any sexual content, which is banned in both modes | the shared content policy (`kuno_protocol.content_policy`: the same list at the gateway and in the enclave), a pluggable prompt classifier inside the enclave, and a check of frames sampled from every finished video before it is signed or sealed ([Output safety](#output-safety)). No setting allows sexual content — *both worker images ship the classifiers, pinned by hash, but they have not been evaluated for accuracy or run inside a CVM* |
 | C2PA provenance | a clip losing its origin once separated from its receipt | a C2PA manifest embedded before sealing, signed with the enclave key under a short-lived certificate that the gateway's CA issues only to a freshly attested enclave, timestamped so it outlives the certificate ([PROVENANCE.md](PROVENANCE.md)) — *the root is not on the C2PA Trust List* |
 | Uniqueness rules | one machine posing as many miners | verified hardware identities (the TDX platform's PPID, each GPU's UEID) bound to one hotkey's live enclave at the gateway, deduplicated again by validators from their own challenges, plus per-GPU registration collateral read from the chain — *the collateral amount per GPU is not set yet*. Open-tier hardware is self-reported and never deduplicated: one machine posing as many open-tier miners is limited only by higher collateral per GPU, per-hotkey admission probes and a lower earning rate |
 
@@ -84,8 +84,10 @@ land.
     the video is signed, sealed or uploaded. See [Output safety](#output-safety).
 
   The limits today:
-  - No classifier weights are in an image. The prompt adapters have not run against real
-    weights; the frame adapters have, on benign synthetic clips only.
+  - Both worker images bake in Qwen3Guard-Gen-0.6B, Freepik's detector and CLIP, each pinned
+    by revision and SHA-256 (`image/CVM.md`). All three load and answer on CPU through the worker's
+    own code (`kuno-safety-check`), on benign synthetic inputs only. None has been evaluated for
+    accuracy, run inside a CVM, or run beside a GPU workload.
   - A worker without `KUNO_SAFETY_CLASSIFIER` or `KUNO_SAFETY_FRAME_MODEL_PATH` logs that as
     an error but keeps serving, unless `KUNO_SAFETY_REQUIRE_CLASSIFIER=1`. With that set,
     which production images must do, it refuses to start without both. An open-tier worker
@@ -218,8 +220,7 @@ Not implemented yet:
 - the confidential VM image and its measured boot chain (only the worker container layer is
   built), and published golden measurements;
 - a chosen per-GPU collateral amount, and the enterprise tier;
-- shipped classifier weights (frame models are chosen and their hashes pinned in
-  `image/CVM.md`, but no image bakes them in yet), and any accuracy evaluation of them or of
+- any accuracy evaluation of the safety classifiers (now baked into both worker images) or of
   the content policy's word lists on real traffic;
 - C2PA Trust List membership for the KunoWorld root.
 
@@ -236,8 +237,8 @@ What is in place and tested against a simulated TEE:
   Standard-mode sealing, and power-of-two padding of the sealed request by every sender, both
   pinned by shared Python and JS vectors;
 - the safety pipeline, with fake classifiers, including the shared content policy and the
-  output check wired into the worker; the frame adapters also load and score real weights on
-  CPU (benign clips only);
+  output check wired into the worker. The worker images' pinned prompt and frame classifiers
+  also load and score on CPU through the worker's code (`kuno-safety-check`), on benign inputs only;
 - C2PA manifests signed under gateway-issued certificates that verify as trusted against the
   KunoWorld root.
 

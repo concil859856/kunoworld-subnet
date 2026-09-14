@@ -45,8 +45,9 @@ confidential tier; they can serve Standard jobs on the open tier.
 - Rejects replayed jobs, tampered requests and mismatched inputs, and never logs content.
 - Runs the safety gate on every job, in both privacy modes: the shared content policy
   (`kuno_protocol.content_policy`, the same list the gateway uses), then prompt and frame
-  classifiers. All sexual content is banned; no setting allows it. No classifier weights ship
-  in an image yet ([SECURITY.md](SECURITY.md)).
+  classifiers. All sexual content is banned; no setting allows it. Both worker images ship the
+  classifiers, pinned by hash, and refuse to start without them; they have not been evaluated for
+  accuracy ([SECURITY.md](SECURITY.md)).
 
 Local development with a simulated TEE:
 
@@ -56,8 +57,9 @@ KUNO_DATA_DIR=data uv run kuno-worker --profiles ltx-2.5-fast,h3-turbo
 ```
 
 Production is meant to run inside the published CVM image with `KUNO_TEE=tdx` and
-`KUNO_BACKEND=real`: the official SGLang server for H3 and resident pipelines for LTX-2.5. None
-of it has run on GPUs yet. `KUNO_TEE=tdx` collects NVIDIA GPU evidence through `nvattest` or
+`KUNO_BACKEND=real`: the official SGLang server for H3 and resident pipelines for LTX-2.5. The two
+worker images that package them, LTX-2.5 and MiniMax H3 with SGLang, are built from
+`image/worker.Dockerfile` ([MINING.md](MINING.md#3c-worker-images)). None of it has run on GPUs yet. `KUNO_TEE=tdx` collects NVIDIA GPU evidence through `nvattest` or
 NVML, and `kuno_protocol` has TDX (DCAP) and NVIDIA verifiers, but neither has run against real
 TDX + NVIDIA CC hardware, and the CVM image and its golden measurements are not released.
 

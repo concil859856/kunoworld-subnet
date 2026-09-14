@@ -1,0 +1,36 @@
+# Pins SGLang for the MiniMax H3 worker image (image/worker.Dockerfile, target h3), installed at /opt/sglang.
+# It is a venv of its own because SGLang pins its own stack: torch 2.13.0 (CUDA 13), transformers 5.12.1 and
+# diffusers 0.37.0, where the worker venv (image/uv.lock) has torch 2.11.0+cu128, transformers 5.17 and
+# diffusers 0.40. Not a workspace member; regenerate uv.lock with image/lock.sh.
+[project]
+name = "kuno-sglang-image"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    # MiniMax H3 arrived in SGLang 0.5.17 (2026-08-08). 0.5.19 (2026-09-04) is the latest release and carries
+    # the H3 fixes since: cross-request audio determinism and a dp_size>1 deadlock (#36398), native loading
+    # of diffusers-layout H3 components (#36067), Cache-DiT caching on H3 (#33827, 0.5.18).
+    "sglang[diffusion]==0.5.19",
+    # Prereleases SGLang 0.5.19 itself requires, named here so that no other prerelease is admitted.
+    "cuda-tile==1.6.0rc5",
+    "flash-attn-4==4.0.0b19",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+prerelease = "if-necessary-or-explicit"
+# antlr4-python3-runtime 4.9.3 (omegaconf <- nvidia-modelopt <- sglang[diffusion]) is published only as an sdist.
+# Building it without isolation uses the setuptools wheel this lock pins, so the image build fetches no unpinned
+# build backend; every other package installs from a hashed wheel.
+no-build-isolation-package = ["antlr4-python3-runtime"]
+
+[tool.uv.sources]
+# PyPI has only a wheel-stub sdist for cuda-tile 1.6.0rc5, which fetches the real wheel from NVIDIA's index
+# while installing, with no hash to check. Taking that wheel from the index directly puts its hash in uv.lock.
+cuda-tile = { index = "nvidia" }
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true

@@ -1,12 +1,15 @@
-# Pins the exact Python environment baked into the worker image. Not a workspace member:
+# Pins the exact Python environment baked into the worker images (/opt/kuno). Not a workspace member:
 # it locks on its own so the image build needs only this repository.
 # `gpu` is the model runtime for KUNO_BACKEND=real: CUDA 12.8 torch, torchaudio and torchao from PyTorch's index
 # (worker/pyproject.toml), diffusers, transformers, accelerate and PyAV.
+# `safety` runs the content safety classifiers baked into the images (transformers, timm, and torchvision from
+# the same CUDA 12.8 index); `provenance` embeds C2PA manifests (KUNO_PROVENANCE=c2pa).
+# SGLang, for the H3 image, has its own lock: image/sglang/uv.lock.
 [project]
 name = "kuno-worker-image"
 version = "0.1.0"
 requires-python = "==3.12.*"
-dependencies = ["kuno-worker[nvidia,gpu]", "kuno-protocol"]
+dependencies = ["kuno-worker[nvidia,gpu,safety,provenance]", "kuno-protocol"]
 
 [tool.uv]
 package = false
