@@ -520,8 +520,9 @@ class Shape:
     def dstack_mr_args(self) -> list[str]:
         args = ["-c", str(self.cpus), "-m", str(self.memory), "--num-gpus", str(self.num_gpus),
                 "--num-nvswitches", str(self.num_nvswitches), "--num-nics", str(self.num_nics),
-                "--num-verity-volumes", str(self.num_verity_volumes), "--hugepages", str(self.hugepages).lower(),
-                "--hotplug-off", str(self.hotplug_off).lower()]
+                "--num-verity-volumes", str(self.num_verity_volumes), "--hotplug-off", str(self.hotplug_off).lower()]
+        if self.hugepages:
+            args.append("--hugepages")  # a flag in the pinned dstack-mr, which rejects a value after it
         if self.qemu_version:
             args += ["--qemu-version", self.qemu_version]
         if self.pci_hole64_size is not None:

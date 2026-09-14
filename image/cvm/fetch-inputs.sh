@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Fetches and verifies the CVM build's pinned inputs, or installs its pinned tools.
 #
-#   image/cvm/fetch-inputs.sh inputs <dir>   kernel source, OVMF (from the pinned dstack release) and the
-#                                            NVIDIA driver, each checked against inputs.lock.json;
+#   image/cvm/fetch-inputs.sh inputs <dir>   kernel source, OVMF (from the pinned dstack release), the NVIDIA
+#                                            driver and its companions, the Go toolchain and the Debian archive
+#                                            keyring, each checked against inputs.lock.json;
 #                                            writes <dir>/pins.env for mkosi.build
 #   image/cvm/fetch-inputs.sh tools <dir>    mkosi and dstack-mr at their pinned revisions, into <dir>/bin
 #
@@ -83,6 +84,51 @@ case "${1:-}" in
       url="$(pin "ppcie_verifier.$package.url")"
       fetch "$url" "$(pin "ppcie_verifier.$package.sha256")" "$dir/$(basename "$url")"
     done
+    go_url="$(pin go_toolchain.url)"
+    fetch "$go_url" "$(pin go_toolchain.sha256)" "$dir/$(basename "$go_url")"
+    for component in rustc cargo rust_std; do
+      url="$(pin "rust_toolchain.$component.url")"
+      fetch "$url" "$(pin "rust_toolchain.$component.sha256")" "$dir/$(basename "$url")"
+    done
+
+    # The Debian archive keyring from the pinned snapshot: build.sh bootstraps mkosi's tools tree with it, so trust
+    # in the snapshot comes from this pin and not from whichever keyring the build host has.
+    keyring_url="$(pin debian.archive_keyring.url)"
+    keyring_deb="$dir/$(basename "$keyring_url")"
+    keyring_sha="$(pin debian.archive_keyring.member_sha256)"
+    fetch "$keyring_url" "$(pin debian.archive_keyring.sha256)" "$keyring_deb"
+    if ! matches "$dir/debian-archive-keyring.gpg" "$keyring_sha"; then
+      python3 - "$keyring_deb" "$(pin debian.archive_keyring.member)" "$dir/debian-archive-keyring.gpg.part" <<'PY'
+import io, posixpath, sys, tarfile
+deb, member, target = sys.argv[1:4]
+data = open(deb, "rb").read()
+if not data.startswith(b"!<arch>\n"):
+    sys.exit(f"{deb} is not a Debian package")
+offset, payload = 8, None
+while offset + 60 <= len(data):
+    name, size = data[offset:offset + 16].decode().strip().rstrip("/"), int(data[offset + 48:offset + 58])
+    if name.startswith("data.tar"):
+        payload = data[offset + 60:offset + 60 + size]
+        break
+    offset += 60 + size + size % 2
+if payload is None:
+    sys.exit(f"{deb} has no data archive")
+with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
+    name = "./" + member
+    for _ in range(8):  # the .gpg name is a symlink to the .pgp file
+        info = archive.getmember(name)
+        if not info.issym():
+            break
+        name = "./" + posixpath.normpath(posixpath.join(posixpath.dirname(name), info.linkname))
+    open(target, "wb").write(archive.extractfile(info).read())
+PY
+      if ! matches "$dir/debian-archive-keyring.gpg.part" "$keyring_sha"; then
+        rm -f "$dir/debian-archive-keyring.gpg.part"
+        echo "the keyring in $keyring_deb does not match its pinned sha256" >&2
+        exit 1
+      fi
+      mv "$dir/debian-archive-keyring.gpg.part" "$dir/debian-archive-keyring.gpg"
+    fi
 
     cat > "$dir/pins.env" <<EOF
 KERNEL_VERSION=$kernel_version
@@ -103,6 +149,14 @@ NVIDIA_ML_PY_FILE=$(basename "$(pin ppcie_verifier.nvidia_ml_py.url)")
 NVIDIA_ML_PY_SHA256=$(pin ppcie_verifier.nvidia_ml_py.sha256)
 TIMEOUT_DECORATOR_FILE=$(basename "$(pin ppcie_verifier.timeout_decorator.url)")
 TIMEOUT_DECORATOR_SHA256=$(pin ppcie_verifier.timeout_decorator.sha256)
+GO_TOOLCHAIN_FILE=$(basename "$go_url")
+GO_TOOLCHAIN_SHA256=$(pin go_toolchain.sha256)
+RUSTC_FILE=$(basename "$(pin rust_toolchain.rustc.url)")
+RUSTC_SHA256=$(pin rust_toolchain.rustc.sha256)
+CARGO_FILE=$(basename "$(pin rust_toolchain.cargo.url)")
+CARGO_SHA256=$(pin rust_toolchain.cargo.sha256)
+RUST_STD_FILE=$(basename "$(pin rust_toolchain.rust_std.url)")
+RUST_STD_SHA256=$(pin rust_toolchain.rust_std.sha256)
 EOF
     echo "inputs verified in $dir" >&2
     ;;

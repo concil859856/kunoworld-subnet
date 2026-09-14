@@ -1,94 +1,140 @@
 #!/usr/bin/env bash
-# mkosi build script: the guest kernel, the NVIDIA open GPU kernel modules built against it, the NVIDIA
-# userspace the CDI spec needs, and nvidia-ctk. Inputs were downloaded and hash-checked by
-# fetch-inputs.sh into image/cvm/.inputs (mounted here as $SRCDIR/inputs); they are checked again.
+# mkosi build script: the guest kernel, the NVIDIA open GPU kernel modules built against it and their GSP firmware,
+# the NVIDIA userspace the CDI spec needs, Fabric Manager and NSCQ, nvattest, NVIDIA's PPCIe verifier and
+# nvidia-ctk. Every input was downloaded and hash-checked by fetch-inputs.sh; build.sh mounts them here as
+# $SRCDIR/inputs, and each is checked again before use.
 #
-# Reproducibility: KBUILD_BUILD_TIMESTAMP/USER/HOST fixed, no debug info, no module signing key (a
-# random per-build key; the verity root filesystem covers the modules instead), -trimpath and an empty
-# build id for Go. NOT RUN IN THIS REPOSITORY: the NVIDIA part in particular follows NVIDIA's .run
-# layout and dstack's recipe and must be checked on the first real build.
+# Where it runs: mkosi starts build scripts with the tools tree's programs, which include no compiler, so this one
+# re-executes itself through mkosi-chroot inside the image with the BuildPackages overlay (Debian at the pinned
+# snapshot), as dstack's mkosi.build does. Rust and Go come from pinned upstream toolchains instead: trixie's rustc
+# is too old for nvattest's locked crates, and its Go for nvidia-container-toolkit's go.mod.
+#
+# Reproducibility: every step works under one fixed path, /var/tmp/kuno-build, so no path of the build machine
+# reaches the kernel (__FILE__), the NVIDIA modules or nvattest's Rust symbols (dstack builds nvattest in a fixed
+# path for the same reason). KBUILD_BUILD_TIMESTAMP/USER/HOST are fixed, there is no debug info and no module
+# signing key (a random per-build key; the verity root filesystem covers the modules instead), and Go builds with
+# -trimpath and an empty build id.
 set -euo pipefail
 
-: "${SRCDIR:?run by mkosi}" "${DESTDIR:?run by mkosi}" "${OUTPUTDIR:?run by mkosi}" "${BUILDDIR:?run by mkosi}"
+if [ "${container:-}" != mkosi ]; then
+  exec mkosi-chroot "$CHROOT_SCRIPT" "$@"
+fi
+
+: "${SRCDIR:?run by mkosi}" "${DESTDIR:?run by mkosi}"
 : "${SOURCE_DATE_EPOCH:?build.sh passes --source-date-epoch}"
 inputs="$SRCDIR/inputs"
+cvm="$SRCDIR/cvm"
 # shellcheck source=/dev/null
 . "$inputs/pins.env"   # written by fetch-inputs.sh from inputs.lock.json
-export TZ=UTC LC_ALL=C KBUILD_BUILD_TIMESTAMP="@$SOURCE_DATE_EPOCH" KBUILD_BUILD_USER=kuno KBUILD_BUILD_HOST=reproducible KBUILD_BUILD_VERSION=1
+export TZ=UTC LC_ALL=C KBUILD_BUILD_TIMESTAMP="@$SOURCE_DATE_EPOCH" KBUILD_BUILD_USER=kuno KBUILD_BUILD_HOST=reproducible \
+  KBUILD_BUILD_VERSION=1 KCONFIG_NOTIMESTAMP=1
+work=/var/tmp/kuno-build
+toolchains="$work/toolchains"
+rm -rf "$work"
+mkdir -p "$work/home" "$toolchains"
+export HOME="$work/home"
 jobs="$(nproc)"
 
 check() { echo "$2  $1" | sha256sum --check --strict --quiet || { echo "$1 does not match its pin" >&2; exit 1; }; }
 
-# ---- kernel
+# ---- kernel, built out of tree
 check "$inputs/linux-$KERNEL_VERSION.tar.xz" "$KERNEL_SHA256"
-tar -xJf "$inputs/linux-$KERNEL_VERSION.tar.xz" -C "$BUILDDIR"
-src="$BUILDDIR/linux-$KERNEL_VERSION"
-make -C "$src" -j"$jobs" x86_64_defconfig
-"$src/scripts/kconfig/merge_config.sh" -m -O "$src" "$src/.config" "$SRCDIR/kernel/kuno.config"
-make -C "$src" -j"$jobs" olddefconfig
-for required in CONFIG_INTEL_TDX_GUEST CONFIG_TDX_GUEST_DRIVER CONFIG_TSM_REPORTS CONFIG_DM_VERITY CONFIG_SQUASHFS CONFIG_FW_CFG_SYSFS CONFIG_EFI_STUB; do
-  grep -q "^$required=y" "$src/.config" || { echo "kernel config lost $required=y" >&2; exit 1; }
-done
-make -C "$src" -j"$jobs" bzImage modules
-kver="$(make -C "$src" -s kernelrelease)"
-make -C "$src" INSTALL_MOD_PATH="$DESTDIR/usr" INSTALL_MOD_STRIP=1 DEPMOD=true modules_install
+tar -xJf "$inputs/linux-$KERNEL_VERSION.tar.xz" -C "$work" --no-same-owner
+src="$work/linux-$KERNEL_VERSION"
+kbuild="$work/linux-build"
+make -C "$src" O="$kbuild" x86_64_defconfig >/dev/null
+"$src/scripts/kconfig/merge_config.sh" -m -O "$kbuild" "$kbuild/.config" "$cvm/kernel/kuno.config" >/dev/null
+make -C "$src" O="$kbuild" olddefconfig >/dev/null
+# Every line of the fragment must survive olddefconfig, which drops a symbol whose dependencies are missing silently.
+while IFS= read -r line; do
+  case "$line" in
+    CONFIG_*=*)
+      grep -qxF "$line" "$kbuild/.config" || { echo "kernel config: $line did not survive olddefconfig" >&2; exit 1; }
+      ;;
+    "# CONFIG_"*" is not set")
+      option="${line#\# }"
+      option="${option%% *}"
+      if grep -q "^$option=" "$kbuild/.config"; then
+        echo "kernel config: $option is set, but kuno.config unsets it" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done < "$cvm/kernel/kuno.config"
+make -C "$src" O="$kbuild" -j"$jobs" bzImage modules
+kver="$(make -C "$src" O="$kbuild" -s kernelrelease)"
+make -C "$src" O="$kbuild" INSTALL_MOD_PATH="$DESTDIR/usr" INSTALL_MOD_STRIP=1 DEPMOD=true modules_install >/dev/null
 rm -f "$DESTDIR/usr/lib/modules/$kver/build" "$DESTDIR/usr/lib/modules/$kver/source"
-install -m 0644 "$src/arch/x86/boot/bzImage" "$OUTPUTDIR/bzImage"
+# Build scripts get no output directory in mkosi 26, so the kernel leaves in the tree, where Debian keeps it (as in
+# dstack's kernel stage); build.sh moves it out of the tree before packing the root filesystem.
+install -m 0644 "$kbuild/arch/x86/boot/bzImage" "$DESTDIR/usr/lib/modules/$kver/vmlinuz"
 
-# ---- NVIDIA open kernel modules and userspace, Fabric Manager and NSCQ (Protected PCIe)
+# ---- NVIDIA open kernel modules, their GSP firmware and userspace, Fabric Manager and NSCQ (Protected PCIe)
 run="$inputs/NVIDIA-Linux-x86_64-$NVIDIA_VERSION.run"
 check "$run" "$NVIDIA_RUN_SHA256"
-sh "$run" --extract-only --target "$BUILDDIR/nvidia" >/dev/null
-make -C "$BUILDDIR/nvidia/kernel-open" -j"$jobs" SYSSRC="$src" SYSOUT="$src" modules
+sh "$run" --extract-only --target "$work/nvidia" >/dev/null
+make -C "$work/nvidia/kernel-open" -j"$jobs" SYSSRC="$src" SYSOUT="$kbuild" modules
 install -d "$DESTDIR/usr/lib/modules/$kver/extra"
-install -m 0644 "$BUILDDIR"/nvidia/kernel-open/*.ko "$DESTDIR/usr/lib/modules/$kver/extra/"
-fm="$BUILDDIR/fabricmanager"; nscq="$BUILDDIR/nscq"; libdir=usr/lib/x86_64-linux-gnu
+install -m 0644 "$work"/nvidia/kernel-open/*.ko "$DESTDIR/usr/lib/modules/$kver/extra/"
+# The open modules start the GPU System Processor from this firmware and fail without it (dstack's nvidia-build.sh).
+install -d "$DESTDIR/usr/lib/firmware/nvidia/$NVIDIA_VERSION"
+install -m 0644 "$work"/nvidia/firmware/*.bin "$DESTDIR/usr/lib/firmware/nvidia/$NVIDIA_VERSION/"
+fm="$work/fabricmanager"; nscq="$work/nscq"; libdir=usr/lib/x86_64-linux-gnu
 check "$inputs/fabricmanager-$NVIDIA_VERSION.tar.xz" "$NVIDIA_FABRICMANAGER_SHA256"
 check "$inputs/nscq-$NVIDIA_VERSION.tar.xz" "$NVIDIA_NSCQ_SHA256"
 mkdir -p "$fm" "$nscq"
-tar -xJf "$inputs/fabricmanager-$NVIDIA_VERSION.tar.xz" -C "$fm" --strip-components=1
-tar -xJf "$inputs/nscq-$NVIDIA_VERSION.tar.xz" -C "$nscq" --strip-components=1
+tar -xJf "$inputs/fabricmanager-$NVIDIA_VERSION.tar.xz" -C "$fm" --strip-components=1 --no-same-owner
+tar -xJf "$inputs/nscq-$NVIDIA_VERSION.tar.xz" -C "$nscq" --strip-components=1 --no-same-owner
 while read -r kind file target; do
   file="${file//@VERSION@/$NVIDIA_VERSION}"; target="${target//@VERSION@/$NVIDIA_VERSION}"
   case "$kind" in
     ''|'#'*) continue ;;
-    bin) install -D -m 0755 "$BUILDDIR/nvidia/$file" "$DESTDIR/usr/bin/$file" ;;
-    lib) install -D -m 0755 "$BUILDDIR/nvidia/$file" "$DESTDIR/$libdir/$file" ;;
+    bin) install -D -m 0755 "$work/nvidia/$file" "$DESTDIR/usr/bin/$file" ;;
+    lib) install -D -m 0755 "$work/nvidia/$file" "$DESTDIR/$libdir/$file" ;;
     fm-bin) install -D -m 0755 "$fm/$file" "$DESTDIR/usr/bin/${file##*/}" ;;
     fm-lib) install -D -m 0755 "$fm/$file" "$DESTDIR/$libdir/${file##*/}" ;;
     fm-cfg) install -D -m 0644 "$fm/$file" "$DESTDIR/usr/share/nvidia/nvswitch/${file##*/}" ;;
     fm-share) install -d "$DESTDIR/usr/$file" && cp -R --no-preserve=ownership "$fm/$file/." "$DESTDIR/usr/$file/" ;;
     fm-unit) install -D -m 0644 "$fm/$file" "$DESTDIR/usr/lib/systemd/system/${file##*/}" ;;
     nscq-lib) install -D -m 0755 "$nscq/$file" "$DESTDIR/$libdir/${file##*/}" ;;
-    link) ln -sfn "$target" "$DESTDIR/$libdir/$file" ;;
+    link) install -d "$DESTDIR/$libdir" && ln -sfn "$target" "$DESTDIR/$libdir/$file" ;;
     *) echo "bad line in nvidia.files" >&2; exit 1 ;;
   esac
-done < "$SRCDIR/nvidia.files"
+done < "$cvm/nvidia.files"
+
+# ---- Rust for nvattest: dstack's pinned upstream toolchain
+for pair in "$RUSTC_FILE $RUSTC_SHA256" "$CARGO_FILE $CARGO_SHA256" "$RUST_STD_FILE $RUST_STD_SHA256"; do
+  file="${pair% *}"
+  check "$inputs/$file" "${pair#* }"
+  tar -xJf "$inputs/$file" -C "$work" --no-same-owner
+  "$work/${file%.tar.xz}/install.sh" --prefix="$toolchains/rust" --disable-ldconfig >/dev/null
+done
+export PATH="$toolchains/rust/bin:$PATH" CARGO_HOME="$work/cargo-home"
 
 # ---- nvattest, NVIDIA's Attestation SDK CLI, which NVIDIA's PPCIe verifier runs. Built as dstack's
 # os/mkosi/components/nvattest/nvattest-build.sh builds it: dstack's OCSP-freshness patch, its patch pinning the
-# CMake FetchContent inputs, and its Cargo.lock for the regorus FFI crate. dstack builds in a fixed path because
-# Rust hashes RUSTFLAGS into symbols; whether this step is byte-reproducible here is unverified.
+# CMake FetchContent inputs, and its Cargo.lock for the regorus FFI crate.
 check "$inputs/nvattest-ocsp-freshness.patch" "$NVATTEST_OCSP_PATCH_SHA256"
 check "$inputs/nvattest-pin-fetchcontent.patch" "$NVATTEST_FETCHCONTENT_PATCH_SHA256"
 check "$inputs/regorus-ffi-Cargo.lock" "$NVATTEST_REGORUS_LOCK_SHA256"
-nvat="$BUILDDIR/attestation-sdk"
+nvat="$work/attestation-sdk"
 git init --quiet "$nvat"
 git -C "$nvat" fetch --quiet --depth=1 "$NVATTEST_REPOSITORY" "$NVATTEST_REVISION"
 git -C "$nvat" checkout --quiet --detach FETCH_HEAD
 [ "$(git -C "$nvat" rev-parse HEAD)" = "$NVATTEST_REVISION" ] || { echo "attestation-sdk is not at $NVATTEST_REVISION" >&2; exit 1; }
 patch -d "$nvat" -p1 --fuzz=0 < "$inputs/nvattest-ocsp-freshness.patch"
 patch -d "$nvat" -p1 --fuzz=0 < "$inputs/nvattest-pin-fetchcontent.patch"
-export CFLAGS="-O2 -g0 -ffile-prefix-map=$BUILDDIR=/usr/src" CXXFLAGS="-O2 -g0 -ffile-prefix-map=$BUILDDIR=/usr/src"
-export CARGO_INCREMENTAL=0 RUSTFLAGS="--remap-path-prefix=$BUILDDIR=/usr/src -C strip=debuginfo"
-cmake -S "$nvat/nv-attestation-cli" -B "$BUILDDIR/nvattest-build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+export CFLAGS="-O2 -g0 -ffile-prefix-map=$work=/usr/src" CXXFLAGS="-O2 -g0 -ffile-prefix-map=$work=/usr/src"
+export CARGO_INCREMENTAL=0 RUSTFLAGS="--remap-path-prefix=$work=/usr/src -C strip=debuginfo"
+cmake -S "$nvat/nv-attestation-cli" -B "$work/nvattest-build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
   -DNVAT_BUILD_TESTS=OFF -DNVAT_BUILD_SAMPLES=OFF -DCMAKE_SKIP_RPATH=ON -DFETCHCONTENT_FULLY_DISCONNECTED=OFF -DUSE_SYSTEM_DEPS=ON
-install -m 0644 "$inputs/regorus-ffi-Cargo.lock" "$BUILDDIR/nvattest-build/_deps/regorus-src/bindings/ffi/Cargo.lock"
-cmake --build "$BUILDDIR/nvattest-build" -j"$jobs"
-cmp "$inputs/regorus-ffi-Cargo.lock" "$BUILDDIR/nvattest-build/_deps/regorus-src/bindings/ffi/Cargo.lock"
-DESTDIR="$BUILDDIR/nvattest-stage" cmake --install "$BUILDDIR/nvattest-build" --prefix /usr
-install -D -m 0755 "$BUILDDIR/nvattest-stage/usr/bin/nvattest" "$DESTDIR/usr/bin/nvattest"
-cp -P "$BUILDDIR/nvattest-stage/usr/lib/"libnvat.so* "$DESTDIR/usr/lib/"
+install -m 0644 "$inputs/regorus-ffi-Cargo.lock" "$work/nvattest-build/_deps/regorus-src/bindings/ffi/Cargo.lock"
+cmake --build "$work/nvattest-build" -j"$jobs"
+cmp "$inputs/regorus-ffi-Cargo.lock" "$work/nvattest-build/_deps/regorus-src/bindings/ffi/Cargo.lock"
+DESTDIR="$work/nvattest-stage" cmake --install "$work/nvattest-build" --prefix /usr >/dev/null
+install -D -m 0755 "$work/nvattest-stage/usr/bin/nvattest" "$DESTDIR/usr/bin/nvattest"
+install -d "$DESTDIR/usr/lib"
+cp -P "$work/nvattest-stage/usr/lib/"libnvat.so* "$DESTDIR/usr/lib/"
 unset CFLAGS CXXFLAGS RUSTFLAGS
 
 # ---- NVIDIA's PPCIe verifier (kuno-app: python3 -m ppcie.verifier.verification) and the two packages it imports
@@ -101,10 +147,18 @@ install -d "$ppcie"
 python3 -m zipfile -e "$inputs/$PPCIE_VERIFIER_FILE" "$ppcie"
 python3 -m zipfile -e "$inputs/$NVIDIA_ML_PY_FILE" "$ppcie"
 rm -f "$ppcie/example.py"
-tar -xzf "$inputs/$TIMEOUT_DECORATOR_FILE" -C "$BUILDDIR"
-cp -R "$BUILDDIR/${TIMEOUT_DECORATOR_FILE%.tar.gz}/timeout_decorator" "$ppcie/"
+tar -xzf "$inputs/$TIMEOUT_DECORATOR_FILE" -C "$work" --no-same-owner
+cp -R "$work/${TIMEOUT_DECORATOR_FILE%.tar.gz}/timeout_decorator" "$ppcie/"
 
-# ---- nvidia-ctk (CDI spec generation) at its pinned revision
-git clone --quiet https://github.com/NVIDIA/nvidia-container-toolkit "$BUILDDIR/nvidia-container-toolkit"
-git -C "$BUILDDIR/nvidia-container-toolkit" checkout --quiet "$NVIDIA_CONTAINER_TOOLKIT_REVISION"
-(cd "$BUILDDIR/nvidia-container-toolkit" && CGO_ENABLED=0 GOFLAGS=-mod=vendor go build -trimpath -ldflags "-buildid= -s -w" -o "$DESTDIR/usr/bin/nvidia-ctk" ./cmd/nvidia-ctk)
+# ---- nvidia-ctk (CDI spec generation) at its pinned revision, with the pinned Go toolchain and its vendored modules.
+# cgo stays on: go-nvml's dlopen package has no pure-Go build. As dstack builds it: no build ids, paths mapped out.
+check "$inputs/$GO_TOOLCHAIN_FILE" "$GO_TOOLCHAIN_SHA256"
+tar -xzf "$inputs/$GO_TOOLCHAIN_FILE" -C "$toolchains" --no-same-owner
+export PATH="$toolchains/go/bin:$PATH" GOTOOLCHAIN=local GOPATH="$work/go" GOCACHE="$work/go-cache" GOFLAGS=-mod=vendor CGO_ENABLED=1
+export CGO_CFLAGS="-O2 -g0 -ffile-prefix-map=$work=/usr/src"
+nct="$work/nvidia-container-toolkit"
+git init --quiet "$nct"
+git -C "$nct" fetch --quiet --depth=1 https://github.com/NVIDIA/nvidia-container-toolkit "$NVIDIA_CONTAINER_TOOLKIT_REVISION"
+git -C "$nct" checkout --quiet --detach FETCH_HEAD
+[ "$(git -C "$nct" rev-parse HEAD)" = "$NVIDIA_CONTAINER_TOOLKIT_REVISION" ] || { echo "nvidia-container-toolkit is not at $NVIDIA_CONTAINER_TOOLKIT_REVISION" >&2; exit 1; }
+(cd "$nct" && go build -trimpath -buildvcs=false -ldflags "-buildid= -s -w -extldflags=-Wl,--build-id=none" -o "$DESTDIR/usr/bin/nvidia-ctk" ./cmd/nvidia-ctk)

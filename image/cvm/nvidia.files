@@ -1,5 +1,6 @@
 # NVIDIA userspace copied into the root filesystem (mkosi.build). @VERSION@ is the pinned driver version.
-# Compute and CC only: no X, GL or Vulkan. Unverified against the 595 .run layout until the first real build.
+# Compute and CC only: no X, GL or Vulkan. Every entry was found in the pinned 595.91.07 archives by a build on
+# 2026-09-14. mkosi.build also installs the GSP firmware, which the open kernel modules need.
 #   bin | lib <file>                 from the extracted driver .run
 #   fm-bin | fm-lib | fm-cfg | fm-unit <file>, fm-share <dir>
 #                                    from the Fabric Manager archive (Protected PCIe runs Fabric Manager in the guest)

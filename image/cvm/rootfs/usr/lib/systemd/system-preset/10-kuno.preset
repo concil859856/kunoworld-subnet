@@ -1,0 +1,6 @@
+# mkosi applies presets after mkosi.postinst.chroot, and Debian's default preset enables every unit it installs.
+# Fabric Manager runs only in Protected PCIe mode, when kuno-app starts it; in multi-GPU passthrough mode it belongs
+# on the host.
+disable nvidia-fabricmanager.service
+enable nvidia-persistenced.service
+enable kuno-app.service

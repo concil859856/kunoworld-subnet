@@ -11,6 +11,38 @@
   "debian": {
     "release": "trixie",
     "snapshot": "20260721T000000Z",
+    "from_dstack": true,
+    "archive_keyring": {
+      "version": "2025.1",
+      "url": "https://snapshot.debian.org/archive/debian/20260721T000000Z/pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb",
+      "sha256": "9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac",
+      "member": "usr/share/keyrings/debian-archive-keyring.gpg",
+      "member_sha256": "506b815cbb32d9b6066b4a2aa524071e071761e7e7f68c3ac74f3061ba852017",
+      "note": "The keys the snapshot's InRelease is signed with (13/trixie). build.sh bootstraps mkosi's tools tree with this keyring instead of the build host's, which may lack them (Ubuntu 22.04's does). The sha256 is the snapshot's Packages index entry; the member hash was taken from the package on 2026-09-14"
+    }
+  },
+  "go_toolchain": {
+    "version": "1.26.2",
+    "url": "https://go.dev/dl/go1.26.2.linux-amd64.tar.gz",
+    "sha256": "990e6b4bbba816dc3ee129eaeaf4b42f17c2800b88a2166c265ac1a200262282",
+    "note": "Builds nvidia-ctk: nvidia-container-toolkit at its pinned revision needs Go 1.25 (go.mod), and trixie ships 1.24. dstack's GO_TOOLCHAIN_VERSION and GO_TOOLCHAIN_SHA256",
+    "from_dstack": true
+  },
+  "rust_toolchain": {
+    "version": "1.92.0",
+    "rustc": {
+      "url": "https://static.rust-lang.org/dist/rustc-1.92.0-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "78b2dd9c6b1fcd2621fa81c611cf5e2d6950690775038b585c64f364422886e0"
+    },
+    "cargo": {
+      "url": "https://static.rust-lang.org/dist/cargo-1.92.0-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "e5e12be2c7126a7036c8adf573078a28b92611f5767cc9bd0a6f7c83081df103"
+    },
+    "rust_std": {
+      "url": "https://static.rust-lang.org/dist/rust-std-1.92.0-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "5f106805ed86ebf8df287039e53a45cf974391ef4d088c2760776b05b8e48b5d"
+    },
+    "note": "Builds nvattest: the regorus FFI Cargo.lock from dstack needs rustc 1.86 (icu 2.2.0, idna_adapter 1.2.2), and trixie ships 1.85, which a build on 2026-09-14 showed. dstack's RUST_TOOLCHAIN_VERSION and component hashes",
     "from_dstack": true
   },
   "kernel": {
@@ -44,7 +76,7 @@
     "run_url": "https://us.download.nvidia.com/tesla/595.91.07/NVIDIA-Linux-x86_64-595.91.07.run",
     "run_sha256": "ca23c88dd24b07a191644e1e11cfb7bcdd7537305749af40f980018b095e6313",
     "container_toolkit_revision": "c748619c592030519361274a2fdd43f2c2ced73a",
-    "note": "version and hashes from dstack; the download URL follows NVIDIA's data-center layout and is unverified",
+    "note": "version and hashes from dstack; the download from this URL (NVIDIA's data-center layout) matched run_sha256 on 2026-09-14",
     "from_dstack": true,
     "fabricmanager": {
       "url": "https://developer.download.nvidia.com/compute/nvidia-driver/redist/fabricmanager/linux-x86_64/fabricmanager-linux-x86_64-595.91.07-archive.tar.xz",

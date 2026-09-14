@@ -16,10 +16,18 @@ an operator runs on a TDX host to prove the measured chain matches.
 - Deterministic packing of the root filesystem with dm-verity, the worker image disk, the initrd, and the weights images.
 - Golden manifest entries: built, signed with `kuno-devkit sign-manifest`, and parsed under the production policy.
 
+**Built here, on 2026-09-14** (§3, "The release built here"), on a 12-thread Ubuntu 22.04 host with no TDX or GPU
+- The whole release with `build.sh --check`: the mkosi tools tree and root filesystem, the kernel, the NVIDIA open
+  modules and userspace, Fabric Manager, NSCQ, nvattest, the PPCIe verifier and nvidia-ctk; the worker image disk
+  (from `kuno-worker:ltx`), the root filesystem with dm-verity, and the initrd. Two builds, with job counts 1 and 12
+  and different scratch paths, were byte-identical, measurements included.
+- RTMR0 from the pinned dstack-mr for every shape, with dstack-mr agreeing with `measure.py` on MRTD, RTMR1 and RTMR2.
+  The MRTD equals the one dstack published for its firmware.
+- Those measurements through `publish.py entry --dev`, a throwaway key and `publish.py verify` under the production
+  policy; `entry` without `--dev` refuses them because the worker image digest is not pinned.
+
 **Written, never run**
-- The mkosi build (kernel, NVIDIA driver).
 - The guest agent that extends RTMR3 and opens the worker image disk.
-- RTMR0 from dstack-mr on our images.
 - The TD launch command, and running several TDs on one server (`plan-host.py`).
 - The CI job.
 
@@ -290,12 +298,13 @@ because dm-verity already guarantees the content. The layout without `KUNO_WEIGH
 |---|---|
 | `inputs.lock.json` | Every external input, pinned (see below). The only null is the release's worker image digest. |
 | `shapes.json` | VM shapes (vCPUs, memory, GPUs, disks, QEMU version) and the profiles each serves. Each is its own manifest entry. |
-| `fetch-inputs.sh` | `inputs`: downloads and hash-checks the kernel, OVMF, the NVIDIA driver, Fabric Manager, NSCQ, dstack's nvattest patches and NVIDIA's PPCIe verifier. `tools`: installs mkosi and dstack-mr at their pinned revisions. |
-| `build.sh` | The whole build (below). `--check` builds twice and compares every byte; `--pins` lists unpinned inputs. |
-| `mkosi/mkosi.conf`, `mkosi.build`, `mkosi.postinst.chroot`, `kernel/kuno.config`, `nvidia.files` | The root filesystem: systemd, podman, cryptsetup, busybox. The build script compiles the kernel and the NVIDIA open modules. Postinst masks every unit that could extend an RTMR or offer a login (no getty, no ssh). |
+| `fetch-inputs.sh` | `inputs`: downloads and hash-checks the kernel, OVMF, the NVIDIA driver, Fabric Manager, NSCQ, dstack's nvattest patches, NVIDIA's PPCIe verifier, the Go and Rust toolchains and the Debian archive keyring. `tools`: installs mkosi and dstack-mr at their pinned revisions. |
+| `build.sh` | The whole build (below). `--check` builds twice and compares every byte; `--pins` lists unpinned inputs; `--image-oci` packs a worker image archive built earlier instead of building the image twice. |
+| `mkosi/mkosi.conf`, `mkosi.build`, `mkosi.postinst.chroot`, `kernel/kuno.config`, `nvidia.files` | The root filesystem: systemd, podman, cryptsetup, busybox. The build script enters the image with `mkosi-chroot`, where the build packages are, and compiles the kernel (every line of `kuno.config` must survive `olddefconfig`), the NVIDIA open modules with their GSP firmware, nvattest and nvidia-ctk, with Rust and Go from pinned upstream toolchains. Postinst masks every unit that could extend an RTMR or offer a login (no getty, no ssh). |
 | `pack-rootfs.sh` | Squashfs from a name-sorted tar with clamped metadata, then dm-verity appended (fixed salt and UUID). |
 | `pack-image.sh` | The worker image disk: the OCI archive made canonical (only the manifest, config and layer blobs, each checked against its digest; a fixed `index.json`; names in order, root-owned, fixed modes, mtime 0) and the catalog's `gpus-per-worker` table, packed by `pack-rootfs.sh` with times at 0. Writes `worker.img.verity`, `.roothash`, `.size` and `.digest`. |
 | `mkinitrd.sh`, `initrd.files`, `initrd/init` | The initrd: busybox and veritysetup with the libraries listed, nothing else. It opens the root filesystem with the root hash from the measured command line, then `switch_root`. |
+| `rootfs/usr/lib/systemd/system-preset/10-kuno.preset` | mkosi applies systemd presets after postinst, and Debian's default preset enables every unit, so this keeps Fabric Manager disabled until `kuno-app` starts it. |
 | `rootfs/usr/lib/kuno/kuno-app`, `kuno-app.service`, `nvidia-persistenced.service`, `rootfs/etc/fstab` | Guest agent: RTMR3, the worker image disk, weights, the GPUs' ready state (after NVIDIA's PPCIe verifier in Protected PCIe mode), and one worker container per GPU group (`KUNO_GPU_GROUPS`, §6). In-memory `/var` and `/tmp`. |
 | `measure.py` | Expected MRTD and RTMR0–3 per shape. |
 | `publish.py` | `entry`, `verify` and `compare-quote`. |
@@ -315,37 +324,122 @@ Pinned inputs:
 | Fabric Manager, NSCQ | NVIDIA's 595.91.07 redistributable archives (sha256 `c91cd6e2…`, `86fbe59a…`) |
 | nvattest | NVIDIA/attestation-sdk `9d12801c…` (2026.06.09), with dstack's two patches and regorus Cargo.lock at dstack `44dd0fc8…` |
 | NVIDIA PPCIe verifier | `nv-ppcie-verifier` 2.0.0 (`bfe171cd…`), `nvidia-ml-py` 12.575.51 (`eb864180…`), `timeout-decorator` 0.5.0 (`6a2f2f58…`) |
+| Debian archive keyring | `debian-archive-keyring` 2025.1 from the snapshot (`9ea7778e…`; its `debian-archive-keyring.gpg` `506b815c…`) |
+| Go toolchain | 1.26.2 (`990e6b4b…`), for nvidia-ctk: its `go.mod` needs Go 1.25, trixie ships 1.24 |
+| Rust toolchain | 1.92.0: rustc `78b2dd9c…`, cargo `e5e12be2…`, rust-std `5f106805…`, for nvattest: the regorus `Cargo.lock` needs rustc 1.86, trixie ships 1.85 |
 | SOURCE_DATE_EPOCH | `1788220800` |
 
-Every value except SOURCE_DATE_EPOCH and the PPCIe verifier's Python packages is dstack's own pin, recorded as such.
-The Fabric Manager and NSCQ hashes are also in NVIDIA's `redistrib_595.91.07.json`. The Python packages carry
-PyPI's hashes. Every one of these downloads matched its pin on 2026-09-14.
+Every value except SOURCE_DATE_EPOCH, the Debian archive keyring and the PPCIe verifier's Python packages is
+dstack's own pin, recorded as such. The Fabric Manager and NSCQ hashes are also in NVIDIA's
+`redistrib_595.91.07.json`. The Python packages carry PyPI's hashes, and the keyring the hash in the snapshot's
+`Packages` index. Every one of these downloads matched its pin on 2026-09-14.
+
+**The tools tree and its keyring.** mkosi builds its tools tree with the build host's apt, and would verify the
+snapshot with the host's Debian keyring. Ubuntu 22.04's `debian-archive-keyring` (2021.1.1) has no trixie keys, and
+mkosi 26 does not pass `Snapshot=` to the tools tree. So `build.sh` gives the tools tree its own apt sources: the
+pinned snapshot's `trixie` and `trixie-security`, signed by the pinned keyring. The image is then installed with the
+tools tree's apt and its `debian-archive-keyring`, from the same snapshot.
 
 ```bash
 sudo image/cvm/fetch-inputs.sh tools image/cvm/.tools                   # needs git and cargo
 echo '{"c2.h200-141gb.x1": ["<ltx-2.5 root hash>"]}' > weights.json
 sudo image/cvm/build.sh --out out/cvm --weights weights.json --check    # writes out/cvm/a and out/cvm/b, fails on any difference
+sudo image/cvm/build.sh --out out/cvm --image-oci worker-ltx.oci.tar    # packs an image archive built earlier instead
 ```
+
+`KUNO_CVM_TOOLS` and `KUNO_CVM_INPUTS` move the tools and inputs out of `image/cvm/.tools` and `.inputs`;
+`KUNO_CVM_WORKDIR` (default `/var/tmp`) holds the scratch directory, which `KUNO_CVM_KEEP_WORK=1` keeps. A build
+whose worker image digest is not pinned (the lock's one null) needs `KUNO_CVM_ALLOW_UNPINNED=1`, as in CI.
+
+`--image-oci` takes the archive `image/build.sh` keeps with `KUNO_IMAGE_OCI_OUT`, or `docker save` of that image from
+Docker's containerd image store, whose `index.json` names the same single manifest. `pack-image.sh` checks every blob
+against its digest either way, and `build.json` records `worker_image_reproduced: false`, since that build did not
+rebuild the image.
 
 `build.sh` steps:
 1. Hash-check the inputs.
 2. Build the worker image twice, via `image/build.sh --check`: the LTX image, or the H3 image with
-   `KUNO_IMAGE_VARIANT=h3`.
-3. `pack-image.sh`: the worker image disk, `worker.img.verity`, with its root hash, data size and image digest.
+   `KUNO_IMAGE_VARIANT=h3`. With `--image-oci`, use that archive.
+3. Build mkosi's tools tree from a copy of `image/cvm/mkosi` in the scratch directory (mkosi 26 writes the tools
+   tree next to its configuration), with the apt sources and keyring above. Every packing step below runs inside
+   it (`mkosi sandbox`), so tar, python3's `tarfile`, squashfs-tools 4.6.1, cryptsetup 2.7.5, cpio and gzip come
+   from the snapshot, not from the build host.
+4. `pack-image.sh`: the worker image disk, `worker.img.verity`, with its root hash, data size and image digest.
    The build stops unless the disk holds the digest step 2 built.
-4. Build the mkosi root filesystem tree and kernel. Nothing of the worker release goes into the tree, and the
-   command line names only the root filesystem.
-5. `pack-rootfs.sh` and `mkinitrd.sh`.
-6. Normalize the kernel's setup header.
-7. Write the command line, `metadata.json` (dstack-mr compatible), `build.json` (with `worker_image_digest` and
-   `worker_image_disk`: file, root hash, size), a copy of `shapes.json` and `sha256sum.txt`, which covers the image
-   disk and its `.roothash`, `.size` and `.digest` files.
-8. `measure.py` per shape with `--image-root` and `--image-digest`, with dstack-mr for RTMR0 and a cross-check of
+5. Build the mkosi root filesystem tree and kernel. Nothing of the worker release goes into the tree, and the
+   command line names only the root filesystem. The kernel leaves the tree (`usr/lib/modules/*/vmlinuz`) before
+   packing.
+6. `pack-rootfs.sh` and `mkinitrd.sh`.
+7. Normalize the kernel's setup header.
+8. Write the command line, `metadata.json` (dstack-mr compatible), `build.json` (with `worker_image_digest`,
+   `worker_image_disk`: file, root hash, size, and `worker_image_reproduced`), a copy of `shapes.json` and
+   `sha256sum.txt`, which covers the image disk and its `.roothash`, `.size` and `.digest` files.
+9. `measure.py` per shape with `--image-root` and `--image-digest`, with dstack-mr for RTMR0 and a cross-check of
    MRTD, RTMR1 and RTMR2.
 
 Nothing written names the build machine, its paths or the time. `--check` builds everything twice, the image
 disk included, with different job counts, and requires identical bytes. A null pin stops the build unless
 `KUNO_CVM_ALLOW_UNPINNED=1`, and then `build.json` says `unpinned`, which `publish.py` refuses.
+
+### The release built here (2026-09-14)
+
+```bash
+sudo env KUNO_CVM_ALLOW_UNPINNED=1 KUNO_CVM_TOOLS=<tools> KUNO_CVM_INPUTS=<inputs> \
+    image/cvm/build.sh --out <out> --image-oci worker-ltx.docker-save.tar --check
+```
+
+- **Host:** Ubuntu 22.04, 12 threads, 61 GB, Docker 29; no TDX, no GPU. mkosi 26 and dstack-mr at their pins.
+- **Worker image:** `docker save kuno-worker:ltx` (`sha256:0542656e998de11c0b7c16fac3af91f2ad15d13198d5e7bc42257c1777dec150`,
+  built earlier by `image/build.sh` with `SOURCE_DATE_EPOCH` 1788220800). It was packed, not rebuilt, so `build.json`
+  says `worker_image_reproduced: false`, and `unpinned: true` because the lock pins no worker digest.
+- **No weights image:** `--weights` was not given, so RTMR3 below holds only the image disk and image digest events.
+  Every shape counts two verity volumes, so RTMR0 already assumes a weights disk; a TD that attaches one extends a
+  third RTMR3 event. These RTMR3 values are for rehearsal, not publication.
+- **Reproducibility:** both builds of `--check` (job counts 1 and 12, separate scratch directories) gave identical
+  bytes for every file below and every measurement file. A single build before the last two fixes also produced
+  the same `bzImage`, initrd, OVMF and worker image disk, so those held across three builds.
+- **Time:** 14 min 34 s for `--check` (about 7 min per build, with mkosi's package cache warm; the first tools tree
+  took about 3 min more from the snapshot). Installing the tools took 20 s, fetching the inputs under a minute.
+
+| File | Bytes | sha256 |
+|---|---|---|
+| `ovmf.fd` | 4194304 | `7909f2899aee5b151de0ea17528dc53ffb729855ced5a75abe7ac7054cc5d1c6` |
+| `bzImage` (Linux 6.18.40-kuno, header normalized) | 14259200 | `e0fe91cbd2baa69da8748892be9db2b549acb8bad6e29ae533e3f5678c328900` |
+| `initramfs.cpio.gz` | 6454395 | `228cbe84d299ce930d963a80cf9cbf4262c0ce7dd43a672df4823e4ddc6cfe9b` |
+| `rootfs.img.verity` | 292294656 | `771b1adfa32e065917e0aa30a0679542909082bd2fe05017281c60089bdcefc6` |
+| `worker.img.verity` | 6615154688 | `c5a282c56c7833af9a1cb6d38cfd31b77dae85723b3553484e78381734389388` |
+| `metadata.json` | 671 | `14ef2b8449ea990eb26b92fcf6257876b4ce1bb274389e0ba99af9a969252271` |
+| `build.json` | 859 | `b40cd3a0143d0ee14356636a38861f6008a259a92c23a8c92a0527450eb6b00f` |
+
+- Root filesystem: root hash `b180a408d862fc3096ca79935adc39d0eacedd8d1b8d0938c8d974362a35437c`, 289996800 data bytes.
+- Worker image disk: root hash `00e7aa37375210f6f800451077366ea45b9dbbf3e777b0a95f806e3cbae13f08`, 6563467264 data bytes.
+
+Measurements. dstack-mr agreed with `measure.py` on MRTD, RTMR1 and RTMR2 for every shape (QEMU 9.1.0, one pass):
+
+| Register | Every shape |
+|---|---|
+| MRTD | `1b5c7f837bd3b98e9ca427b9561d94715c38de76af60e827a5b3174c18e6477a9711dc94e2160388db5c746a73069212` |
+| RTMR1 | `430f5c7f9eb61fc0ab925e498589a941261e1c055417f69262ab9051efbb12df6ac936ab0adb1d110a1c96600d58f004` |
+| RTMR2 | `82a5f46943c345d5f4fbd552156911a7832535a89c052d2ab0dbf8af5ce13637370fedfd76dd362d649238e7b5c454ac` |
+| RTMR3 (no weights) | `c6456a077f6686c514852e1b694e62f78ac5ee297e3e223727aac424837bee9c9f407275a2df298572323ae6c152d1bf` |
+
+| Shape | RTMR0 (dstack-mr) |
+|---|---|
+| `c1.rtx-pro-6000-bw-se.x1` | `16c401da2fc39537842fff23f6a6b80eede7235d0ac06cbe288ac1c00539ffdc1e7151e4660c5e6087d6a8aa4828762e` |
+| `c2.h200-141gb.x1` | `4bf8a945bca693b19d5958e2e4a8bdddb5e9bcba6682ef365230afa46add5f91e3f1772c69d2f4337aca20684ead71de` |
+| `c2.b200-180gb.x1` | `f3a1f541ccfde0c842f9e0bff13a9bc4cd4007267fadbd9ecefa8582b89256232d40d825ac94e1a8fbb1dde1a87c7a6e` |
+| `c2.b300-288gb.x1` | `b03a2cff2d7dfbd29b5b103bca2607b19fbf0b12af0ac5bfc74a8421337d93dc1e666e8508d8a3b89a69018801d75056` |
+| `c8.h200-141gb.x8` | `25c6d4d3056615536e4bf2e337b583c87e9150f21fe1b088e1b24abee053c1e8080385ac3801d2c1811b5dbc46f49683` |
+| `c8.b200-180gb.x8`, `c8.b300-288gb.x8` | `ab79d78ce3a59dfe283494543d0ffea037c9d8b7b3aee90f5ede0cc12570ab4e0660d511b69fbe96b76b57c0c1e46a11` |
+
+Found along the way:
+- `c8.b200-180gb.x8` and `c8.b300-288gb.x8` are the same VM, so every register matches, and `publish.py entry` keeps
+  one `AllowedMeasurement` for both: 7 measurement files gave 6 entries, the later shape's profiles and GPU fields
+  winning. Today both shapes have the same profiles and GPU fields.
+- systemd presets also enable Debian's own units in the image: `systemd-networkd`, `chrony` together with
+  `chronyd-restricted`, `cni-dhcp` and podman's sockets. Their behaviour at boot is unchecked.
+- Installing packages prints an `update-alternatives` error for bash's excluded man page; it is not fatal, as in
+  dstack's build.
 
 **CI.** `.github/workflows/cvm-reproducibility.yml` runs the build on two runners, with different
 checkouts and job counts, and requires `sha256sum.txt`, `metadata.json` and every measurement file to be
@@ -618,18 +712,17 @@ places BARs bottom-up from there. Confirm both from the first TD's event log (`m
   - `/dev/disk/by-id/virtio-kuno-image` appearing from the virtio serial, and mounting the squashfs read-only.
   - `podman load` from the archive on that mount, and the loaded image's id being its config digest.
   - `tar -xOf` seeking through a multi-gigabyte archive instead of reading it.
-  - `pack-image.sh` on a real worker image archive. `image/build.sh` now builds the images' OCI archives here.
-    Each `index.json` names exactly one manifest, as `pack-image.sh` requires. It also carries the name
-    annotations `docker load` tags by, which `pack-image.sh` drops when it writes its fixed index.
-    `pack-image.sh` itself has not run on them.
-  - `pack-image.sh`'s archive bytes come from python3's `tarfile`, which the mkosi tools tree does not pin.
-    Two builders with different Python versions have not been compared.
-- **The mkosi build.**
-  - mkosi 26 flags (`--include`, `--source-date-epoch`) and package names.
-  - The NVIDIA `.run` layout and `nvidia.files`.
-  - The `nvidia-ctk` build.
-  - Whether the kernel and module builds are reproducible across machines. Only the packing steps were
-    shown to be deterministic here.
+  - `pack-image.sh` on `image/build.sh`'s own archive. It has run on `docker save` of `kuno-worker:ltx`
+    (`sha256:0542656e…`), whose `index.json` names that one manifest with name annotations it drops, and packed
+    it to the same root hash in two builds on this machine. `image/build.sh`'s archive names the same manifest.
+  - `pack-image.sh` now runs in the mkosi tools tree, so its archive bytes come from the snapshot's python3 (3.13)
+    `tarfile`, not the host's. Two different builders have not been compared.
+- **The mkosi build.** It builds, and two builds on one machine were byte-identical ("The release built here").
+  - Reproducibility across machines. No second builder has been compared. Everything compiles under one fixed path
+    inside the image, with no `-march=native`, but a different host kernel or CPU has not been tried.
+  - The build on GitHub's ubuntu-24.04 runners (the CI job), whose apt and Debian keyring differ from this host's.
+  - That the tools tree's own sources (`trixie` and `trixie-security` from the snapshot) install the same package
+    versions mkosi's generated sources would; the image itself uses mkosi's.
 - **The kernel.** Whether 6.18.40 with `kuno.config` boots as a TDX guest with configfs-tsm quotes and
   writable RTMRs.
 - **`kuno-app` on TDX.**
@@ -643,7 +736,9 @@ places BARs bottom-up from there. Confirm both from the first TD's event log (`m
   - Fabric Manager in the guest, started from the redistributable archive's unit and start script.
   - NVIDIA's PPCIe verifier 2.0.0 installed without its declared dependencies, on Debian's python3,
     cryptography, ecdsa and prettytable.
-  - nvattest built with dstack's recipe outside dstack's fixed build path, including reproducibility.
+  - nvattest running. It builds with dstack's recipe (patches, `Cargo.lock`, Rust 1.92.0) under this build's own fixed
+    path, two builds gave the same bytes, and every library it links is in the root filesystem; it has not run
+    against a GPU or NVSwitch.
   - NSCQ inside the worker containers with only the NVSwitch device nodes and the mounted library.
   - That nvattest's NVSwitch evidence JSON has the shape of its GPU evidence.
   - That the NVSwitch EAT's signature claim is `x-nvidia-switch-attestation-report-signature-verified`.
