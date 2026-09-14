@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The media tests probe what they encode with ffprobe; imageio-ffmpeg bundles ffmpeg only.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
