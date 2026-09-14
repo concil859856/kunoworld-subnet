@@ -1,0 +1,456 @@
+"""LTX-2.5 in the precision a hardware class declares, on cards that cannot hold the bf16 pipeline.
+
+Selection. `kuno_protocol.precision.select_recipe` maps (profile, hardware class) to one recipe:
+
+    O1.rtx-5090-32gb.x1.fp8-cast  fp8-cast  transformer weights stored float8_e4m3fn, upcast to bf16 per
+                                            layer (diffusers enable_layerwise_casting; the same plain cast
+                                            as ltx-pipelines' --quantization fp8-cast, the only FP8 route
+                                            for LTX-2.5, which has no FP8 checkpoint)
+    O1.rtx-4090-24gb.x1.int8      int8-wo   transformer and text encoder quantized at load with torchao
+                                            Int8WeightOnlyConfig(group_size=128, version=2); Lightricks'
+                                            comfy-int8-convrot file is ComfyUI-only
+    every other class, or none    bf16      the pipeline as published
+
+A class the profile does not list runs bf16 with verified mode off, as `Backend.verified_enabled` does.
+
+Refusals, all before a GPU is touched where possible:
+  * the weights are not the pinned ones (`precision.verify_weights`), or no digest pins them;
+  * the GPU is not the class's SKU, has less memory than the class declares, or its compute
+    capability or PyTorch build cannot run the recipe;
+  * the class cannot fit even the profile's smallest request in any offload mode the host RAM allows;
+  * at job time, the request needs more memory than the loaded plan (`CapacityRefused`).
+
+Memory (GiB). A linear model per recipe (precision_recipes.json) over the stage with the most latent
+tokens, `((frames - 1) // 8 + 1) × (width // 32) × (height // 32)`:
+
+    none   every component on the GPU
+    model  one model on the GPU at a time (diffusers enable_model_cpu_offload): the text encoder and
+           prompt enhancer alone, then the transformer with the VAEs and activations
+    group  transformer and text encoder streamed a block at a time from pinned host memory
+           (diffusers apply_group_offloading, block_level, use_stream); slowest, smallest
+
+`auto` takes the lightest mode whose envelope covers the profile's largest request; if none does,
+the mode with the largest envelope, and requests beyond it are refused. The estimates are unmeasured
+until `worker/scripts/benchmark_ltx_quantized.py` runs on the class.
+
+Verified mode. Quantization changes how weights are stored, not what the denoising loop carries: the
+latents stay bfloat16, so the step callback, `SchedulerTrap` and `tensor_record` are unchanged. The
+class id (which encodes the precision) and the recipe's weights digest go into the transcript, and
+open-tier classes are compared within a tolerance.
+
+NOT RUN ON A GPU. Everything above the torch section is plain data and tested without hardware.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from kuno_protocol.precision import (
+    ComponentPrecision,
+    PrecisionError,
+    PrecisionRecipe,
+    WeightFile,
+    WeightsCheck,
+    select_recipe,
+    verify_weights,
+    weight_files,
+)
+from kuno_protocol.profiles import HardwareClass, ModelProfile, ltx_num_frames
+
+from .media_tools import BackendError
+
+log = logging.getLogger("kuno.worker.quantized")
+
+OFFLOAD_MODES = ("none", "model", "group")
+# Left free on every card: the display, other processes, allocator fragmentation.
+VRAM_RESERVE_GIB = 0.5
+# Host memory kept for the OS, the worker and the CVM's own buffers when weights live in RAM.
+HOST_RAM_MARGIN_GIB = 8.0
+# Vendor rounding between the class's nominal size and what the driver reports.
+GPU_MEMORY_TOLERANCE_GIB = 1.0
+# Below this share of parameters in the storage dtype, a recipe did not apply.
+MIN_QUANTIZED_FRACTION = 0.5
+
+
+class CapacityRefused(BackendError):
+    """This hardware class cannot fit the request; the message says what it can serve."""
+
+
+@dataclass(frozen=True)
+class DeviceInfo:
+    name: str
+    total_gib: float
+    capability: tuple[int, int]
+    torch_version: str = ""
+
+
+# ------------------------------------------------------------------ selection
+
+
+def resolve_recipe(profile: ModelProfile, hardware_class: str | None) -> tuple[PrecisionRecipe, HardwareClass | None]:
+    """The recipe this worker loads. A class the profile does not list is ignored (bf16, verified mode off)."""
+    listed = profile.verified.hardware_class(hardware_class) if profile.verified and hardware_class else None
+    return select_recipe(profile, hardware_class if listed is not None else None)
+
+
+def _model_tokens(text: str) -> set[str]:
+    """GPU model tokens such as "4090", "h200", "6000": words with a digit that are not a memory size."""
+    return {t for t in re.findall(r"[a-z0-9]+", text.lower()) if any(c.isdigit() for c in t) and not t.endswith("gb")}
+
+
+def _version(text: str) -> tuple[int, int]:
+    match = re.match(r"(\d+)\.(\d+)", text or "")
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+def check_device(recipe: PrecisionRecipe, hardware: HardwareClass | None, device: DeviceInfo) -> None:
+    if hardware is not None:
+        wanted = _model_tokens(hardware.gpu_sku)
+        if wanted and not wanted <= _model_tokens(device.name):
+            raise PrecisionError(
+                f"this GPU is a {device.name}, but {hardware.id} is {hardware.gpu_sku}: "
+                "set KUNO_VERIFIED_HARDWARE_CLASS to the class of the GPU you have"
+            )
+        if hardware.vram_gb and device.total_gib + GPU_MEMORY_TOLERANCE_GIB < hardware.vram_gb:
+            raise PrecisionError(f"{device.name} reports {device.total_gib:.1f} GiB; {hardware.id} needs {hardware.vram_gb:g} GiB")
+    if recipe.min_compute_capability and device.capability < tuple(recipe.min_compute_capability):
+        need = ".".join(map(str, recipe.min_compute_capability))
+        raise PrecisionError(f"{recipe.id} needs compute capability {need}; {device.name} is {device.capability[0]}.{device.capability[1]}")
+    if device.capability >= (12, 0) and device.torch_version and _version(device.torch_version) < (2, 7):
+        raise PrecisionError(f"{device.name} (Blackwell, sm_120) needs PyTorch 2.7 or newer built for CUDA 12.8+; this is {device.torch_version}")
+
+
+# ------------------------------------------------------------------ memory
+
+
+def latent_tokens(width: int, height: int, num_frames: int) -> int:
+    return ((num_frames - 1) // 8 + 1) * (width // 32) * (height // 32)
+
+
+def _render_frames(profile: ModelProfile, duration_s: float, fps: int) -> int:
+    """Frames the transformer renders (DFR renders 48/50 fps requests at half rate, as build_call does)."""
+    if profile.variant == "dfr" and fps >= 48:
+        return ltx_num_frames(duration_s, fps // 2)
+    return ltx_num_frames(duration_s, fps)
+
+
+def call_tokens(call: dict[str, Any], width: int, height: int) -> int:
+    frames = call.get("num_frames")
+    if frames is None:  # audio-to-video: the clip length follows the audio
+        frames = ltx_num_frames(float(call.get("audio_max_duration", 0)), round(float(call["frame_rate"])))
+    return latent_tokens(width, height, int(frames))
+
+
+def profile_token_range(profile: ModelProfile) -> tuple[int, int]:
+    lim = profile.limits
+    sizes = [tuple(size) for ratios in lim.sizes.values() for size in ratios.values()]
+    low = min(latent_tokens(w, h, _render_frames(profile, lim.min_duration_s, fps)) for w, h in sizes for fps in lim.fps)
+    high = max(latent_tokens(w, h, _render_frames(profile, lim.max_duration_s, fps)) for w, h in sizes for fps in lim.fps)
+    return low, high
+
+
+@dataclass(frozen=True)
+class MemoryPlan:
+    recipe_id: str
+    hardware_class: str
+    offload: str
+    usable_gib: float
+    # peak(tokens) = max(floor_gib, token_base_gib + per_token_gib × tokens) + overhead_gib
+    floor_gib: float
+    token_base_gib: float
+    per_token_gib: float
+    overhead_gib: float
+    host_ram_gib: float
+    measured: bool = False
+
+    def estimate_gib(self, tokens: int) -> float:
+        return max(self.floor_gib, self.token_base_gib + self.per_token_gib * tokens) + self.overhead_gib
+
+    @property
+    def max_tokens(self) -> int:
+        """The largest request this plan fits; -1 when nothing fits."""
+        room = self.usable_gib - self.overhead_gib
+        if self.floor_gib > room or self.token_base_gib > room:
+            return -1
+        return int((room - self.token_base_gib) / self.per_token_gib) if self.per_token_gib > 0 else 1 << 40
+
+
+def _plan(recipe: PrecisionRecipe, hardware: HardwareClass, mode: str, usable: float) -> MemoryPlan:
+    memory = recipe.memory
+    c = memory.components_gib
+    transformer, encoder, enhancer, other = (c.get(k, 0.0) for k in ("transformer", "text_encoder", "prompt_enhancer", "other"))
+    if mode == "none":
+        floor, base, host = 0.0, memory.weights_gib + memory.activation_fixed_gib, 0.0
+    elif mode == "model":
+        floor, base, host = max(encoder, enhancer), transformer + other + memory.activation_fixed_gib, memory.weights_gib
+    elif mode == "group":
+        floor, base, host = memory.group_onload_gib, memory.group_onload_gib + other + memory.activation_fixed_gib, memory.weights_gib
+    else:
+        raise PrecisionError(f"KUNO_LTX_OFFLOAD must be auto, none, model or group, not {mode!r}")
+    return MemoryPlan(
+        recipe_id=recipe.id, hardware_class=hardware.id, offload=mode, usable_gib=usable, floor_gib=floor, token_base_gib=base,
+        per_token_gib=memory.activation_gib_per_10k_tokens / 10_000, overhead_gib=memory.overhead_gib, host_ram_gib=host,
+        measured=memory.measured,
+    )
+
+
+def plan_memory(
+    profile: ModelProfile, recipe: PrecisionRecipe, hardware: HardwareClass, *, host_ram_gib: float | None, mode: str = "auto"
+) -> MemoryPlan:
+    if not hardware.vram_gb:
+        raise PrecisionError(f"{hardware.id} declares no vram_gb to plan memory against")
+    usable = hardware.vram_gb - VRAM_RESERVE_GIB
+    low, high = profile_token_range(profile)
+    modes = OFFLOAD_MODES if mode == "auto" else (mode,)
+    viable, notes = [], []
+    for candidate in modes:
+        plan = _plan(recipe, hardware, candidate, usable)
+        if plan.host_ram_gib and host_ram_gib is not None and host_ram_gib < plan.host_ram_gib + HOST_RAM_MARGIN_GIB:
+            notes.append(f"{candidate} offload needs {plan.host_ram_gib + HOST_RAM_MARGIN_GIB:.0f} GiB of host RAM, this host has {host_ram_gib:.0f}")
+            continue
+        if plan.max_tokens < low:
+            notes.append(f"{candidate} offload needs about {plan.estimate_gib(low):.1f} GiB for the smallest request")
+            continue
+        viable.append(plan)
+    if not viable:
+        raise PrecisionError(
+            f"{hardware.id} cannot serve {profile.id} with {recipe.precision} weights on {usable:.1f} GiB usable: " + "; ".join(notes)
+        )
+    covering = [p for p in viable if p.max_tokens >= high]
+    chosen = covering[0] if covering else max(viable, key=lambda p: p.max_tokens)
+    if not covering:
+        log.warning(
+            "%s on %s: %s offload serves up to %d latent tokens of the profile's %d; larger requests are refused",
+            profile.id, hardware.id, chosen.offload, chosen.max_tokens, high,
+        )
+    return chosen
+
+
+def host_memory_gib() -> float | None:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def plan_for_class(profile: ModelProfile, hardware_class: str | None, *, host_ram_gib: float | None, mode: str = "auto") -> MemoryPlan | None:
+    """The plan admission uses, or None: no class, a class that declares no VRAM (the confidential
+    classes), or, with `auto`, a class that holds every component at once (the official 80-96 GB bf16
+    recipe keeps running without offload or admission, as before quantized classes existed)."""
+    recipe, hardware = resolve_recipe(profile, hardware_class)
+    if hardware is None or not hardware.vram_gb:
+        return None
+    if mode == "auto" and hardware.vram_gb >= recipe.memory.weights_gib + recipe.memory.overhead_gib:
+        return None
+    return plan_memory(profile, recipe, hardware, host_ram_gib=host_ram_gib, mode=mode)
+
+
+def _longest_fitting(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int) -> float | None:
+    lim = profile.limits
+    duration = lim.max_duration_s
+    while duration >= lim.min_duration_s:
+        if latent_tokens(width, height, _render_frames(profile, duration, fps)) <= plan.max_tokens:
+            return duration
+        duration -= lim.duration_step_s
+    return None
+
+
+def admit(plan: MemoryPlan, profile: ModelProfile, call: dict[str, Any], width: int, height: int, fps: int) -> int:
+    """Raises CapacityRefused when the request cannot fit; returns its latent tokens otherwise."""
+    tokens = call_tokens(call, width, height)
+    if tokens <= plan.max_tokens:
+        return tokens
+    longest = _longest_fitting(plan, profile, width, height, fps)
+    hint = f"at {width}x{height} and {fps} fps it serves up to {longest:g} s" if longest else f"it cannot serve {width}x{height} at any duration"
+    raise CapacityRefused(
+        f"{plan.hardware_class} cannot fit this request ({tokens} latent tokens): about {plan.estimate_gib(tokens):.1f} GiB with "
+        f"{plan.offload} offload, {plan.usable_gib:.1f} GiB usable ({'measured' if plan.measured else 'estimated'}); {hint}"
+    )
+
+
+# ------------------------------------------------------------------ load plan
+
+
+@dataclass(frozen=True)
+class LoadPlan:
+    profile_id: str
+    recipe: PrecisionRecipe
+    hardware: HardwareClass | None
+    memory: MemoryPlan | None
+    weights: WeightsCheck
+    offload: str
+
+
+def prepare_load(
+    models_dir: Path,
+    profile: ModelProfile,
+    *,
+    hardware_class: str | None,
+    model_digest: str | None,
+    offload: str = "auto",
+    verify: str = "full",
+    allow_unpinned: bool = False,
+    device: DeviceInfo | None = None,
+    host_ram_gib: float | None = None,
+) -> LoadPlan:
+    """Everything decided before torch loads a byte. Raises PrecisionError with the reason otherwise."""
+    recipe, hardware = resolve_recipe(profile, hardware_class)
+    if device is not None:
+        check_device(recipe, hardware, device)
+    memory = plan_for_class(profile, hardware_class, host_ram_gib=host_ram_gib, mode=offload)
+    if memory is not None:
+        mode = memory.offload
+    elif offload in ("auto", "none"):
+        mode = "none"
+    elif offload in OFFLOAD_MODES:
+        mode = offload
+    else:
+        raise PrecisionError(f"KUNO_LTX_OFFLOAD must be auto, none, model or group, not {offload!r}")
+    if hardware is None and model_digest is None and not allow_unpinned:
+        # Performance mode with nothing to pin: no transcript carries a digest, so hashing 66 GB buys nothing.
+        files = [WeightFile(path=p, size=(Path(models_dir) / p).stat().st_size) for p in weight_files(Path(models_dir), recipe)]
+        weights = WeightsCheck(recipe_id=recipe.id, mode="size", model_digest="unpinned", files=files)
+    else:
+        weights = verify_weights(Path(models_dir), recipe, expected_digest=model_digest, mode=verify, allow_unpinned=allow_unpinned)  # type: ignore[arg-type]
+    return LoadPlan(profile_id=profile.id, recipe=recipe, hardware=hardware, memory=memory, weights=weights, offload=mode)
+
+
+# ------------------------------------------------------------------ torch (GPU image only)
+
+
+def probe_device(device: str = "cuda") -> DeviceInfo:
+    import torch
+
+    if not torch.cuda.is_available():
+        raise PrecisionError("no CUDA device is visible to PyTorch")
+    index = torch.device(device).index or 0
+    props = torch.cuda.get_device_properties(index)
+    return DeviceInfo(name=props.name, total_gib=props.total_memory / 2**30, capability=(props.major, props.minor), torch_version=torch.__version__)
+
+
+def dtype_census(module: Any) -> dict[str, int]:
+    """Parameter elements by "<tensor type>:<dtype>". torchao keeps the original dtype on its tensor
+    subclasses, so the type name is what shows a weight was quantized."""
+    counts: dict[str, int] = {}
+    for _name, param in module.named_parameters():
+        data = getattr(param, "data", param)
+        key = f"{type(data).__name__}:{str(param.dtype).removeprefix('torch.')}"
+        counts[key] = counts.get(key, 0) + int(param.numel())
+    return counts
+
+
+def quantized_fraction(counts: dict[str, int], spec: ComponentPrecision) -> float:
+    total = sum(counts.values())
+    if spec.method == "none" or total == 0:
+        return 1.0 if spec.method == "none" else 0.0
+    if spec.method == "layerwise-cast":
+        stored = sum(n for key, n in counts.items() if key.endswith(":" + spec.storage_dtype))
+    else:
+        stored = sum(n for key, n in counts.items() if not key.startswith(("Tensor:", "Parameter:")) or key.endswith(":int8"))
+    return stored / total
+
+
+def check_quantized(name: str, module: Any, spec: ComponentPrecision) -> float:
+    """A recipe that silently did not apply would load bf16 weights under a quantized class's name."""
+    fraction = quantized_fraction(dtype_census(module), spec)
+    if fraction < MIN_QUANTIZED_FRACTION:
+        raise PrecisionError(
+            f"{name}: only {fraction:.0%} of its parameters are stored as {spec.storage_dtype} after {spec.method}; "
+            "the quantization did not apply (check the diffusers, transformers and torchao versions)"
+        )
+    return fraction
+
+
+def _torchao_config(spec: ComponentPrecision):
+    import torchao.quantization as quantization
+
+    factory = getattr(quantization, spec.torchao_config or "", None)
+    if factory is None:
+        raise PrecisionError(f"torchao has no {spec.torchao_config}: install torchao>=0.15")
+    return factory(**spec.torchao_kwargs)
+
+
+def _apply_cast(module: Any, spec: ComponentPrecision) -> None:
+    if module is None or spec.method != "layerwise-cast":
+        return
+    import torch
+
+    storage, compute = getattr(torch, spec.storage_dtype), getattr(torch, spec.compute_dtype)
+    pattern = tuple(spec.skip_modules_pattern) or None
+    if hasattr(module, "enable_layerwise_casting"):
+        module.enable_layerwise_casting(storage_dtype=storage, compute_dtype=compute, skip_modules_pattern=pattern)
+    else:  # transformers models (the text encoder)
+        from diffusers.hooks import apply_layerwise_casting
+
+        apply_layerwise_casting(module, storage_dtype=storage, compute_dtype=compute, skip_modules_pattern=pattern)
+
+
+def _apply_offload(pipeline: Any, mode: str, device: str) -> None:
+    import torch
+
+    if mode == "none":
+        pipeline.to(device)
+        return
+    if mode == "model":
+        pipeline.enable_model_cpu_offload(device=device)
+    else:
+        from diffusers.hooks import apply_group_offloading
+
+        streamed = ("transformer", "text_encoder", "prompt_enhancer")
+        for name in streamed:
+            module = getattr(pipeline, name, None)
+            if module is not None:
+                apply_group_offloading(
+                    module, onload_device=torch.device(device), offload_device=torch.device("cpu"),
+                    offload_type="block_level", num_blocks_per_group=1, use_stream=True,
+                )
+        for name, component in pipeline.components.items():
+            if name not in streamed and isinstance(component, torch.nn.Module):
+                component.to(device)
+    vae = getattr(pipeline, "vae", None)
+    if vae is not None and hasattr(vae, "enable_tiling"):
+        vae.enable_tiling()
+
+
+def build_ltx_pipelines(models_dir: Path, plan: LoadPlan, device: str = "cuda") -> dict[str, Any]:
+    """Loads one recipe: diffusers LTX2Pipeline with the transformer (and text encoder) in its precision."""
+    import torch
+    from diffusers import LTX2ConditionPipeline, LTX2Pipeline, LTX2VideoTransformer3DModel
+
+    recipe, dtype = plan.recipe, torch.bfloat16
+    specs = recipe.components
+    transformer_spec = specs.get("transformer", ComponentPrecision())
+    quantization = None
+    if transformer_spec.method == "torchao":
+        from diffusers import TorchAoConfig
+
+        quantization = TorchAoConfig(_torchao_config(transformer_spec))
+    transformer = LTX2VideoTransformer3DModel.from_pretrained(
+        str(models_dir), subfolder=recipe.transformer_subfolder, torch_dtype=dtype, quantization_config=quantization
+    )
+    kwargs: dict[str, Any] = {"transformer": transformer, "torch_dtype": dtype}
+    encoder_spec = specs.get("text_encoder")
+    if encoder_spec is not None and encoder_spec.method == "torchao":
+        from diffusers.quantizers import PipelineQuantizationConfig
+        from transformers import TorchAoConfig as TransformersTorchAoConfig
+
+        kwargs["quantization_config"] = PipelineQuantizationConfig(
+            quant_mapping={"text_encoder": TransformersTorchAoConfig(quant_type=_torchao_config(encoder_spec))}
+        )
+    base = LTX2Pipeline.from_pretrained(str(models_dir), **kwargs)
+    _apply_cast(base.transformer, transformer_spec)
+    if encoder_spec is not None:
+        _apply_cast(getattr(base, "text_encoder", None), encoder_spec)
+    for name, spec in specs.items():
+        module = getattr(base, name, None)
+        if module is not None and spec.method != "none":
+            log.info("%s: %.0f%% of parameters in %s", name, 100 * check_quantized(name, module, spec), spec.storage_dtype)
+    _apply_offload(base, plan.offload, device)
+    # The condition pipeline shares the loaded (and offload-hooked) modules rather than loading a second copy.
+    condition = LTX2ConditionPipeline(**base.components)
+    return {"text": base, "condition": condition, "audio": base, "dfr": base}

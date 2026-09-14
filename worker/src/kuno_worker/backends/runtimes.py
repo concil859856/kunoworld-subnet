@@ -76,21 +76,39 @@ class LtxAdapter:
             torch.cuda.empty_cache()
 
 
-def ltx_loader(models_dir: Path, device: str = "cuda") -> Callable[[ModelProfile], Any]:
-    """Loads LTX-2.5 once and shares its components across pipeline classes."""
+def ltx_loader(
+    models_dir: Path,
+    device: str = "cuda",
+    *,
+    hardware_class: str | None = None,
+    model_digest: str | None = None,
+    offload: str = "auto",
+    weights_verify: str = "full",
+    allow_unpinned_weights: bool = False,
+    host_ram_gib: float | None = None,
+    device_probe: Callable[[str], Any] | None = None,
+    builder: Callable[..., dict[str, Any]] | None = None,
+) -> Callable[[ModelProfile], Any]:
+    """Loads LTX-2.5 once, in the precision the hardware class declares (backends/quantized.py), and
+    shares its components across pipeline classes. The weights must hash to `model_digest` (the
+    owner-signed manifest's entry for this profile and class) before anything reaches the GPU.
+    `device_probe` and `builder` replace the torch parts in tests."""
 
     def load(profile: ModelProfile) -> LtxAdapter:
-        import torch
-        from diffusers import LTX2ConditionPipeline, LTX2Pipeline
+        from .quantized import build_ltx_pipelines, host_memory_gib, prepare_load, probe_device
 
-        subfolder = "transformer_full" if profile.variant == "pro" else "transformer"
-        base = LTX2Pipeline.from_pretrained(str(models_dir), subfolder=subfolder, torch_dtype=torch.bfloat16)
-        base.to(device)
-        # The condition pipeline reuses the same weights rather than loading a second copy.
-        condition = LTX2ConditionPipeline(**base.components)
-        pipelines: dict[str, Any] = {"text": base, "condition": condition, "audio": base, "dfr": base}
-        log.info("LTX-2.5 resident for %s (%s)", profile.id, subfolder)
-        return LtxAdapter(pipelines, device=device)
+        plan = prepare_load(
+            Path(models_dir), profile, hardware_class=hardware_class, model_digest=model_digest, offload=offload,
+            verify=weights_verify, allow_unpinned=allow_unpinned_weights, device=(device_probe or probe_device)(device),
+            host_ram_gib=host_memory_gib() if host_ram_gib is None else host_ram_gib,
+        )
+        pipelines = (builder or build_ltx_pipelines)(Path(models_dir), plan, device)
+        log.info(
+            "LTX-2.5 resident for %s: %s, %s offload, weights %s", profile.id, plan.recipe.id, plan.offload, plan.weights.model_digest[:16]
+        )
+        adapter = LtxAdapter(pipelines, device=device)
+        adapter.load_plan = plan
+        return adapter
 
     return load
 

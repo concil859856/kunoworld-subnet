@@ -30,15 +30,51 @@ context seals exactly one message.
 ## Blobs (inputs and output video)
 
 ```
-header  = "KUNOB1" | version:u8 = 1 | chunk_size:u32be | nonce_prefix:7 bytes     (18 bytes)
+header  = "KUNOB1" | version:u8 | chunk_size:u32be | nonce_prefix:7 bytes          (18 bytes)
 key     = HKDF-SHA256(ikm = input or output key, salt = none, info = "kuno/v1/blob/" + label, L = 32)
-chunk_i = ChaCha20-Poly1305(key, nonce = prefix | i:u32be | final:u8, aad = header, plaintext[i])
-blob    = header | chunk_0 | … | chunk_n            (an empty plaintext is one empty final chunk)
+chunk_i = ChaCha20-Poly1305(key, nonce = prefix | i:u32be | final:u8, aad = header, stream[i])
+blob    = header | chunk_0 | … | chunk_n            (an empty stream is one empty final chunk)
+size    = 18 + len(stream) + 16 × max(1, ⌈len(stream) / chunk_size⌉)
 ```
+
+| version | stream | status |
+|---|---|---|
+| 1 | the plaintext | still decrypted by every implementation; no longer written by default |
+| 2 | `length:u64be \| plaintext \| 0x00 …`, exactly `padme(8 + length)` bytes long | written by default: SDK inputs (Python and JS), enclave outputs, the gateway's Standard-mode sealing, and anything else sealed with `kuno_protocol.blobs.encrypt_blob` |
+
+```
+padme(L) = L                                   if L < 2
+         = (L + m) & ~m, where E = ⌊log2 L⌋, S = ⌊log2 E⌋ + 1, m = 2^(E−S) − 1
+```
+
+A version 2 decoder authenticates every chunk exactly as for version 1, then refuses the stream,
+as it would a bad tag, unless `8 + length ≤ len(stream)`, `len(stream) = padme(8 + length)` exactly,
+and every byte after the plaintext is zero. So a sealer can't leak a length by padding differently.
+The version byte is part of every chunk's AAD, so a blob can't be relabelled from one version to the
+other. The plaintext length is known once the first 8 stream bytes are decrypted, which keeps
+streaming decryption possible.
+
+**Padding scheme.** PADMÉ is Algorithm 1 of Nikitin, Barman, Lueks, Underwood, Hubaux and Ford,
+"Reducing Metadata Leakage from Encrypted Files and Communication with PURBs" (PoPETs 2019,
+[arXiv:1806.03160](https://arxiv.org/abs/1806.03160)). For files up to size M it leaks O(log log M)
+bits, as padding to a power of two does, but its overhead stays under 12% (the worst case is +11.63%,
+15 bytes on a 129-byte stream) and falls with size, where a power of two costs up to +100%. Measured on the stream:
+
+| Plaintext | Bucket width | Worst-case overhead |
+|---|---|---|
+| 1 KB | 32 B | 3.1% |
+| 200 KB | 4 KiB | 2.1% |
+| 1 MiB | 32 KiB | 3.1% |
+| 5 MB | 128 KiB | 2.6% |
+| 30 MB | 512 KiB | 1.7% |
+| 100 MB | 2 MiB | 2.1% |
+| 1 GiB | 32 MiB | 3.1% |
 
 Labels bind a blob to its job and role: `<job_id>/input/<index>` and `<job_id>/output/video`.
 The final-chunk flag makes truncation at a chunk boundary detectable. The gateway rejects
-uploads that do not start with `KUNOB1`.
+uploads that do not start with `KUNOB1` (both versions do). The shared vectors carry `blob`
+(version 1, byte-identical to its first publication) and `blob_v2`: valid cases, streams that
+authenticate but must be refused, a PADMÉ table, and sealed sizes at the default 1 MiB chunk.
 
 ## Attestation binding
 
@@ -132,6 +168,23 @@ what production has until the owner adds it) or disabled, every open-tier regist
 refused. When absent it is left out of the signed bytes, so manifests signed before the field
 existed still verify. An open-tier image digest is self-reported: the list states which releases
 the owner expects and lets it withdraw one, nothing more.
+
+`GoldenManifest.model_digests` is optional too: `{"<profile_id>@<hardware_class>" | "<profile_id>":
+"<64 hex>"}`, the weights identity each profile variant must load (`kuno_protocol.precision`). A
+quantized class (`O1.rtx-5090-32gb.x1.fp8-cast`, `O1.rtx-4090-24gb.x1.int8`) runs different weights
+from bf16, so it has its own key; an exact `profile@class` key wins over the bare profile id
+(`GoldenManifest.model_digest_for`). Workers put the value in step transcripts (`KUNO_MODEL_DIGEST`)
+and validators' executors pin transcripts to it. When empty it is left out of the signed bytes, like
+`open_tier`. The digest is
+
+```
+SHA-256("kuno/v1/weights\n" | canonical_json({"identity": {recipe, precision, transformer_subfolder, components},
+                                             "files": [{"path", "size", "sha256"}, ...sorted by path]}))
+```
+
+over every file the recipe reads (`kuno-devkit weights-digest --profile P --hardware-class C --models-dir D`).
+Readers older than this field ignore it and therefore fail to verify a manifest that sets it: upgrade
+gateways and validators before publishing one.
 
 ## Miner registration and hotkey proof
 
@@ -246,8 +299,8 @@ category is never sent. A worker whose configured classifiers cannot run reports
 
 Ed25519 by the enclave's attested signing key over `"kuno/v1/receipt\n" + canonical_json(body)`.
 The body holds only digests and metadata: job, enclave, profile, image digest, params digest,
-input digest, output ciphertext digest and size, `content_digest` (SHA-256 of the decrypted
-MP4), attestation digest, timings, GPU-seconds, video info and miner hotkey. Anyone holding a
+input digest, `output_digest` and `output_bytes` (SHA-256 and size of the sealed output blob exactly
+as uploaded, padding included), `content_digest` (SHA-256 of the decrypted MP4, never padded), attestation digest, timings, GPU-seconds, video info and miner hotkey. Anyone holding a
 video can look it up at `GET /v1/provenance/{sha256}`.
 
 ## Model switch

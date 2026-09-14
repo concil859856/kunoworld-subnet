@@ -27,6 +27,7 @@ from .collateral import CollateralGate
 from .open_tier import AdmissionTracker, TierPolicy, apply_tiers, fraud_penalties, open_tier_gpus
 from .ledger import DURATION_SLACK_S, EnclaveKey, LedgerAudit, audit_ledger, duration_bounds, enclave_keys
 from .scoring import MinerScore, compute_scores, hardware_conflicts, normalize
+from .usd_pay import UsdPay
 
 log = logging.getLogger("kuno.validator")
 
@@ -74,6 +75,7 @@ class Validator:
         collateral: CollateralGate | None = None,
         tier_policy: TierPolicy | None = None,
         calibration: Calibration | None = None,
+        pay: UsdPay | None = None,
     ):
         if not api_key:
             raise ValueError("a validator API key is required: the gateway authenticates every validator read")
@@ -106,6 +108,11 @@ class Validator:
         self.admission = AdmissionTracker(self.tier_policy.admission_probes)
         self.enclave_tiers: dict[str, str] = {}
         self._feed: dict[str, dict] = {}
+        # USD-denominated pay (usd_pay.py) when KUNO_PAY_MODE=usd; None keeps today's VCU scoring.
+        self.pay = pay
+        self._stored_rate_card: dict | None = None
+        # (now, window_s, switch) of the last score(), so USD pay prices exactly the round that was scored.
+        self._scored: tuple[float, float, SwitchConfig] | None = None
         self.state_path = state_path
         self._load_state()
         # Step audits of this validator's own canaries: open a random denoising step and replay it (VERIFIED_MODE.md).
@@ -513,8 +520,10 @@ class Validator:
             for hotkey, reasons in self.collateral.penalties(gpus, now, open_gpus).items():
                 penalties.setdefault(hotkey, []).extend(reasons)
         self._save_state()
+        switch = self.switch()
+        self._scored = (now, window_s, switch)
         return compute_scores(
-            audit.entries, attested, self.profiles, self.switch(), now, window_s,
+            audit.entries, attested, self.profiles, switch, now, window_s,
             penalties=penalties, flags=flags, tier_rates=self.tier_policy.rates(),
         )
 
@@ -536,6 +545,15 @@ class Validator:
                 miner.hotkey, miner.score, miner.succeeded, miner.failed, "; ".join(miner.reasons),
                 f" [flags: {'; '.join(miner.flags)}]" if miner.flags else "",
             )
+        if self.pay is not None and self.pay.policy.usd and self._scored is not None:
+            # USD-denominated pay: the same gates, with work priced by the owner-signed rate card. PayUnavailable
+            # propagates, so the caller leaves the previous weights in place.
+            now, window_s, switch = self._scored
+            entries = self.last_audit.entries if self.last_audit is not None else []
+            try:
+                return self.pay.weights(scores, entries, self.profiles, switch, now, window_s)
+            finally:
+                self._save_state()
         return normalize(scores)
 
     # ------------------------------------------------------------ state
@@ -565,6 +583,10 @@ class Validator:
             self.collateral.load(state["collateral"])
         self.admission.load(state.get("admission") or {})
         self.enclave_tiers = {k: v for k, v in (state.get("tiers") or {}).items() if isinstance(v, str)}
+        # Kept even when USD pay is off, so switching modes back and forth can't roll the accepted card back.
+        self._stored_rate_card = state.get("rate_card") if isinstance(state.get("rate_card"), dict) else None
+        if self.pay is not None:
+            self.pay.load(self._stored_rate_card)
 
     def _save_state(self) -> None:
         if self.state_path is None:
@@ -578,6 +600,7 @@ class Validator:
             "collateral": self.collateral.dump() if self.collateral is not None else None,
             "admission": self.admission.dump(),
             "tiers": self.enclave_tiers,
+            "rate_card": (self.pay.dump() if self.pay is not None else None) or self._stored_rate_card,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")

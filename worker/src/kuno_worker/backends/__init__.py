@@ -28,7 +28,15 @@ def build_backends(kind: str, config) -> dict[str, Backend]:
         h3 = H3SglangBackend(config.h3_fl2va_url, config.h3_ref2va_url, config.workdir)
         verified = {"hardware_class": config.verified_hardware_class, "model_digest": config.model_digest}
         h3.turbo = H3ResidentBackend(config.workdir, turbo_lora=config.h3_turbo_lora, **verified)
-        return {"minimax-h3": h3, "ltx-2.5": LtxResidentBackend(config.ltx_models_dir, config.workdir, **verified)}
+        ltx = LtxResidentBackend(
+            config.ltx_models_dir,
+            config.workdir,
+            offload=getattr(config, "ltx_offload", "auto"),
+            weights_verify=getattr(config, "weights_verify", "full"),
+            allow_unpinned_weights=getattr(config, "allow_unpinned_weights", False),
+            **verified,
+        )
+        return {"minimax-h3": h3, "ltx-2.5": ltx}
 
     if kind == "cold":
         from .h3 import H3SglangBackend

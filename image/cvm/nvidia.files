@@ -1,0 +1,10 @@
+# NVIDIA userspace copied from the extracted .run into the root filesystem (mkosi.build). @VERSION@ is
+# the pinned driver version. Compute and CC only: no X, GL or Vulkan. Unverified against the 595 .run
+# layout until the first real build.
+bin nvidia-smi
+bin nvidia-persistenced
+lib libnvidia-ml.so.@VERSION@
+lib libcuda.so.@VERSION@
+lib libnvidia-ptxjitcompiler.so.@VERSION@
+lib libnvidia-nvvm.so.@VERSION@
+lib libnvidia-cfg.so.@VERSION@

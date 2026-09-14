@@ -31,6 +31,7 @@ export KUNO_OPEN_TIER_PROBES=5                     # canaries a new open-tier ho
 export KUNO_TOLERANCE_CALIBRATION=/path/to/tolerance_calibration.json  # default: the file shipped with kuno-protocol
 export KUNO_COLLATERAL_MAX_STALE_S=8640            # how long a failed chain read may reuse the last reading
 export KUNO_CHAIN_ENDPOINT=wss://...               # optional; defaults to the --network's public endpoint
+export KUNO_PAY_MODE=vcu                           # or usd: see USD-denominated pay (needs KUNO_RATE_CARD and --netuid)
 kuno-validator run --interval 4320 --netuid <netuid> \
   --wallet-name <name> --wallet-hotkey <hotkey> --canary ltx-2.5-fast --standard-canary ltx-2.5-fast
 ```
@@ -92,7 +93,8 @@ vector it would submit.
    no penalty in the window. Penalties include [hardware dedupe](#hardware-dedupe) and
    [collateral](#collateral) as well as canaries, replays, step audits and the open-tier fraud
    rule. Open-tier work earns at `KUNO_OPEN_TIER_RATE` and only after admission ([Open tier](#open-tier)). Every zeroed hotkey is logged with
-   its reasons (`miner <hotkey>: score=0.0000 … <reasons>`).
+   its reasons (`miner <hotkey>: score=0.0000 … <reasons>`). With `KUNO_PAY_MODE=usd` the same
+   gated work is priced in US dollars instead ([USD-denominated pay](#usd-denominated-pay)).
 5. **Weights.** Set for registered hotkeys, renormalized over those actually on the subnet.
    Never to the owner hotkey and never to a burn UID: burned miner emission cuts the
    subnet's TAO emission share. When nothing qualifies, the previous weights stand.
@@ -274,6 +276,105 @@ about their hardware, image or memory is attested, so the validator weighs them 
 - **Hardware dedupe** doesn't apply: open-tier evidence carries no hardware identity. One
   machine posing as many open-tier miners is limited by collateral per GPU, admission per hotkey
   and the lower rate, not by identities.
+
+## USD-denominated pay
+
+`KUNO_PAY_MODE=usd` (`validator/src/kuno_validator/usd_pay.py`) pays serving miners for verified
+video-seconds at US-dollar rates the owner sets, instead of splitting the emission by VCU. The
+default, `vcu`, is the scoring described above.
+
+```bash
+export KUNO_PAY_MODE=usd
+export KUNO_RATE_CARD=/path/to/rate-card.signed.json   # owner-signed; required
+export KUNO_PAY_RESIDUAL=renormalize                   # the default, and the only accepted value
+export KUNO_PAY_PRICE_TOLERANCE=0.02                   # largest spread allowed between TAO/USD sources
+export KUNO_PAY_PRICE_MAX_AGE_S=900                    # a dated quote older than this doesn't count
+export KUNO_PAY_REPORT=/var/lib/kuno/pay.jsonl         # default: <state file stem>-pay.jsonl beside the state file
+kuno-validator run --netuid <netuid> ...               # --netuid is required: the pool is read from the chain
+```
+
+**What stays the same.** Every gate and penalty: attestation, reliability, canaries, replays, step
+audits, hardware dedupe, collateral, open-tier admission and the fraud rule. A miner zeroed in VCU
+mode earns nothing here either. Billable seconds and each job's tier come from the audited ledger
+exactly as scoring sees them. The Turbo track (mechanism 1) is untouched.
+
+**The formula**, for each miner that passed every gate, over the 24-hour scoring window:
+
+| Term | Definition |
+|---|---|
+| `usd_owed_i` | Σ billable seconds × `rate(profile, tier)` over the miner's credited jobs |
+| `owed_i` | `usd_owed_i × tempo_seconds / window_s`: the window's average per tempo, so a burst of demand is paid out over 24 h |
+| `pool_usd` | serving miners' alpha per tempo × TAO per alpha × USD per TAO |
+| `weight_i` | `owed_i / pool_usd`, then renormalized (below) |
+
+- **Serving miners' alpha per tempo** = `SubnetAlphaOutEmission × (Tempo + 1) × (1 − owner cut) × ½ ×`
+  mechanism 0's share of `MechanismEmissionSplit` (an even split when unset). The owner cut is
+  `SubnetOwnerCut / 65535` when `OwnerCutEnabled`.
+- **TAO per alpha** is the pool's spot price from `SwapRuntimeApi.current_alpha_price`, at the
+  finalized head. `SubnetMovingPrice` and `MinerBurned` are reported alongside but not used; the
+  moving price starts near zero on a new subnet. The storage items were checked against finney
+  metadata at spec_version 455, and the price call was answered by finney.
+- **USD per TAO** is the median of Kraken, Coinbase and CoinGecko (`price_feeds.py`). At least two
+  must answer with a fresh quote, and the quotes must agree within `KUNO_PAY_PRICE_TOLERANCE`.
+- **Rates.** The card's rate for a job's profile and tier replaces the profile's VCU weight,
+  `KUNO_OPEN_TIER_RATE` and the switch's `emission_split`. A family the switch turns off still earns
+  nothing. Work on a profile or tier the card doesn't price earns nothing and is logged.
+
+**Oversubscribed and undersubscribed.**
+- **Σ weights > 1 (oversubscribed):** weights are renormalized down, so every miner gets the same
+  fraction of what it is owed.
+- **Σ weights < 1 (undersubscribed):** `KUNO_PAY_RESIDUAL` decides what happens to the rest.
+  - `renormalize` (default): weights are scaled up to sum to 1. Miners receive the whole pool,
+    more than the card says they're owed, and nothing is burned.
+  - `recycle` is **documented, not implemented**, and the validator refuses to start with it. It
+    would send the residual to the owner uid, where the chain withholds it from miners. Since June
+    2026 the withheld share of a tempo's miner incentive (`MinerBurned`) multiplies the subnet's TAO
+    emission share by `1 − MinerBurned` before the emission gate, and recycling instead of burning
+    doesn't avoid it (research_bittensor.md §1.4, §3.2). A subnet whose miners are owed 30% of the
+    pool would keep 30% of its TAO share, less still if that drops it under the gate. Revisit only
+    if the chain rule changes.
+
+Bittensor normalizes weights, so under `renormalize` the dollar amounts decide only each miner's
+relative share: `usd_owed_i / Σ usd_owed`. The pool's value decides the regime and the KPIs below.
+
+**Failing closed.** Nothing is submitted, and the previous weights stay on chain, when:
+- no rate card has been accepted (none set, missing, unreadable, or not signed by `KUNO_OWNER_PUBLIC_KEY`);
+- the chain can't be read, or the serving pool is worth nothing;
+- fewer than two fresh TAO/USD sources answer, or they disagree beyond the tolerance.
+
+The log says why (`USD pay is unavailable this round (…)`). Under `renormalize` the price doesn't
+change the weights, but a round that can't be priced still isn't submitted: its report would be
+wrong.
+
+**The rate card** is `{"card": RateCard, "signature"}`, signed by the owner over
+`"kuno/v1/rate-card\n" + canonical_json(card)` (`kuno_protocol/rate_card.py`). It gives USD per
+verified video-second per profile and tier (`confidential`, `open`). It is accepted like the switch:
+the signature must verify, and `issued_at` never goes backwards. A different card with the same
+`issued_at` is ignored. The accepted card is kept in the state file, so a restart can't roll it back.
+A card file that later goes missing or turns bad keeps the accepted card in use (logged). The owner
+distributes the signed file to validators, as with the signed manifest.
+
+```bash
+python -m kuno_protocol.rate_card template --out rate-card.json     # every rate a placeholder
+# set real rates and "placeholder": false, then, offline:
+python -m kuno_protocol.rate_card sign --key owner.key --card rate-card.json --out rate-card.signed.json
+```
+
+**Every rate is a placeholder today.** The owner has not set miner prices. The template derives each
+rate from `PLACEHOLDER_USD_PER_VCU_SECOND` ($0.01 per VCU-weighted second, the open tier at half) and
+marks the card `"placeholder": true`, which is also the default for any card that doesn't say
+otherwise. A placeholder card is logged at error level every round and flagged in the report.
+
+**Reporting.** Each priced round is logged and appended as one JSON line to the pay report:
+
+| Field | Meaning |
+|---|---|
+| `regime`, `subscription` | `undersubscribed`, `oversubscribed`, `balanced` or `no_work`; `subscription` is `Σ owed_i / pool_usd` before renormalizing |
+| `subsidy_ratio` | emission value ÷ miner USD owed, per tempo (`pool_usd_per_tempo / owed_usd_per_tempo`). Above 1, emissions pay miners more than their work is worth at card rates. It should fall as demand grows. |
+| `emission_to_revenue` | value of everything the subnet mints over the window (owner, validators and miners, both mechanisms) ÷ customer revenue over the window |
+| `revenue_usd_window` | list price of the window's succeeded jobs (replays excluded), from each job's public params and the profile's pricing, or the ledger's `price_usd` if the gateway publishes one. Validators can't see discounts, credits or refunds, and canaries count as revenue. |
+| `miners` | per hotkey: USD owed over the window and per tempo, priced seconds, raw and final weight |
+| also | prices and their sources, `miner_burned`, `moving_tao_per_alpha`, `unpriced` seconds, `rate_card_issued_at`, `rate_card_placeholder` |
 
 ## Model switch rules
 

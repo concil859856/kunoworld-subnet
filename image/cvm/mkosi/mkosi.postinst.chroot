@@ -1,0 +1,15 @@
+#!/bin/sh
+# Runs inside the image after packages and extra trees are installed.
+set -eu
+
+systemctl enable kuno-app.service
+# Nothing may extend RTMRs besides kuno-app, and nothing may offer a login.
+systemctl mask \
+  systemd-pcrphase.service systemd-pcrphase-initrd.service systemd-pcrphase-sysinit.service \
+  systemd-pcrmachine.service systemd-pcrfs-root.service systemd-pcrfs@.service systemd-pcrextend@.service \
+  getty@.service serial-getty@.service console-getty.service \
+  apt-daily.timer apt-daily-upgrade.timer
+chmod 0755 /usr/lib/kuno/kuno-app
+# The machine id is generated per boot in /run; an empty file keeps the tree identical across builds.
+: > /etc/machine-id
+depmod -a "$(ls /usr/lib/modules)"

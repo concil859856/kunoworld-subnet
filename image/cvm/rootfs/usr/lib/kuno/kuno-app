@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# KunoWorld CVM application agent. Runs once per boot before anything reads customer data:
+#
+#   1. RTMR3 <- the worker image digest, then each weights image's dm-verity root hash in ascending
+#      order (image/cvm/expected_rtmr3.py computes the same value off-host). RTMR3 must be all zeros
+#      when it starts, and must equal the replayed value when it is done, or the agent stops.
+#   2. Opens each weights image with that root hash and mounts it read-only under /models/<name>.
+#   3. Loads the worker image from the measured root filesystem, checks it is the measured digest,
+#      and runs it with host-provided settings reduced to an allowlist.
+#
+# Host inputs (QEMU fw_cfg, unmeasured and untrusted except through what RTMR3 records):
+#   opt/kuno/weights       lines "<name> <sha256 root hash> <data bytes>"; disk serial kuno-w-<name>
+#   opt/kuno/env           lines KEY=VALUE, only the keys in ALLOWED_ENV
+#   opt/kuno/hotkey.seed   the miner's hotkey seed (the miner is the host; it is their own secret)
+#
+# NOT RUN ON TDX HARDWARE. Needs Linux >= 6.16 (writable rtmr3:sha384 in sysfs), CONFIG_FW_CFG_SYSFS,
+# podman with the NVIDIA CDI spec, and GPUs in confidential-computing mode.
+set -euo pipefail
+
+readonly RTMR3=/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384
+readonly FWCFG=/sys/firmware/qemu_fw_cfg/by_name/opt/kuno
+readonly IMAGE_TAR=/usr/share/kuno/worker.oci.tar
+readonly STATE=/run/kuno
+readonly ZEROS=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+readonly ALLOWED_ENV=" KUNO_GATEWAY_URL KUNO_PROFILES KUNO_CAPACITY KUNO_MINER_HOTKEY KUNO_VERIFIED_HARDWARE_CLASS KUNO_MODEL_DIGEST KUNO_H3_FL2VA_URL KUNO_H3_REF2VA_URL KUNO_H3_TURBO_LORA KUNO_REATTEST_S KUNO_RETRY_MAX_S KUNO_PROVENANCE KUNO_GPU_EVIDENCE KUNO_SAFETY_REQUIRE_CLASSIFIER "
+
+log() { printf 'kuno-app: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+hex_to_bin() { tr 'a-f' 'A-F' | basenc --base16 -d; }
+fwcfg() { local file="$FWCFG/$1/raw"; if [ -r "$file" ]; then cat "$file"; fi; }
+
+# SHA-384(tag "\n" value): the events of expected_rtmr3.py.
+event_digest() { printf '%s\n%s' "$1" "$2" | sha384sum | cut -d' ' -f1; }
+replay() { printf '%s%s' "$1" "$2" | hex_to_bin | sha384sum | cut -d' ' -f1; }
+read_rtmr3() { od -An -v -tx1 "$RTMR3" | tr -d ' \n'; }
+# One write of exactly 48 bytes extends the register (Documentation/ABI/testing/sysfs-devices-virtual-misc-tdx_guest).
+extend_rtmr3() { printf '%s' "$1" | hex_to_bin | dd of="$RTMR3" bs=48 count=1 iflag=fullblock status=none; }
+
+# `kuno-app --expected-rtmr3 <image digest> [root hash...]` prints the value these events replay to, with
+# the same functions and without touching the register: an in-guest cross-check of expected_rtmr3.py.
+if [ "${1:-}" = "--expected-rtmr3" ]; then
+  shift
+  value="$(replay "$ZEROS" "$(event_digest kuno/v1/rtmr3/image "${1:?image digest}")")"
+  shift
+  while read -r root; do
+    [ -n "$root" ] && value="$(replay "$value" "$(event_digest kuno/v1/rtmr3/weights "$root")")"
+  done < <(printf '%s\n' "$@" | sort)
+  printf '%s\n' "$value"
+  exit 0
+fi
+
+mkdir -p "$STATE" && chmod 0700 "$STATE"
+[ -w "$RTMR3" ] || die "$RTMR3 is not writable: this needs a TDX guest on Linux >= 6.16"
+[ -r "$IMAGE_TAR" ] || die "$IMAGE_TAR is missing from the root filesystem"
+
+# ---- the worker image digest, from the archive the root filesystem carries
+index="$(tar -xOf "$IMAGE_TAR" index.json)"
+image_digest="$(jq -r '.manifests | if length == 1 then .[0].digest else error("one manifest expected") end' <<<"$index")"
+[[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "the image archive has no single sha256 manifest"
+manifest="$(tar -xOf "$IMAGE_TAR" "blobs/sha256/${image_digest#sha256:}")"
+[ "$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)" = "${image_digest#sha256:}" ] || die "manifest blob does not hash to its digest"
+config_digest="$(jq -r '.config.digest' <<<"$manifest")"
+[[ "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "the image manifest has no config digest"
+
+# ---- weights images named by the host
+declare -a names=() roots=() sizes=()
+while read -r name root size; do
+  [ -n "${name:-}" ] || continue
+  [[ "$name" =~ ^[a-z0-9][a-z0-9.-]{0,12}$ ]] || die "weights name $name must be 1-13 of [a-z0-9.-] (virtio serials are 20 bytes)"
+  [[ "$root" =~ ^[0-9a-f]{64}$ ]] || die "weights root hash for $name must be 64 lowercase hex"
+  [[ "$size" =~ ^[0-9]+$ ]] || die "weights data size for $name must be a number"
+  names+=("$name"); roots+=("$root"); sizes+=("$size")
+done < <(fwcfg weights)
+mapfile -t sorted_roots < <(printf '%s\n' "${roots[@]}" | sed '/^$/d' | sort)
+if [ "${#sorted_roots[@]}" -ne "$(printf '%s\n' "${sorted_roots[@]}" | sed '/^$/d' | sort -u | wc -l)" ]; then
+  die "the same weights image is listed twice"
+fi
+
+# ---- RTMR3, once per boot
+if [ -f "$STATE/rtmr3.expected" ]; then
+  [ "$(read_rtmr3)" = "$(cat "$STATE/rtmr3.expected")" ] || die "RTMR3 changed since this boot measured it"
+  log "RTMR3 already measured this boot"
+else
+  [ "$(read_rtmr3)" = "$ZEROS" ] || die "RTMR3 was extended before the agent ran"
+  expected="$ZEROS"
+  : > "$STATE/rtmr3-events.log"
+  record() {
+    local tag="$1" value="$2" digest
+    digest="$(event_digest "$tag" "$value")"
+    extend_rtmr3 "$digest"
+    expected="$(replay "$expected" "$digest")"
+    printf '{"event":"%s","value":"%s","digest":"%s"}\n' "$tag" "$value" "$digest" >> "$STATE/rtmr3-events.log"
+  }
+  record "kuno/v1/rtmr3/image" "$image_digest"
+  for root in "${sorted_roots[@]}"; do
+    [ -n "$root" ] && record "kuno/v1/rtmr3/weights" "$root"
+  done
+  [ "$(read_rtmr3)" = "$expected" ] || die "RTMR3 does not equal the replayed events"
+  printf '%s\n' "$expected" > "$STATE/rtmr3.expected"
+  log "RTMR3 = $expected"
+fi
+
+# ---- weights: open with the measured root hashes, mount read-only
+for i in "${!names[@]}"; do
+  name="${names[$i]}"; device="/dev/disk/by-id/virtio-kuno-w-$name"; mapped="kuno-w-$name"
+  for _ in $(seq 1 100); do [ -b "$device" ] && break; sleep 0.1; done
+  [ -b "$device" ] || die "weights disk $device did not appear"
+  if [ ! -b "/dev/mapper/$mapped" ]; then
+    veritysetup open "$device" "$mapped" "$device" "${roots[$i]}" --hash-offset="${sizes[$i]}" \
+      || die "dm-verity refused weights image $name"
+  fi
+  mkdir -p "/models/$name"
+  mountpoint -q "/models/$name" || mount -o ro,nodev,nosuid "/dev/mapper/$mapped" "/models/$name"
+done
+
+# ---- GPUs: CDI spec for podman, then mark CC GPUs ready for workloads
+nvidia-ctk cdi generate --output=/run/cdi/nvidia.yaml >/dev/null
+nvidia-smi conf-compute -srs 1 >/dev/null || die "could not set the GPUs' confidential-computing ready state"
+
+# ---- the worker
+podman load --quiet --input "$IMAGE_TAR" >/dev/null
+[ "$(podman image inspect --format '{{.Id}}' "${config_digest#sha256:}")" = "${config_digest#sha256:}" ] \
+  || die "the loaded image is not the measured one"
+
+install -d -m 0700 "$STATE/secrets"
+env_file="$STATE/worker.env"
+{
+  printf 'KUNO_TEE=tdx\nKUNO_BACKEND=real\nKUNO_IMAGE_DIGEST=%s\nKUNO_WORKDIR=/var/lib/kuno/work\n' "$image_digest"
+  if [ -d /models/ltx-2.5 ]; then
+    # dm-verity already refuses any block that differs from the root hash RTMR3 records.
+    printf 'KUNO_LTX_MODELS_DIR=/models/ltx-2.5\nKUNO_WEIGHTS_VERIFY=size\n'
+  fi
+  while IFS='=' read -r key value; do
+    [ -n "${key:-}" ] || continue
+    case "$ALLOWED_ENV" in *" $key "*) printf '%s=%s\n' "$key" "$value" ;; *) log "ignoring host setting $key" ;; esac
+  done < <(fwcfg env)
+} > "$env_file"
+chmod 0600 "$env_file"
+if seed="$(fwcfg hotkey.seed)" && [ -n "$seed" ]; then
+  printf '%s' "$seed" > "$STATE/secrets/hotkey.seed" && chmod 0400 "$STATE/secrets/hotkey.seed"
+  printf 'KUNO_HOTKEY_SEED_FILE=/run/secrets/hotkey.seed\n' >> "$env_file"
+fi
+
+# uid 0 inside the container only so it can create configfs-tsm report entries; no capabilities.
+exec podman run --rm --name kuno-worker --network host --read-only --user 0:0 \
+  --cap-drop all --security-opt no-new-privileges \
+  --tmpfs /var/lib/kuno:rw,mode=0700 --tmpfs /tmp:rw,mode=1777 \
+  --device nvidia.com/gpu=all \
+  --volume /sys/kernel/config:/sys/kernel/config:rw \
+  --volume /models:/models:ro \
+  --volume "$STATE/secrets:/run/secrets:ro" \
+  --env-file "$env_file" \
+  "${config_digest#sha256:}"

@@ -1,0 +1,68 @@
+#!/bin/sh
+# KunoWorld CVM initrd: open the dm-verity root filesystem named by the measured kernel command
+# line and switch to it. Everything this trusts comes from the command line, which OVMF measured
+# into RTMR2 before the kernel ran: kuno.rootfs_hash (sha256 root hash), kuno.rootfs_size (data
+# bytes, the hash tree's offset) and kuno.rootfs_dev (the disk). A root filesystem that does not
+# match fails veritysetup or any later read, and init exits, which panics the kernel (panic=1).
+# After dstack's initramfs init (Apache-2.0).
+set -eu
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+log() {
+  printf '[kuno-init] %s\n' "$*" >&2
+}
+
+fail() {
+  log "$*"
+  exit 1
+}
+
+mkdir -p /proc /sys /run /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mount -t devtmpfs devtmpfs /dev
+
+ROOT_HASH=""
+ROOT_SIZE=""
+ROOT_DEV="/dev/vda"
+read -r CMDLINE < /proc/cmdline
+for arg in $CMDLINE; do
+  case "$arg" in
+    kuno.rootfs_hash=*) ROOT_HASH="${arg#kuno.rootfs_hash=}" ;;
+    kuno.rootfs_size=*) ROOT_SIZE="${arg#kuno.rootfs_size=}" ;;
+    kuno.rootfs_dev=*) ROOT_DEV="${arg#kuno.rootfs_dev=}" ;;
+  esac
+done
+
+case "$ROOT_HASH" in
+  *[!0-9a-f]*|"") fail "kuno.rootfs_hash is missing or not lowercase hex" ;;
+esac
+[ "${#ROOT_HASH}" -eq 64 ] || fail "kuno.rootfs_hash must be 64 hex characters"
+case "$ROOT_SIZE" in
+  *[!0-9]*|"") fail "kuno.rootfs_size is missing or not a number" ;;
+esac
+case "$ROOT_DEV" in
+  /dev/vd[a-z]|/dev/sd[a-z]|/dev/nvme[0-9]n[0-9]) ;;
+  *) fail "kuno.rootfs_dev $ROOT_DEV is not a whole disk" ;;
+esac
+
+tries=0
+while [ ! -b "$ROOT_DEV" ]; do
+  tries=$((tries + 1))
+  [ "$tries" -le 50 ] || fail "$ROOT_DEV did not appear"
+  sleep 0.1
+done
+
+log "opening $ROOT_DEV with dm-verity"
+veritysetup open "$ROOT_DEV" rootfs "$ROOT_DEV" "$ROOT_HASH" --hash-offset="$ROOT_SIZE" \
+  || fail "dm-verity refused the root filesystem"
+
+mkdir -p /root
+mount -t squashfs -o ro /dev/mapper/rootfs /root || fail "cannot mount the root filesystem"
+
+for dir in dev proc sys run; do
+  mount --move "/$dir" "/root/$dir"
+done
+exec switch_root /root /sbin/init

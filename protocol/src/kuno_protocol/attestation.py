@@ -151,15 +151,28 @@ class GoldenManifest(BaseModel):
     max_evidence_age_s: int = 3600
     # Open-tier (no TEE) registrations; None refuses them all.
     open_tier: OpenTierPolicy | None = None
+    # Weights identity per profile variant: "<profile_id>@<hardware_class>" (or a bare profile id for every
+    # class) -> kuno_protocol.precision.weights_digest. Workers put it in step transcripts (KUNO_MODEL_DIGEST)
+    # and validators' executors pin transcripts to it. A quantized class runs different weights, so it has its own key.
+    model_digests: dict[str, str] = Field(default_factory=dict)
 
     def trusts_mock(self) -> bool:
         return bool(self.mock_quote_keys) or any(a.platform == "mock" for a in self.allowed)
 
+    def model_digest_for(self, profile_id: str, hardware_class: str | None = None) -> str | None:
+        """The pinned weights digest for a profile variant; an exact "<profile>@<class>" key wins over the profile's."""
+        if hardware_class is not None and f"{profile_id}@{hardware_class}" in self.model_digests:
+            return self.model_digests[f"{profile_id}@{hardware_class}"]
+        return self.model_digests.get(profile_id)
+
     def signed_fields(self) -> dict:
-        """What the owner signs. `open_tier` is left out when unset, so manifests signed before it existed still verify."""
+        """What the owner signs. `open_tier` and `model_digests` are left out when unset, so manifests signed
+        before they existed still verify."""
         fields = self.model_dump(mode="json")
         if fields.get("open_tier") is None:
             fields.pop("open_tier", None)
+        if not fields.get("model_digests"):
+            fields.pop("model_digests", None)
         return fields
 
 

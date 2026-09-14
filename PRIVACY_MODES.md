@@ -8,7 +8,8 @@ KunoWorld has two privacy modes. You choose one for each video.
 prompt, your inputs and the finished video. Your device seals the request to a key that exists
 only inside that enclave. The enclave seals the video to a key that only you hold. KunoWorld
 stores the encrypted video on Cloudflare R2 until you delete it, but it cannot decrypt it. **If
-you lose the key, the video is gone.** Nobody, including KunoWorld, can recover it.
+you lose the key, the video is gone.** Nobody, including KunoWorld, can recover it. [Key sync](#key-sync)
+can keep your keys for your other devices, encrypted so that KunoWorld still can't open them.
 
 **Standard: you, KunoWorld and the GPU provider.** KunoWorld and the GPU provider that renders
 the video can technically read your prompt, inputs and video. KunoWorld seals the job to the
@@ -20,7 +21,9 @@ honestly. They never receive the video.
 
 **In both modes:**
 
-- **Only you can open your videos.** A video is served only to the account that made it.
+- **Only you can open your videos, unless you create a share link for one.** A video is served only
+  to the account that made it, and to whoever holds a link its owner made for that one video. See
+  [Share links](#share-links).
 - **Nobody at KunoWorld opens your prompt, inputs or video, with two exceptions:** a report
   of illegal content (child sexual abuse material), or a legal preservation hold. Every such
   view is logged. For a Private video, a report can only lead to a view if the person reporting
@@ -36,6 +39,72 @@ honestly. They never receive the video.
 This page describes how the system is built. It is not a contract. The legal entity that
 operates KunoWorld and its jurisdiction are not yet named; the terms of service and privacy
 policy will govern, and prices on the site are placeholders.
+
+## Key sync
+
+A Private video opens only with its output key, and that key lives on your devices. Key sync lets your other devices
+have it too, without KunoWorld ever being able to open it. It is optional and stays off until you set it up (the studio
+offers it after your first Private video).
+
+**How it works.**
+
+- Your browser makes an **account master key**: 32 random bytes that never leave your devices unencrypted.
+- Each Private video's **key record** is encrypted in your browser with AES-256-GCM under the master key. The record
+  holds the video's output key, the enclave's signing public key, the content digest, and the take's display details
+  (the first 500 characters of the prompt, and its settings). The encryption's associated data names your account and
+  the video, so a record can't be moved to another account or video.
+- The master key is itself encrypted ("wrapped") with AES-256-GCM by one or more **unlockers**:
+  - a **recovery code**, shown once when you set up key sync: 32 Crockford base32 characters (160 random bits) in
+    groups of four. It is stretched with PBKDF2-HMAC-SHA256 at 600,000 iterations with a random 16-byte salt, the
+    current figure for PBKDF2-HMAC-SHA256 in the
+    [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
+    The code already carries 160 bits of entropy, so the stretching is a second line of defence, not the first.
+  - a **passkey**, where the browser and passkey provider support the WebAuthn PRF extension
+    ([W3C Web Authentication Level 3](https://www.w3.org/TR/webauthn-3/); see
+    [MDN](https://developer.mozilla.org/en-US/docs/Web/API/Web_Authentication_API/WebAuthn_extensions)). The passkey
+    evaluates a random 32-byte salt, and its 32-byte output goes through HKDF-SHA256 before it is used as a key, as
+    [Yubico's PRF guide](https://developers.yubico.com/WebAuthn/Concepts/PRF_Extension/Developers_Guide_to_PRF.html)
+    recommends. It doesn't sign you in; it only unlocks your keys, on the site where it was made. Support varies by
+    browser and provider; for example, iPhone and iPad browsers can't use PRF with an external security key.
+- On a new device you sign in with your email and unlock with the recovery code or a passkey; your library then shows
+  your Private videos with working keys. Keys a browser already had (made there, restored from a backup file, or from
+  before key sync) are encrypted and uploaded once that browser is unlocked. An unlocked browser remembers the master
+  key, next to the video keys it already keeps, until you lock it.
+
+**What KunoWorld stores, and can't open.** Each unlocker's wrapped master key and its public parameters (salt and
+iteration count; for a passkey, its credential id, PRF salt and site), unlocker labels, and the encrypted key records.
+It can see which of your videos have a synced key, how many, and when they changed. The gateway accepts wrapped values
+only in their fixed format (`KVM1` or `KVJ1`, a 12-byte IV, the ciphertext and its tag) and refuses unknown fields, so
+a bare key can't be stored by mistake. Nobody at KunoWorld opens the vault, because it holds nothing anyone could open.
+
+**What still loses a video.** Losing every unlocked browser, your recovery code and every passkey. Nobody can recover
+the key after that, KunoWorld included. Backing keys up to a file still works, with or without key sync.
+
+**Deleting, rotating, turning off.** Deleting a video deletes its synced key. Rotating makes a new master key and a new
+recovery code, re-encrypts every synced key in your browser and replaces them all at once; old codes and passkeys stop
+working. Turning key sync off deletes everything it stored; keys already in a browser stay there. Each of these leaves a
+deletion tombstone, so restoring a database backup can't bring the old data back. Key sync works only through the
+website's email sign-in; API keys can't reach it.
+
+## Share links
+
+**Only you can open your videos, unless you create a share link for one.** A link is for one video and is off until
+you make it, in the studio or with the SDKs. It can expire, and you can revoke it at any time on your account page.
+
+- **Anyone who has the link can watch that video.** Treat a link like the video itself.
+- **Standard video:** KunoWorld serves the video to whoever opens the link.
+- **Private video:** the link carries the video's key after `#`: `https://kunoworld.com/s/<token>#k=<key>`. Browsers
+  never send that part to any server, so KunoWorld still never has the key. The share page downloads the encrypted
+  video, checks it against the enclave-signed receipt, and decrypts it in the viewer's browser. Anyone holding the
+  whole link can open it.
+- **The token** is 32 random bytes. KunoWorld stores only its SHA-256 hash, so a link is shown once, when it is made.
+- **A link stops working** when you revoke it, when it expires, when the video is deleted, removed after a review or
+  placed under a legal preservation hold, or when the account is closed. Viewers see the same message whatever the
+  reason, so a link can't reveal a hold.
+- **Viewers.** KunoWorld counts views and keeps nothing about who watched. Public share routes are rate-limited per IP
+  address using a keyed hash of it, which isn't stored with the link. Share pages are marked `noindex` and aren't cached.
+- A restricted account can't make links. Anyone who sees a shared video can report it. Share links don't change when
+  anyone at KunoWorld may open content.
 
 ## How the ban is enforced without looking
 

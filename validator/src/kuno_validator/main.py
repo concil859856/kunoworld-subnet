@@ -13,6 +13,7 @@ from kuno_protocol.policy import policy_from_env
 
 from .collateral import CollateralGate
 from .open_tier import TierPolicy
+from .usd_pay import PayUnavailable, UsdPay
 from .validator import Validator
 
 log = logging.getLogger("kuno.validator")
@@ -68,6 +69,13 @@ def main() -> None:
     from kuno_protocol.tolerance import load_calibration
 
     calibration = load_calibration(env.get("KUNO_TOLERANCE_CALIBRATION") or None)
+    # KUNO_PAY_MODE=usd prices verified work with the owner-signed rate card (usd_pay.py); the default is VCU scoring.
+    try:
+        pay = UsdPay.from_env(env, args.netuid, args.network, b64d(owner) if owner else None, state_path)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if pay is not None and args.netuid is None:
+        parser.error("KUNO_PAY_MODE=usd prices work against the subnet's emission, which is read from the chain: pass --netuid")
     validator = Validator(
         env.get("KUNO_GATEWAY_URL", "http://127.0.0.1:8080"),
         env["KUNO_VALIDATOR_API_KEY"],
@@ -78,6 +86,7 @@ def main() -> None:
         collateral=collateral,
         tier_policy=TierPolicy.from_env(env),
         calibration=calibration,
+        pay=pay,
     )
 
     turbo = None
@@ -103,10 +112,11 @@ def main() -> None:
         threading.Thread(target=_turbo_loop, args=(turbo, latest, args, stop), daemon=True).start()
 
     while True:
-        weights = validator.step(args.canary, args.standard_canary)
-        latest["serving"] = weights
-        print(json.dumps(weights, indent=2))
-        if args.netuid is not None:
+        weights = serving_round(validator, args.canary, args.standard_canary)
+        if weights is not None:
+            latest["serving"] = weights
+            print(json.dumps(weights, indent=2))
+        if weights is not None and args.netuid is not None:
             from .chain import set_weights
 
             outcome = set_weights(
@@ -119,6 +129,15 @@ def main() -> None:
             break
         time.sleep(args.interval)
     stop.set()
+
+
+def serving_round(validator: Validator, canaries: list[str], standard_canaries: list[str]) -> dict[str, float] | None:
+    """One serving round's weights, or None when USD pay can't price the round: the previous weights then stay on chain."""
+    try:
+        return validator.step(canaries, standard_canaries)
+    except PayUnavailable as exc:
+        log.error("USD pay is unavailable this round (%s); leaving the previous serving weights in place", exc)
+        return None
 
 
 def _turbo_round(turbo, latest: dict, args) -> None:

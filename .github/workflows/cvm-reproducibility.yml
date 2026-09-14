@@ -1,0 +1,111 @@
+# Rebuilds the KunoWorld CVM image on two runners, with different build paths and job counts, and
+# requires bit-for-bit identical artifacts and MRTD/RTMR0-3 measurements (image/CVM.md).
+#
+# Manual only (workflow_dispatch): it never runs on push or pull requests, and it never touches real
+# keys. The workflow references no secrets, has read-only repository permissions, and the only key
+# it signs with is a throwaway one it generates to prove the manifest round-trips through
+# `kuno-devkit sign-manifest` and the production manifest policy. The owner signs the real manifest
+# offline. protocol/tests/test_cvm_image.py checks these properties of this file.
+name: cvm-reproducibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      shapes:
+        description: "comma-separated shape ids from image/cvm/shapes.json"
+        required: true
+        default: "c2.h200-141gb.x1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cvm-reproducibility
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.builder }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - builder: a
+            jobs: 2
+          - builder: b
+            jobs: 4
+    env:
+      KUNO_PACK_JOBS: ${{ matrix.jobs }}
+      KUNO_CVM_SHAPES: ${{ inputs.shapes }}
+    steps:
+      - name: Refuse owner key material in the environment
+        run: |
+          if env | grep -E '^KUNO_OWNER_(KEY|PRIVATE)' >/dev/null; then
+            echo "owner key material is present in the environment; this job must never see it" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: src-${{ matrix.builder }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned build tools (mkosi, dstack-mr)
+        working-directory: src-${{ matrix.builder }}
+        run: sudo --preserve-env=PATH image/cvm/fetch-inputs.sh tools "$RUNNER_TEMP/tools"
+      - name: Build the worker image, the CVM image and its measurements
+        working-directory: src-${{ matrix.builder }}
+        run: |
+          sudo --preserve-env=PATH,KUNO_PACK_JOBS,KUNO_CVM_SHAPES \
+            env KUNO_CVM_TOOLS="$RUNNER_TEMP/tools" KUNO_CVM_ALLOW_UNPINNED=1 \
+            image/cvm/build.sh --out "$RUNNER_TEMP/out-${{ matrix.builder }}"
+      - name: Collect what must be identical
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/out-${{ matrix.builder }}"
+          cp sha256sum.txt metadata.json "$RUNNER_TEMP/release/"
+          cp -r measurements "$RUNNER_TEMP/release/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cvm-${{ matrix.builder }}
+          path: ${{ runner.temp }}/release
+
+  compare:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: cvm-a
+          path: a
+      - uses: actions/download-artifact@v4
+        with:
+          name: cvm-b
+          path: b
+      - name: Require bit-for-bit identical artifacts and measurements
+        run: |
+          # sha256sum.txt covers every boot artifact; the measurement files carry the registers and logs.
+          diff -r a b
+          echo "identical: $(wc -l < a/sha256sum.txt) artifacts, $(ls a/measurements | wc -l) shape(s)"
+      - name: Round-trip a manifest with a throwaway key (never the owner's)
+        run: |
+          uv venv
+          uv pip install -e protocol
+          throwaway="$RUNNER_TEMP/throwaway"
+          uv run kuno-devkit init --data "$throwaway" > /dev/null
+          args=()
+          for m in a/measurements/*.json; do args+=(--measurements "$m"); done
+          uv run python image/cvm/publish.py entry --shapes image/cvm/shapes.json "${args[@]}" --dev --out manifest.json
+          uv run kuno-devkit sign-manifest --key "$throwaway/owner.key" --manifest manifest.json --out manifest.signed.json
+          public_key="$(grep '^KUNO_OWNER_PUBLIC_KEY=' "$throwaway/dev.env" | cut -d= -f2)"
+          uv run python image/cvm/publish.py verify --manifest manifest.signed.json --owner-public-key "$public_key" "${args[@]}"
+          rm -rf "$throwaway"

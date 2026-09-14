@@ -103,6 +103,7 @@ def test_manifests_signed_before_open_tier_existed_still_verify():
     manifest = GoldenManifest(issued_at=1_700_000_000)
     legacy_body = manifest.model_dump(mode="json")
     legacy_body.pop("open_tier")
+    legacy_body.pop("model_digests")  # also newer than these manifests, and likewise left out when unset
     legacy_message = b"kuno/v1/manifest\n" + canonical_json(legacy_body)
     assert manifest_message(manifest) == legacy_message
     signed = {"manifest": legacy_body, "signature": b64e(owner.sign(legacy_message))}

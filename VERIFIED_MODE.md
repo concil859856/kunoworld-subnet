@@ -84,6 +84,21 @@ after the confidential ones: `ltx-2.5-fast` adds `O1.rtx-4090-24gb.x1.int8`,
 `O1.rtx-5090-32gb.x1.fp8-cast`, `O1.rtx-pro-6000-bw-96gb.x1` and `O1.h100-80gb.x1`; `ltx-2.5-pro`
 adds the last two. `ltx-2.5-4k` (141 GB) and the H3 profiles (4 × 80 GB) have none.
 
+**Precision variants.** A class's `precision` selects the weights recipe the worker loads
+(`kuno_protocol/precision_recipes.json`, applied by `worker/backends/quantized.py`): `bf16`, `fp8-cast`
+(transformer stored float8_e4m3fn and upcast per layer) or `int8-wo` (torchao int8 weight-only for the
+transformer and text encoder). A precision variant is the pair `<profile>@<class>`, and each has its own:
+
+- weights digest, `GoldenManifest.model_digests["<profile>@<class>"]` (the method is part of the digest,
+  so fp8-cast of the bf16 files is not the bf16 identity);
+- golden set, computed with `kuno_validator.golden --profile P --hardware-class C`;
+- tolerance calibration entries, keyed by (profile, miner class, executor class).
+
+The latents a quantized pipeline carries stay bfloat16, so commitments, openings and the step hooks are
+unchanged. A replay of an fp8 or int8 step is compared within that variant's calibration, never against
+bf16. The worker refuses weights that do not hash to the digest, a GPU that is not the class's SKU,
+and requests larger than the class's memory plan (`CapacityRefused`).
+
 Every profile also lists `dev-cpu` (`dev: true`): the mock backend's toy denoiser for dev networks.
 Production validators (`AuditPolicy(production=True)`) treat a commitment on a simulated class as
 a failure, exactly as production attestation refuses the simulated TEE.
@@ -364,6 +379,9 @@ constant one; `step_thresholds` is the first step in that direction.
    same class. Every step must match. This validates the hooks: packed-latent capture, audio
    capture, sigma handling, and the duplicate-sigma replay trick.
 3. Publish the golden set and the weights digest (`model_digest`) in the owner-signed manifest.
+   For a quantized class, first run `worker/scripts/benchmark_ltx_quantized.py` on the card: it records
+   load time, speed, peak memory against the recipe's estimate, and whether outputs repeat; then compute
+   `kuno-devkit weights-digest` for `<profile>@<class>` and calibrate that variant (above).
 4. Only then set the profile's audit penalties live for that class.
 
 ## What this proves, and what it doesn't

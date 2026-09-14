@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# mkosi build script: the guest kernel, the NVIDIA open GPU kernel modules built against it, the NVIDIA
+# userspace the CDI spec needs, and nvidia-ctk. Inputs were downloaded and hash-checked by
+# fetch-inputs.sh into image/cvm/.inputs (mounted here as $SRCDIR/inputs); they are checked again.
+#
+# Reproducibility: KBUILD_BUILD_TIMESTAMP/USER/HOST fixed, no debug info, no module signing key (a
+# random per-build key; the verity root filesystem covers the modules instead), -trimpath and an empty
+# build id for Go. NOT RUN IN THIS REPOSITORY: the NVIDIA part in particular follows NVIDIA's .run
+# layout and dstack's recipe and must be checked on the first real build.
+set -euo pipefail
+
+: "${SRCDIR:?run by mkosi}" "${DESTDIR:?run by mkosi}" "${OUTPUTDIR:?run by mkosi}" "${BUILDDIR:?run by mkosi}"
+: "${SOURCE_DATE_EPOCH:?build.sh passes --source-date-epoch}"
+inputs="$SRCDIR/inputs"
+# shellcheck source=/dev/null
+. "$inputs/pins.env"   # written by fetch-inputs.sh from inputs.lock.json
+export TZ=UTC LC_ALL=C KBUILD_BUILD_TIMESTAMP="@$SOURCE_DATE_EPOCH" KBUILD_BUILD_USER=kuno KBUILD_BUILD_HOST=reproducible KBUILD_BUILD_VERSION=1
+jobs="$(nproc)"
+
+check() { echo "$2  $1" | sha256sum --check --strict --quiet || { echo "$1 does not match its pin" >&2; exit 1; }; }
+
+# ---- kernel
+check "$inputs/linux-$KERNEL_VERSION.tar.xz" "$KERNEL_SHA256"
+tar -xJf "$inputs/linux-$KERNEL_VERSION.tar.xz" -C "$BUILDDIR"
+src="$BUILDDIR/linux-$KERNEL_VERSION"
+make -C "$src" -j"$jobs" x86_64_defconfig
+"$src/scripts/kconfig/merge_config.sh" -m -O "$src" "$src/.config" "$SRCDIR/kernel/kuno.config"
+make -C "$src" -j"$jobs" olddefconfig
+for required in CONFIG_INTEL_TDX_GUEST CONFIG_TDX_GUEST_DRIVER CONFIG_TSM_REPORTS CONFIG_DM_VERITY CONFIG_SQUASHFS CONFIG_FW_CFG_SYSFS CONFIG_EFI_STUB; do
+  grep -q "^$required=y" "$src/.config" || { echo "kernel config lost $required=y" >&2; exit 1; }
+done
+make -C "$src" -j"$jobs" bzImage modules
+kver="$(make -C "$src" -s kernelrelease)"
+make -C "$src" INSTALL_MOD_PATH="$DESTDIR/usr" INSTALL_MOD_STRIP=1 DEPMOD=true modules_install
+rm -f "$DESTDIR/usr/lib/modules/$kver/build" "$DESTDIR/usr/lib/modules/$kver/source"
+install -m 0644 "$src/arch/x86/boot/bzImage" "$OUTPUTDIR/bzImage"
+
+# ---- NVIDIA open kernel modules and userspace
+run="$inputs/NVIDIA-Linux-x86_64-$NVIDIA_VERSION.run"
+check "$run" "$NVIDIA_RUN_SHA256"
+sh "$run" --extract-only --target "$BUILDDIR/nvidia" >/dev/null
+make -C "$BUILDDIR/nvidia/kernel-open" -j"$jobs" SYSSRC="$src" SYSOUT="$src" modules
+install -d "$DESTDIR/usr/lib/modules/$kver/extra"
+install -m 0644 "$BUILDDIR"/nvidia/kernel-open/*.ko "$DESTDIR/usr/lib/modules/$kver/extra/"
+while read -r kind file; do
+  case "$kind" in ''|'#'*) continue ;; bin) dest=usr/bin ;; lib) dest=usr/lib/x86_64-linux-gnu ;; *) echo "bad line in nvidia.files" >&2; exit 1 ;; esac
+  file="${file//@VERSION@/$NVIDIA_VERSION}"
+  install -D -m 0755 "$BUILDDIR/nvidia/$file" "$DESTDIR/$dest/$file"
+done < "$SRCDIR/nvidia.files"
+
+# ---- nvidia-ctk (CDI spec generation) at its pinned revision
+git clone --quiet https://github.com/NVIDIA/nvidia-container-toolkit "$BUILDDIR/nvidia-container-toolkit"
+git -C "$BUILDDIR/nvidia-container-toolkit" checkout --quiet "$NVIDIA_CONTAINER_TOOLKIT_REVISION"
+(cd "$BUILDDIR/nvidia-container-toolkit" && CGO_ENABLED=0 GOFLAGS=-mod=vendor go build -trimpath -ldflags "-buildid= -s -w" -o "$DESTDIR/usr/bin/nvidia-ctk" ./cmd/nvidia-ctk)

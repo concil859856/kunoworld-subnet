@@ -611,7 +611,7 @@
             "interconnect": null,
             "dev": false,
             "comparison": "tolerance",
-            "precision": "int8-convrot",
+            "precision": "int8-wo",
             "vram_gb": 24
           },
           {

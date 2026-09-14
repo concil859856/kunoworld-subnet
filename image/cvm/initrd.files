@@ -1,0 +1,28 @@
+# Everything in the KunoWorld initrd besides initrd/init, copied (dereferenced) from the mkosi-built
+# initrd staging tree: Debian trixie at the snapshot pinned in inputs.lock.json, packages
+# busybox-static and cryptsetup-bin. The library set is the one dstack 0.6.0's trixie initramfs
+# ships for veritysetup; mkinitrd.sh fails if any of these is missing from the tree.
+bin/busybox
+link bin/sh busybox
+link bin/cat busybox
+link bin/mkdir busybox
+link bin/mount busybox
+link bin/sleep busybox
+link bin/switch_root busybox
+sbin/veritysetup
+lib64/ld-linux-x86-64.so.2
+lib/x86_64-linux-gnu/libblkid.so.1
+lib/x86_64-linux-gnu/libc.so.6
+lib/x86_64-linux-gnu/libcap.so.2
+lib/x86_64-linux-gnu/libcrypto.so.3
+lib/x86_64-linux-gnu/libcryptsetup.so.12
+lib/x86_64-linux-gnu/libdevmapper.so.1.02.1
+lib/x86_64-linux-gnu/libjson-c.so.5
+lib/x86_64-linux-gnu/libm.so.6
+lib/x86_64-linux-gnu/libpcre2-8.so.0
+lib/x86_64-linux-gnu/libpopt.so.0
+lib/x86_64-linux-gnu/libselinux.so.1
+lib/x86_64-linux-gnu/libudev.so.1
+lib/x86_64-linux-gnu/libuuid.so.1
+lib/x86_64-linux-gnu/libz.so.1
+lib/x86_64-linux-gnu/libzstd.so.1

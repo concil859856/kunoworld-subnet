@@ -36,8 +36,25 @@ land.
   verified data centers. It does not exist yet, so today treat every miner as able to attack
   its own hardware.
 - **Traffic shape.** The host sees connection timing, job duration, ciphertext sizes and
-  power draw. Fixed presets blunt this; output padding is planned but not
-  implemented. Neither eliminates it.
+  power draw. Blobs are padded ([PROTOCOL.md](PROTOCOL.md#blobs-inputs-and-output-video)):
+  inputs and outputs are sealed with their length inside the encryption and zeros up to a PADMÉ
+  size bucket. A ciphertext then shows only its bucket: 32 KiB wide around 1 MiB, 512 KiB around
+  30 MB. That costs about 1.5–3% on a video and never more than 12%. It stops anyone matching a
+  blob to a known image or video by its exact size, and blunts fingerprinting by small size
+  differences. It does not hide:
+  - which bucket a file falls in. A 5 MB and a 50 MB video stay distinguishable; PADMÉ still leaks
+    O(log log M) bits.
+  - the public parameters the gateway prices and routes by: model, duration preset, resolution,
+    aspect ratio, fps, audio and input roles. The gateway and the miner read them in the clear, and
+    they largely decide the output's size class. Fixed duration presets keep that coarse.
+  - the number of inputs, or timing: when jobs arrive, how long generation takes, the receipt's
+    GPU-seconds and timestamps, and power draw.
+  - the length of the sealed request (prompt, seed, input manifest), which is not padded, so its
+    size tracks the prompt's length.
+  - version 1 blobs, which carry exact sizes and are still accepted from clients that predate
+    padding.
+  - `content_digest` in the public receipt, by design: anyone who already holds a video can
+    confirm it.
 - **What the model itself does.** Attestation proves which code ran, not that the model is
   well-behaved. That is why content safeguards run inside the enclave
   (`worker/src/kuno_worker/safety.py`). All sexual content is banned in both modes:
@@ -189,7 +206,8 @@ Not implemented yet:
   below has produced or verified a live quote or live GPU evidence;
 - the confidential VM image and its measured boot chain (only the worker container layer is
   built), and published golden measurements;
-- a chosen per-GPU collateral amount, output padding, and the enterprise tier;
+- a chosen per-GPU collateral amount, and the enterprise tier;
+- padding of the sealed request (prompt and input manifest); only blobs are padded;
 - shipped classifier weights (frame models are chosen and their hashes pinned in
   `image/CVM.md`, but no image bakes them in yet), and any accuracy evaluation of them or of
   the content policy's word lists on real traffic;
@@ -204,6 +222,8 @@ What is in place and tested against a simulated TEE:
 - hotkey proofs, the hardware-identity registry and validator dedupe, and collateral gating
   (the chain read was checked read-only against finney);
 - validator receipt re-verification, the replay and canary penalties, and the switch rules;
+- blob size padding (format version 2) in both SDKs, the worker's output sealing and the gateway's
+  Standard-mode sealing, pinned by shared Python and JS vectors;
 - the safety pipeline, with fake classifiers, including the shared content policy and the
   output check wired into the worker; the frame adapters also load and score real weights on
   CPU (benign clips only);

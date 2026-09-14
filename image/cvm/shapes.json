@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "note": "VM shapes the owner publishes measurements for. RTMR0 depends on every field (the ACPI tables QEMU generates: dstack-mr machine.rs/acpi.rs) and MRTD's page order on qemu_version, so each shape is its own golden manifest entry and a miner must launch exactly one of them (launch-td.sh). num_verity_volumes counts the weights disks attached after the root disk. CPU and memory sizes are proposals, not measured requirements.",
+  "shapes": [
+    {
+      "id": "c1.rtx-pro-6000-bw-se.x1",
+      "description": "one RTX PRO 6000 Blackwell Server Edition in CC mode",
+      "profiles": ["ltx-2.5-fast"],
+      "cpus": 16,
+      "memory": "128G",
+      "num_gpus": 1,
+      "num_nvswitches": 0,
+      "num_nics": 1,
+      "num_verity_volumes": 1,
+      "hugepages": false,
+      "hotplug_off": true,
+      "qemu_version": "9.1.0"
+    },
+    {
+      "id": "c2.h200-141gb.x1",
+      "description": "one H200 141GB in CC mode",
+      "profiles": ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k"],
+      "cpus": 24,
+      "memory": "256G",
+      "num_gpus": 1,
+      "num_nvswitches": 0,
+      "num_nics": 1,
+      "num_verity_volumes": 1,
+      "hugepages": false,
+      "hotplug_off": true,
+      "qemu_version": "9.1.0"
+    },
+    {
+      "id": "c4.h200-sxm-141gb.x4",
+      "description": "four NVLink-bridged H200 SXM (HGX) in CC mode, Ulysses 4",
+      "profiles": ["h3-turbo", "h3", "h3-reference"],
+      "cpus": 96,
+      "memory": "1024G",
+      "num_gpus": 4,
+      "num_nvswitches": 0,
+      "num_nics": 1,
+      "num_verity_volumes": 1,
+      "hugepages": false,
+      "hotplug_off": true,
+      "qemu_version": "9.1.0"
+    }
+  ]
+}

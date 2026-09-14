@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "note": "Every input of the CVM build that comes from outside this repository, pinned by hash or revision. build.sh refuses a null pin unless KUNO_CVM_ALLOW_UNPINNED=1, and then records the build as unpinned, which publish.py refuses. Values marked from_dstack are copied from Dstack-TEE/dstack os/mkosi/versions.env at 44dd0fc8a6f392685ebc5ccfb206022189e5eed9 (2026-09-10) and its mkosi-os-v0.6.0-rc4 release, whose OVMF and kernel conventions dstack-mr measures; re-check them together when bumping.",
+  "source_date_epoch": 1788220800,
+  "mkosi": {
+    "version": "26",
+    "revision": "84af20892b61c8e177e391f997ded8b4cb5514f2",
+    "repository": "https://github.com/systemd/mkosi",
+    "from_dstack": true
+  },
+  "debian": {
+    "release": "trixie",
+    "snapshot": "20260721T000000Z",
+    "from_dstack": true
+  },
+  "kernel": {
+    "version": "6.18.40",
+    "url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.40.tar.xz",
+    "sha256": "3712fc1ec839e4daac981176c8518912e8f452650aaedfe4381da4419613a431",
+    "config_fragment": "kernel/kuno.config",
+    "from_dstack": true
+  },
+  "ovmf": {
+    "release": "mkosi-os-v0.6.0-rc4",
+    "url": "https://github.com/Dstack-TEE/dstack/releases/download/mkosi-os-v0.6.0-rc4/dstack-0.6.0-rc4.tar.gz",
+    "archive_sha256": "4efd96e7622f9b061dc77327b96061ab604e1fda819d8fff5afb195648ce6b73",
+    "member": "dstack-0.6.0-rc4/ovmf.fd",
+    "sha256": "7909f2899aee5b151de0ea17528dc53ffb729855ced5a75abe7ac7054cc5d1c6",
+    "published_mrtd_single_pass": "1b5c7f837bd3b98e9ca427b9561d94715c38de76af60e827a5b3174c18e6477a9711dc94e2160388db5c746a73069212",
+    "variant": "pre202505",
+    "kernel_header_normalized": true,
+    "edk2_revision": "fbe0805b2091393406952e84724188f8c1941837",
+    "status": "release candidate: no stable mkosi-based dstack OS release exists yet. Rebuild it from edk2_revision with dstack's patches, or move to a stable release, before mainnet.",
+    "from_dstack": true
+  },
+  "dstack_mr": {
+    "repository": "https://github.com/Dstack-TEE/dstack",
+    "revision": "44dd0fc8a6f392685ebc5ccfb206022189e5eed9",
+    "path": "dstack/dstack-mr/cli",
+    "license": "Apache-2.0"
+  },
+  "nvidia": {
+    "driver_version": "595.91.07",
+    "run_url": "https://us.download.nvidia.com/tesla/595.91.07/NVIDIA-Linux-x86_64-595.91.07.run",
+    "run_sha256": "ca23c88dd24b07a191644e1e11cfb7bcdd7537305749af40f980018b095e6313",
+    "nvattest_revision": "9d12801cea8a198ea0f29640dfaf8a4017c841c5",
+    "container_toolkit_revision": "c748619c592030519361274a2fdd43f2c2ced73a",
+    "note": "version and hashes from dstack; the download URL follows NVIDIA's data-center layout and is unverified",
+    "from_dstack": true
+  },
+  "worker_image": {
+    "build": "image/build.sh",
+    "expected_digest": null,
+    "note": "set to the release's KUNO_IMAGE_DIGEST (image/build.sh --check); null leaves the build unpinned"
+  }
+}

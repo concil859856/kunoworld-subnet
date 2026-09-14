@@ -20,6 +20,7 @@ Production C2PA hierarchy, run offline by the subnet owner (see subnet/PROVENANC
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import secrets
 from pathlib import Path
@@ -174,6 +175,12 @@ def main() -> None:
     inter_cmd.add_argument("--algorithm", choices=c2pa_certs.CA_ALGORITHMS, default="p384")
     inter_cmd.add_argument("--days", type=int, default=c2pa_certs.INTERMEDIATE_DAYS)
     inter_cmd.add_argument("--force", action="store_true")
+    weights_cmd = sub.add_parser(
+        "weights-digest", help="hash a weights directory into the model digest the manifest pins for a profile and class"
+    )
+    weights_cmd.add_argument("--profile", required=True)
+    weights_cmd.add_argument("--hardware-class", help="omit for the bf16 recipe a profile runs without a class")
+    weights_cmd.add_argument("--models-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "init":
         env = init(args.data, args.force)
@@ -191,6 +198,24 @@ def main() -> None:
         )
         print(f"Wrote {args.out_chain} (valid until {cert.not_valid_after_utc:%Y-%m-%d}) and its key {args.out_key}")
         print(f"Gateway: KUNO_C2PA_CA_KEY={args.out_key.resolve()} KUNO_C2PA_CA_CHAIN={args.out_chain.resolve()}")
+    elif args.command == "weights-digest":
+        print(json.dumps(weights_digest_report(args.profile, args.hardware_class, args.models_dir), indent=2))
+
+
+def weights_digest_report(profile_id: str, hardware_class: str | None, models_dir: Path) -> dict:
+    """`model_digests` entry for a profile variant, from the files on disk (hashes every file)."""
+    from .precision import PrecisionError, select_recipe, variant_id, verify_weights
+
+    profile = load_profiles().get(profile_id)
+    if profile is None:
+        raise SystemExit(f"unknown profile {profile_id}")
+    try:
+        recipe, _ = select_recipe(profile, hardware_class)
+        check = verify_weights(models_dir, recipe, allow_unpinned=True)
+    except PrecisionError as exc:
+        raise SystemExit(str(exc)) from None
+    key = variant_id(profile_id, hardware_class) if hardware_class else profile_id
+    return {"model_digests": {key: check.model_digest}, "recipe": recipe.id, "files": [f.model_dump() for f in check.files]}
 
 
 def sign_manifest_file(key_path: Path, manifest_path: Path, out_path: Path) -> SignedManifest:

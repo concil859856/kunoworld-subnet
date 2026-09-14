@@ -41,6 +41,12 @@ class WorkerConfig:
     # manifest's weights digest. Unset leaves the resident backends in performance mode.
     verified_hardware_class: str | None = None
     model_digest: str | None = None
+    # Resident LTX: offload mode (auto | none | model | group), how weights are checked before loading
+    # (full hashes every file; size trusts KUNO_MODEL_DIGEST, for dm-verity mounts only) and whether
+    # weights with no pinned digest may load on a verified class (development only).
+    ltx_offload: str = "auto"
+    weights_verify: str = "full"
+    allow_unpinned_weights: bool = False
     # "c2pa" embeds a signed C2PA manifest in every video (needs the provenance extra); "off" doesn't.
     provenance: str = "off"
     # PEM chain, leaf first, issued for this enclave. Unset: the gateway's CA issues one after each
@@ -86,6 +92,9 @@ class WorkerConfig:
             capacity=int(env.get("KUNO_CAPACITY", "1")),
             verified_hardware_class=env.get("KUNO_VERIFIED_HARDWARE_CLASS") or None,
             model_digest=env.get("KUNO_MODEL_DIGEST") or None,
+            ltx_offload=env.get("KUNO_LTX_OFFLOAD", "auto"),
+            weights_verify=env.get("KUNO_WEIGHTS_VERIFY", "full"),
+            allow_unpinned_weights=env.get("KUNO_WEIGHTS_ALLOW_UNPINNED") == "1",
             provenance=env.get("KUNO_PROVENANCE", "off"),
             provenance_cert_chain=_path(env.get("KUNO_PROVENANCE_CERT_CHAIN")),
             provenance_tsa_url=env.get("KUNO_PROVENANCE_TSA_URL") or None,

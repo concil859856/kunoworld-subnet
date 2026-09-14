@@ -120,21 +120,50 @@ class LtxResidentBackend(Backend):
         hardware_class: str | None = None,
         retention: RetentionStore | None = None,
         model_digest: str | None = None,
+        offload: str = "auto",
+        weights_verify: str = "full",
+        allow_unpinned_weights: bool = False,
+        host_ram_gib: float | None = None,
     ):
-        """`hardware_class` turns on verified mode for profiles that pin it (see VERIFIED_MODE.md);
-        `model_digest` is the weights identity from the owner-signed manifest."""
+        """`hardware_class` turns on verified mode for profiles that pin it (see VERIFIED_MODE.md) and picks
+        the weights precision (backends/quantized.py); `model_digest` is the weights identity from the
+        owner-signed manifest. `offload` is auto | none | model | group."""
         if loader is None:
             if models_dir is None:
                 raise ValueError("KUNO_LTX_MODELS_DIR must point at the LTX-2.5 weights")
             from .runtimes import ltx_loader
 
-            loader = ltx_loader(Path(models_dir))
+            loader = ltx_loader(
+                Path(models_dir), hardware_class=hardware_class, model_digest=model_digest, offload=offload,
+                weights_verify=weights_verify, allow_unpinned_weights=allow_unpinned_weights, host_ram_gib=host_ram_gib,
+            )
         self.store = ModelStore(loader, capacity=capacity)
         self.workdir = Path(workdir)
         self.hardware_class = hardware_class
         self.retention = retention
         self.model_digest = model_digest
+        self.offload = offload
+        self.host_ram_gib = host_ram_gib
+        self._plans: dict[str, Any] = {}
         self._determinism: dict[str, Any] | None = None
+
+    def memory_plan(self, profile: ModelProfile):
+        """The class's memory plan for this profile (None for classes that declare no VRAM). Raises
+        PrecisionError when the class cannot serve the profile at all."""
+        if profile.id not in self._plans:
+            from .quantized import host_memory_gib, plan_for_class
+
+            ram = host_memory_gib() if self.host_ram_gib is None else self.host_ram_gib
+            self._plans[profile.id] = plan_for_class(profile, self.hardware_class, host_ram_gib=ram, mode=self.offload)
+        return self._plans[profile.id]
+
+    def admit(self, task: GenerationTask, call: dict[str, Any]) -> None:
+        """Refuses, before any GPU work, a request larger than this class's memory plan allows."""
+        plan = self.memory_plan(task.profile)
+        if plan is not None:
+            from .quantized import admit
+
+            admit(plan, task.profile, call, task.width, task.height, task.params.fps)
 
     def _pin(self, profile: ModelProfile) -> None:
         """Determinism must be pinned before weights touch the GPU (cuBLAS reads its workspace config once)."""
@@ -145,6 +174,7 @@ class LtxResidentBackend(Backend):
 
     def warm(self, profile: ModelProfile) -> None:
         self._pin(profile)
+        self.memory_plan(profile)
         self.store.warm(profile)
 
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
@@ -154,6 +184,7 @@ class LtxResidentBackend(Backend):
             for item in task.inputs:
                 item.save(directory)
             call = build_call(task)
+            self.admit(task, call)
             recorder = self.step_recorder(task, context_bytes(prompt=task.prompt, negative_prompt=task.negative_prompt))
             tap = None
             if recorder is not None:

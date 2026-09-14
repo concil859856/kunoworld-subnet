@@ -40,6 +40,10 @@ if [ "${1:-}" = "--check" ]; then
   fi
   echo "reproducible: two clean builds produced $digest" >&2
 fi
+# The CVM build (image/cvm/build.sh) puts this exact archive into the measured root filesystem.
+if [ -n "${KUNO_IMAGE_OCI_OUT:-}" ]; then
+  cp "$work/a.tar" "$KUNO_IMAGE_OCI_OUT"
+fi
 
 docker load --input "$work/a.tar" >/dev/null 2>&1 || true
 docker buildx build "$root" --file "$root/image/worker.Dockerfile" --platform "$platform" \

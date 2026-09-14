@@ -1,0 +1,20 @@
+[Unit]
+Description=KunoWorld worker: measure the application into RTMR3, mount verity weights, run the pinned image
+After=network-online.target systemd-modules-load.service
+Wants=network-online.target
+# A failed measurement must not be retried into a register that already holds part of the events:
+# kuno-app refuses unless RTMR3 is zero or equals what this boot already recorded.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/kuno/kuno-app
+Restart=on-failure
+RestartSec=30
+KillMode=mixed
+TimeoutStopSec=60
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

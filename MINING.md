@@ -24,7 +24,8 @@ reachability, then lists which profiles the machine can serve and what is missin
 | `h3-turbo`, `h3`, `h3-reference` | 4 | 80 GB | official recipe is 4 GPUs with Ulysses sequence parallelism |
 
 The subnet README's hardware classes (C1, C2, C4) are how the network groups these profiles;
-the VRAM column is the minimum each one needs.
+the VRAM column is the minimum each one needs. RTX 4090 and 5090 cards run quantized LTX-2.5 on the
+open tier instead; see [section 6](#what-each-consumer-card-can-serve).
 
 The confidential tier, which serves private jobs, additionally requires an Intel TDX host
 (Xeon 5th gen "Emerald Rapids" or Xeon 6 "Granite Rapids") with the GPUs in NVIDIA
@@ -47,6 +48,16 @@ LTX-2.5 (about 66 GB) in the layout the worker expects under `KUNO_LTX_MODELS_DI
 <models>/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors                            # ltx-2.5-pro
 <models>/loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors              # ltx-2.5-4k
 ```
+
+That layout serves `KUNO_BACKEND=cold`. The resident backend (`KUNO_BACKEND=real`) reads the diffusers
+layout of [Lightricks/LTX-2.5-Diffusers](https://huggingface.co/Lightricks/LTX-2.5-Diffusers) from the same
+directory:
+- `model_index.json`, `scheduler/`, `tokenizer/`, `text_encoder/`, `connectors/`;
+- `transformer/` (distilled) or `transformer_full/` (`ltx-2.5-pro`);
+- `vae/`, `audio_vae/`, `vocoder/`, `latent_upsampler/`, `prompt_enhancer/`;
+- for `ltx-2.5-4k`, also `temporal_latent_upsampler/` and `diffusion_decoder/`.
+
+Those files are what the weights digest covers (`kuno-devkit weights-digest`, below).
 
 MiniMax H3 (about 124 GB) is served by the official SGLang server, one per checkpoint:
 
@@ -238,15 +249,94 @@ from an open-tier enclave as fraud (zero weight).
 
 | Hardware class | GPU | Weights | Profiles | Why it fits |
 |---|---|---|---|---|
-| `O1.rtx-4090-24gb.x1.int8` | RTX 4090 24 GB | int8 | `ltx-2.5-fast`, short clips | LTX-2.5's int8 build measured 22.67 GiB resident on a 4090 for a 5 s clip; longer clips need weight streaming ([runaihome](https://runaihome.com/blog/ltx-2-5-local-ai-video-hardware-guide-2026/)) |
-| `O1.rtx-5090-32gb.x1.fp8-cast` | RTX 5090 32 GB | fp8-cast | `ltx-2.5-fast` | FP8 cuts the LTX-2.5 transformer from 35.37 GB to 18.11 GB (SGLang docs, research_model_capabilities.md §2.4.3); LTX-2.3 fp8-cast peaked at 24.2 GB for 97 frames at 1280×704 on a 5090 without offload ([benchmark](https://huggingface.co/datasets/witcheer/rtx-5090-benchmarks/blob/main/reports/ltx-2.3.md)) |
+| `O1.rtx-4090-24gb.x1.int8` | RTX 4090 24 GB | int8 weight-only (`int8-wo`) | `ltx-2.5-fast`, with limits below | LTX-2.5's 8-bit transformer measured 20.03 GiB resident on a 4090, all weights 22.67 GiB (int8-convrot build, [runaihome](https://runaihome.com/blog/ltx-2-5-local-ai-video-hardware-guide-2026/)); everything else streams from host RAM |
+| `O1.rtx-5090-32gb.x1.fp8-cast` | RTX 5090 32 GB | fp8-cast | `ltx-2.5-fast`, with limits below | FP8 cuts the LTX-2.5 transformer from 35.37 GB to 18.11 GB (SGLang docs, research_model_capabilities.md §2.4.3); LTX-2.3 fp8-cast peaked at 24.2 GB for 97 frames at 1280×704 on a 5090 without offload ([benchmark](https://huggingface.co/datasets/witcheer/rtx-5090-benchmarks/blob/main/reports/ltx-2.3.md)) |
 | `O1.rtx-pro-6000-bw-96gb.x1` | RTX PRO 6000 Blackwell 96 GB (workstation, or Server Edition with CC off) | bf16 | `ltx-2.5-fast`, `ltx-2.5-pro` | the full bf16 pipeline needs 80–96 GB (research_model_capabilities.md §2.5) |
 | `O1.h100-80gb.x1` | H100 80 GB, CC off | bf16 | `ltx-2.5-fast`, `ltx-2.5-pro` | as above; the profiles' 80 GB minimum |
 
 Pin `KUNO_PROFILES` and `KUNO_VERIFIED_HARDWARE_CLASS` to your class. A 24–32 GB card that fails
-long or high-resolution jobs counts those failures against its success rate. The worker's resident
-LTX backend loads bf16 today: **the int8 and fp8-cast classes need a quantized loader recipe that
-is not built yet**, so until then only the 80–96 GB classes can actually serve.
+long or high-resolution jobs counts those failures against its success rate, so the worker refuses
+what its class cannot fit before it touches the GPU (below).
+
+### What each consumer card can serve
+
+The resident backend (`KUNO_BACKEND=real`) loads LTX-2.5 in the precision your class declares
+(`worker/backends/quantized.py`; recipes in `kuno_protocol/precision_recipes.json`).
+
+| | RTX 5090 32 GB (`O1.rtx-5090-32gb.x1.fp8-cast`) | RTX 4090 24 GB (`O1.rtx-4090-24gb.x1.int8`) |
+|---|---|---|
+| Transformer | stored as float8_e4m3fn and upcast to bf16 per layer; this is diffusers' `enable_layerwise_casting`, the same plain cast as ltx-pipelines' `--quantization fp8-cast` | int8 weight-only, quantized at load with torchao `Int8WeightOnlyConfig(group_size=128, version=2)` |
+| Text encoder (Gemma 4 12B) | bf16 | int8 weight-only |
+| Weights (estimated) | transformer ≈ 20 GiB, text encoder 22.4 GiB, prompt enhancer ≈ 8 GiB, VAEs/vocoder/upsampler ≈ 2.6 GiB | transformer ≈ 20.4 GiB, text encoder 11.4 GiB, the rest as on the 5090 |
+| Offload (`KUNO_LTX_OFFLOAD=auto`) | `group`: transformer and text encoder streamed a block at a time from pinned host memory | `group` |
+| Host RAM | ≥ 61 GiB | ≥ 50 GiB |
+| Longest 720p 16:9 request | 20 s at 24 fps, 20 s at 50 fps | 20 s at 24 fps, 18 s at 50 fps |
+| Longest 1080p 16:9 request | 20 s at 24 fps, 11 s at 50 fps | 16 s at 24 fps, 7 s at 50 fps |
+| Longest 1080p 21:9 request | 18 s at 24 fps, 8 s at 50 fps | 12 s at 24 fps, 5 s at 50 fps |
+| Speed | **unmeasured** | **unmeasured** |
+
+**These sizes are estimates, not measurements.** They come from a linear memory model fitted to two
+community reports, both with the ComfyUI int8-convrot build: 20.03 GiB resident on a 4090, and about
+10 s of 720p before running out of memory on a 5090. No KunoWorld code has run on either card. `auto`
+picks the offload mode that serves the most requests, which on these cards is `group`.
+`KUNO_LTX_OFFLOAD=model` keeps the transformer on the GPU and is faster, but on a 5090 it fits only about
+12 s of 720p at 24 fps (5 s at 50 fps), and on a 4090 nothing at all.
+
+Why not the checkpoints Lightricks ships:
+- **No FP8 file for LTX-2.5.** Lightricks publishes FP8 checkpoints only for LTX-2 and LTX-2.3, so the
+  5090 casts the bf16 weights, as ltx-pipelines 1.3.0 does.
+- **The int8 file is ComfyUI-only.** `ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors`
+  is marked not for PyTorch, so the 4090 quantizes the bf16 weights with torchao. That is why its class
+  precision is `int8-wo`.
+- **NVFP4** needs Blackwell and Lightricks' ltx-kernels; no class uses it yet.
+- **fp8-cast on a 4090.** A 4090 (compute capability 8.9) could run fp8-cast too. That would be a new
+  class, with its own digest and calibration.
+
+Before loading, the worker checks each of these and refuses with the reason:
+- **The weights are the pinned ones.**
+  - They must hash to `KUNO_MODEL_DIGEST`, the owner-signed manifest's
+    `model_digests["ltx-2.5-fast@<your class>"]`, computed with
+    `kuno-devkit weights-digest --profile ltx-2.5-fast --hardware-class <class> --models-dir <dir>`.
+  - A verified class without a digest refuses to load.
+  - Hashing about 70 GB takes minutes at start-up. `KUNO_WEIGHTS_VERIFY=size` skips it, but belongs
+    only inside a CVM whose dm-verity weights RTMR3 binds.
+- **The GPU is your class's SKU**, with the class's memory, and runs PyTorch 2.7 or newer if it is
+  Blackwell.
+- **Host RAM fits the offload mode.**
+
+A job the plan cannot fit fails at once with `CapacityRefused`, naming the longest duration the class
+serves at that size and frame rate.
+
+The GPU image needs diffusers ≥ 0.40.0 (the first release with LTX-2.5), torch ≥ 2.7 (CUDA 12.8+ for
+the 5090), transformers ≥ 4.51, and, for int8, torchao ≥ 0.15.0. torchao 0.16 removed the string names
+such as `"int8wo"`, so the recipes use its config classes. None of these is a dependency of kuno-worker.
+
+Measure your card before relying on it; the owner does the same before calibrating a class:
+
+```bash
+uv run python subnet/worker/scripts/benchmark_ltx_quantized.py --models-dir /models/ltx-2.5 \
+    --hardware-class O1.rtx-5090-32gb.x1.fp8-cast --model-digest <digest> \
+    --requests 720p:16:9:5,720p:16:9:10,1080p:16:9:5 --out bench.jsonl
+```
+
+It records:
+- load time and seconds per step;
+- peak VRAM against the estimate;
+- refusals and out-of-memory failures;
+- whether outputs repeat, with `--check-determinism`;
+- a memory fit to publish in place of the estimates.
+
+Sources:
+- Lightricks model repos and file notes: [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5),
+  [LTX-2.3-fp8](https://huggingface.co/Lightricks/LTX-2.3-fp8).
+- ltx-pipelines quantization modes:
+  [optimization.md](https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/docs/optimization.md),
+  [ltx-core quantization](https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-core/src/ltx_core/quantization).
+- diffusers: [LTX-2.5 support in 0.40.0](https://github.com/huggingface/diffusers/releases/tag/v0.40.0),
+  [layerwise casting and group offload](https://huggingface.co/docs/diffusers/main/en/optimization/memory),
+  [torchao](https://huggingface.co/docs/diffusers/main/en/quantization/torchao).
+- The torchao string-name removal: [diffusers#13286](https://github.com/huggingface/diffusers/issues/13286).
+- 5090 community report: [note.com](https://note.com/truenorthai/n/nf600b6190507).
 
 **Running it.**
 
@@ -255,6 +345,8 @@ export KUNO_TEE=open                                   # no quote; standard jobs
 export KUNO_HOTKEY_SEED_FILE=/run/secrets/hotkey.seed  # required: the worker refuses to start without a hotkey
 export KUNO_BACKEND=real KUNO_PROFILES=ltx-2.5-fast
 export KUNO_VERIFIED_HARDWARE_CLASS=O1.rtx-5090-32gb.x1.fp8-cast
+export KUNO_LTX_MODELS_DIR=/models/ltx-2.5                # the diffusers layout (section 2)
+export KUNO_MODEL_DIGEST=<model_digests["ltx-2.5-fast@O1.rtx-5090-32gb.x1.fp8-cast"] from the signed manifest>
 export KUNO_PROVENANCE=off                             # the gateway issues C2PA certificates to attested enclaves only
 uv run kuno-worker
 ```

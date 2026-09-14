@@ -28,17 +28,29 @@ case "$fs" in
     ;;
   squashfs)
     command -v mksquashfs >/dev/null || { echo "mksquashfs not found: install squashfs-tools" >&2; exit 1; }
-    mksquashfs "$src" "$out.img" -noappend -all-root -mkfs-time 0 -all-time 0 -no-xattrs -quiet >&2
+    # mksquashfs refuses SOURCE_DATE_EPOCH together with explicit times, and the CVM build exports it.
+    env -u SOURCE_DATE_EPOCH mksquashfs "$src" "$out.img" -noappend -all-root -mkfs-time 0 -all-time 0 -no-xattrs -quiet >&2
     ;;
   *)
     echo "KUNO_WEIGHTS_FS must be erofs or squashfs" >&2; exit 1
     ;;
 esac
 
-veritysetup format "$out.img" "$out.verity" \
-  --hash sha256 --data-block-size 4096 --hash-block-size 4096 \
-  --salt 0000000000000000000000000000000000000000000000000000000000000000 \
-  --uuid 00000000-0000-0000-0000-000000000000 \
-  | awk '/^Root hash:/ {print $3}' > "$out.roothash"
+salt=0000000000000000000000000000000000000000000000000000000000000000
+uuid=00000000-0000-0000-0000-000000000000
+if [ "${KUNO_WEIGHTS_LAYOUT:-separate}" = appended ]; then
+  # One disk per weights image, as the CVM agent opens it: data padded to 4 KiB, then the hash tree.
+  size=$(stat -c %s "$out.img")
+  if [ $((size % 4096)) -ne 0 ]; then size=$(((size + 4095) / 4096 * 4096)); truncate -s "$size" "$out.img"; fi
+  veritysetup format "$out.img" "$out.img" --hash-offset="$size" --data-blocks=$((size / 4096)) \
+    --hash sha256 --data-block-size 4096 --hash-block-size 4096 --salt "$salt" --uuid "$uuid" \
+    | awk '/^Root hash:/ {print $3}' > "$out.roothash"
+  echo "$size" > "$out.size"
+  echo "layout: appended (hash tree at byte $size; fw_cfg line: <name> $(cat "$out.roothash") $size)" >&2
+else
+  veritysetup format "$out.img" "$out.verity" \
+    --hash sha256 --data-block-size 4096 --hash-block-size 4096 --salt "$salt" --uuid "$uuid" \
+    | awk '/^Root hash:/ {print $3}' > "$out.roothash"
+fi
 echo "filesystem: $fs" >&2
 cat "$out.roothash"

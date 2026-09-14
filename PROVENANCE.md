@@ -146,7 +146,11 @@ We verified this with c2pa-python 0.37.10: a manifest without a timestamp reads 
 To avoid that:
 - **Gateway:** set `KUNO_C2PA_TSA_URL`. It is returned to workers with each certificate.
 - **Worker:** `KUNO_PROVENANCE_TSA_URL` overrides the gateway's suggestion.
-- **Which TSA.** Use one on the C2PA TSA Trust List [TRUST-LISTS].
+- **Which TSA.** Use one on the C2PA TSA Trust List [TRUST-PEM]. Validators ignore a timestamp whose chain doesn't reach that list (`timeStamp.untrusted`) [SPEC §15.8], which is as good as no timestamp once the certificate expires.
+  - Probed on 2026-09-14 against the list: `http://ts-c2pa.ssl.com/ecc` and `http://ts-c2pa.ssl.com/rsa` chain to listed SSL.com C2PA roots.
+  - The familiar code-signing TSAs don't: `timestamp.digicert.com`, `timestamp.sectigo.com`, GlobalSign, Entrust and FreeTSA.
+  - Details, recommendations and `kuno-gateway check-tsa`: `platform/gateway/C2PA_CA.md`, "Timestamps".
+- **Enforced.** A production gateway running the CA refuses to start without `KUNO_C2PA_TSA_URL`, and real-TEE workers refuse a certificate that comes without one.
 - **Privacy.** The TSA sees only a hash of the COSE signature and the time of the request, never content.
 - **Development.** No TSA is configured on dev networks.
 
