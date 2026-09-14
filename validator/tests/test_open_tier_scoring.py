@@ -62,13 +62,13 @@ def test_open_tier_work_earns_at_the_tier_rate():
         {"miner_hotkey": "O", "profile_id": "ltx-2.5-fast", "status": "succeeded", "receipt": {"body": "signed"}, "billable_s": 4.0, "finished_at": 100.0, "tier": "open"},
     ]
     weights = normalize(compute_scores(entries, {"C", "O"}, PROFILES, SwitchConfig(), 150.0, tier_rates=TierPolicy().rates()))
-    assert weights["C"] == pytest.approx(2 / 3) and weights["O"] == pytest.approx(1 / 3)
+    assert weights["C"] == pytest.approx(1 / 1.75) and weights["O"] == pytest.approx(0.75 / 1.75)  # the default rate, 0.75
     # Without tier rates (or without tiers on entries) nothing changes.
     assert normalize(compute_scores(entries, {"C", "O"}, PROFILES, SwitchConfig(), 150.0))["O"] == pytest.approx(0.5)
 
 
 def test_tier_policy_from_env_and_its_limits():
-    assert TierPolicy.from_env({}) == TierPolicy(0.5, 5)
+    assert TierPolicy.from_env({}) == TierPolicy(0.75, 5)
     assert TierPolicy.from_env({"KUNO_OPEN_TIER_RATE": "0.25", "KUNO_OPEN_TIER_PROBES": "10"}).rates()["open"] == 0.25
     with pytest.raises(ValueError, match="between 0 and 1"):
         TierPolicy.from_env({"KUNO_OPEN_TIER_RATE": "1.5"})

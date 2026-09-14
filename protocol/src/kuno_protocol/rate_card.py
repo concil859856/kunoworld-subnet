@@ -1,22 +1,26 @@
 """The owner-signed rate card: what one verified video-second earns a miner, in US dollars.
 
-Validators that run `KUNO_PAY_MODE=usd` (VALIDATING.md, "USD-denominated pay") multiply each
-miner's verified billable seconds by the card's rate for the job's profile and tier. The owner
-signs `"kuno/v1/rate-card\\n" + canonical_json(RateCard)` with the Ed25519 key that signs the
-switch and the golden manifest, and `issued_at` must increase, exactly like the switch.
+Validators that run `KUNO_PAY_MODE=usd` (VALIDATING.md, "USD-denominated pay") price each miner's verified billable
+work with the card. The owner signs `"kuno/v1/rate-card\\n" + canonical_json(RateCard)` with the Ed25519 key that signs
+the switch and the golden manifest, and `issued_at` must increase, exactly like the switch.
 
     python -m kuno_protocol.rate_card template --out rate-card.json            # every rate a placeholder
     python -m kuno_protocol.rate_card sign --key owner.key --card rate-card.json --out rate-card.signed.json
 
-Capacity pay (VALIDATING.md, "Capacity pay") is priced per model family in `gpu_hour_usd`: USD per
-credited GPU-hour of ready confidential-tier capacity. When empty it is left out of the signed bytes
-and of the file, so cards signed before it existed still verify and validators that predate it still
-read cards that don't set it.
+A verified job is priced one of two ways:
+  by VCU      when the card sets `usd_per_vcu_second` for the job's tier: the job's VCU (`ModelProfile.vcu_for`, which
+              weighs resolution, fps and duration by GPU cost) × that rate. One rate pays every profile alike.
+  by profile  otherwise: billable seconds × `usd_per_second[profile][tier]`, one rate per profile whatever the resolution,
+              fps or duration. Cards signed before VCU rates existed price this way.
 
-PLACEHOLDERS. The owner has not set miner prices. Every rate `placeholder_rate_card()` writes is a
-stand-in derived from `PLACEHOLDER_USD_PER_VCU_SECOND` or `PLACEHOLDER_USD_PER_GPU_HOUR`, and the card
-says `"placeholder": true` (also the default, so a card nobody reviewed is never mistaken for a real
-one). Validators log a placeholder card at error level every round.
+Capacity pay (VALIDATING.md, "Capacity pay") is priced per model family in `gpu_hour_usd`: USD per credited GPU-hour of
+ready confidential-tier capacity. `usd_per_vcu_second` and `gpu_hour_usd` are left out of the signed bytes and of the
+file while empty, so cards signed before they existed still verify and validators that predate them still read cards
+that don't set them.
+
+PLACEHOLDERS. The owner has not set miner prices. Every rate `placeholder_rate_card()` writes is a stand-in from the
+PLACEHOLDER constants below (research/research_pricing.md §3), and the card says `"placeholder": true` (also the default,
+so a card nobody reviewed is never mistaken for a real one). Validators log a placeholder card at error level every round.
 """
 
 from __future__ import annotations
@@ -31,17 +35,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .canonical import b64d, b64e, canonical_json
 from .crypto import signing_key_from_bytes, verify_signature
-from .profiles import ModelProfile, load_profiles
+from .profiles import FAMILY_H3, FAMILY_LTX, ModelProfile, load_profiles
 from .tiers import CONFIDENTIAL, OPEN
 
 TIERS = (CONFIDENTIAL, OPEN)
 
-# PLACEHOLDER, NOT A PRICE: USD per VCU-weighted verified second on the confidential tier. The owner sets real rates.
-PLACEHOLDER_USD_PER_VCU_SECOND = 0.01
+# PLACEHOLDER, NOT A PRICE: USD per VCU on the confidential tier. With the GPU-cost VCU weights in profiles.json it
+# reproduces research/research_pricing.md §3's recommended miner rates within about ±5% (h3 5 s ≈ $0.114/s, ltx-2.5-fast
+# 1080p ≈ $0.0095/s; ltx-2.5-fast 720p pays +14%). The owner sets real rates.
+PLACEHOLDER_USD_PER_VCU_SECOND = 0.0019
 # PLACEHOLDER, NOT A PRICE: open-tier rate as a share of the confidential rate (mirrors KUNO_OPEN_TIER_RATE's default).
-PLACEHOLDER_OPEN_TIER_SHARE = 0.5
-# PLACEHOLDER, NOT A PRICE: USD per credited GPU-hour of ready confidential-tier capacity, in every family.
-PLACEHOLDER_USD_PER_GPU_HOUR = 2.0
+# At 0.5 only RTX 4090/5090 open miners break even at 60% utilization (research/pricing/costs.md §8.2).
+PLACEHOLDER_OPEN_TIER_SHARE = 0.75
+# PLACEHOLDER, NOT A PRICE: USD per credited GPU-hour of ready confidential-tier capacity, per family. Each is below the
+# family's lowest owned GPU cost, so an idle GPU never profits from capacity pay alone (research/pricing/costs.md §8.3).
+PLACEHOLDER_USD_PER_GPU_HOUR = {FAMILY_LTX: 0.80, FAMILY_H3: 1.50}
 PLACEHOLDER_NOTE = "PLACEHOLDER RATES: not set by the subnet owner; do not rely on them for real pay."
 
 
@@ -54,10 +62,12 @@ class RateCard(BaseModel):
     unit: Literal["verified_video_second"] = "verified_video_second"
     # True until the owner has reviewed every rate. Defaults to True so an unreviewed card is flagged.
     placeholder: bool = True
-    # profile id -> tier ("confidential" | "open") -> USD per verified billable second.
+    # profile id -> tier ("confidential" | "open") -> USD per verified billable second, for tiers without a VCU rate.
     usd_per_second: dict[str, dict[str, float]]
-    # family -> USD per credited GPU-hour of ready capacity (capacity pay). Not written when empty: validators that
-    # predate the field refuse a card with fields they don't know.
+    # tier -> USD per VCU (ModelProfile.vcu_for). A tier listed here prices every profile by VCU and ignores
+    # usd_per_second. Not written when empty: validators that predate the field refuse a card with fields they don't know.
+    usd_per_vcu_second: dict[str, float] = Field(default_factory=dict, exclude_if=lambda value: not value)
+    # family -> USD per credited GPU-hour of ready capacity (capacity pay). Not written when empty, for the same reason.
     gpu_hour_usd: dict[str, float] = Field(default_factory=dict, exclude_if=lambda value: not value)
     note: str = ""
 
@@ -72,6 +82,16 @@ class RateCard(BaseModel):
                     raise ValueError(f"{profile_id}/{tier}: a rate must be a finite, non-negative number")
         return value
 
+    @field_validator("usd_per_vcu_second")
+    @classmethod
+    def _check_vcu_rates(cls, value: dict[str, float]) -> dict[str, float]:
+        for tier, rate in value.items():
+            if tier not in TIERS:
+                raise ValueError(f"usd_per_vcu_second: unknown tier {tier!r} (expected one of {', '.join(TIERS)})")
+            if not math.isfinite(rate) or rate < 0:
+                raise ValueError(f"usd_per_vcu_second/{tier}: a rate must be a finite, non-negative number")
+        return value
+
     @field_validator("gpu_hour_usd")
     @classmethod
     def _check_gpu_hour_rates(cls, value: dict[str, float]) -> dict[str, float]:
@@ -84,15 +104,30 @@ class RateCard(BaseModel):
         """USD per verified second for this profile on this tier, or None when the card doesn't price it."""
         return (self.usd_per_second.get(profile_id) or {}).get(tier)
 
+    def vcu_rate(self, tier: str) -> float | None:
+        """USD per VCU on this tier, or None when the card doesn't price the tier by VCU."""
+        return self.usd_per_vcu_second.get(tier)
+
+    def job_usd(self, profile_id: str, tier: str, seconds: float, vcu: float) -> float | None:
+        """USD for one verified job: its `vcu` × the tier's VCU rate when the card sets one, else its billable `seconds`
+        × the profile's rate on the tier; None when the card prices neither."""
+        vcu_rate = self.vcu_rate(tier)
+        if vcu_rate is not None:
+            return vcu * vcu_rate
+        rate = self.rate(profile_id, tier)
+        return seconds * rate if rate is not None else None
+
     def gpu_hour_rate(self, family: str) -> float | None:
         """USD per credited GPU-hour of capacity in this family, or None when the card doesn't price it."""
         return self.gpu_hour_usd.get(family)
 
     def signed_fields(self) -> dict:
-        """What the owner signs. `gpu_hour_usd` is left out when empty, so cards signed before it existed still verify."""
+        """What the owner signs. `usd_per_vcu_second` and `gpu_hour_usd` are left out when empty, so cards signed before
+        they existed still verify."""
         fields = self.model_dump(mode="json")
-        if not fields.get("gpu_hour_usd"):
-            fields.pop("gpu_hour_usd", None)
+        for name in ("usd_per_vcu_second", "gpu_hour_usd"):
+            if not fields.get(name):
+                fields.pop(name, None)
         return fields
 
 
@@ -113,17 +148,16 @@ def sign_rate_card(owner_key, card: RateCard) -> SignedRateCard:
 
 
 def placeholder_rate_card(profiles: dict[str, ModelProfile] | None = None, issued_at: int | None = None) -> RateCard:
-    """A card pricing every profile from PLACEHOLDER constants. Every number in it is a placeholder."""
+    """A card pricing every profile by VCU and every family's capacity from the PLACEHOLDER constants. Every number in it
+    is a placeholder."""
     profiles = profiles if profiles is not None else load_profiles()
-    rates = {
-        profile.id: {
-            CONFIDENTIAL: round(PLACEHOLDER_USD_PER_VCU_SECOND * profile.vcu_per_output_second, 6),
-            OPEN: round(PLACEHOLDER_USD_PER_VCU_SECOND * profile.vcu_per_output_second * PLACEHOLDER_OPEN_TIER_SHARE, 6),
-        }
-        for profile in profiles.values()
+    vcu_rates = {
+        CONFIDENTIAL: PLACEHOLDER_USD_PER_VCU_SECOND,
+        OPEN: round(PLACEHOLDER_USD_PER_VCU_SECOND * PLACEHOLDER_OPEN_TIER_SHARE, 8),
     }
-    gpu_hours = {family: PLACEHOLDER_USD_PER_GPU_HOUR for family in sorted({profile.family for profile in profiles.values()})}
-    card = RateCard(usd_per_second=rates, gpu_hour_usd=gpu_hours, placeholder=True, note=PLACEHOLDER_NOTE)
+    families = sorted({profile.family for profile in profiles.values()})
+    gpu_hours = {family: PLACEHOLDER_USD_PER_GPU_HOUR[family] for family in families if family in PLACEHOLDER_USD_PER_GPU_HOUR}
+    card = RateCard(usd_per_second={}, usd_per_vcu_second=vcu_rates, gpu_hour_usd=gpu_hours, placeholder=True, note=PLACEHOLDER_NOTE)
     return card if issued_at is None else card.model_copy(update={"issued_at": issued_at})
 
 
@@ -149,7 +183,8 @@ def main() -> None:
         signed = sign_rate_card(signing_key_from_bytes(b64d(args.key.read_text().strip())), card)
         args.out.write_text(signed.model_dump_json(indent=2))
         flag = " — STILL A PLACEHOLDER CARD" if card.placeholder else ""
-        print(f"Wrote {args.out} ({len(card.usd_per_second)} profile(s), issued_at {card.issued_at}){flag}")
+        priced = f"{len(card.usd_per_vcu_second)} VCU tier rate(s), {len(card.usd_per_second)} profile(s)"
+        print(f"Wrote {args.out} ({priced}, issued_at {card.issued_at}){flag}")
 
 
 if __name__ == "__main__":

@@ -48,11 +48,11 @@ def test_a_card_is_a_placeholder_unless_the_owner_says_otherwise():
     assert RateCard(usd_per_second={}).placeholder is True
     card = placeholder_rate_card(issued_at=5)
     assert card.placeholder is True and "PLACEHOLDER" in card.note and card.issued_at == 5
-    profiles = load_profiles()
-    assert set(card.usd_per_second) == set(profiles)
-    for profile_id, tiers in card.usd_per_second.items():
-        assert set(tiers) == {"confidential", "open"}
-        assert 0 < tiers["open"] <= tiers["confidential"], profile_id
+    # It prices by VCU on both tiers, so it prices every profile.
+    assert card.usd_per_second == {} and set(card.usd_per_vcu_second) == {"confidential", "open"}
+    for profile_id, profile in load_profiles().items():
+        vcu = profile.vcu(5)
+        assert 0 < card.job_usd(profile_id, "open", 5, vcu) <= card.job_usd(profile_id, "confidential", 5, vcu), profile_id
 
 
 def test_the_cli_writes_a_placeholder_template_and_signs_it_without_printing_the_key(tmp_path, monkeypatch, capsys):

@@ -23,7 +23,7 @@ from functools import lru_cache
 from importlib import resources
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
     from .schemas import GenerationParams
@@ -100,6 +100,8 @@ class Limits(BaseModel):
     negative_prompt: bool = False
     prompt_enhancer: bool = False
     seed: bool = True
+    # fps -> a lower duration cap at that frame rate, e.g. LTX-2.5 Fast renders over 10 s only at 24/25 fps.
+    max_duration_s_by_fps: dict[int, float] = Field(default_factory=dict)
 
 
 class LicenseInfo(BaseModel):
@@ -109,8 +111,27 @@ class LicenseInfo(BaseModel):
     region_policy: str | None = None
 
 
+PRIVACY_MODES = ("private", "standard")
+
+
+class LongClip(BaseModel):
+    """A multiplier on the whole job once its duration exceeds `over_s`."""
+
+    over_s: float
+    multiplier: float
+
+
 class Pricing(BaseModel):
+    # The Private price per resolution. Private is the default mode, so a client that reads only this sees what a
+    # default job costs.
     usd_per_second: dict[str, float]
+    # The Standard price per resolution. None: the profile is offered in Private mode only.
+    standard_usd_per_second: dict[str, float] | None = None
+    # No job costs less than this, after multipliers.
+    min_job_usd: float = 0.0
+    long_clip: LongClip | None = None
+    # fps -> a multiplier on the whole job.
+    fps_multipliers: dict[int, float] = Field(default_factory=dict)
 
 
 class HardwareClass(BaseModel):
@@ -180,6 +201,59 @@ class VerifiedMode(BaseModel):
         return sum(steps + 1 for steps in self.stage_steps)
 
 
+class VcuWeights(BaseModel):
+    """Verified video compute units (VCU): what a job's output costs in GPU time, comparable across profiles.
+
+        VCU = per_output_second[resolution] × fps_multiplier[fps] × (1 + duration_slope × max(0, seconds − duration_base_s)) × seconds
+
+    Weights follow GPU cost (research/pricing/costs.md §6.2, §8.4), anchored at `h3` 5 s = 60 per second, so a VCU is about
+    the same GPU time in every profile and one USD rate per VCU pays every profile alike (rate_card.py). Every weight is a
+    PLACEHOLDER until the benchmarks in research/research_pricing.md §8 have run.
+    """
+
+    # resolution label -> VCU per output second at 24/25 fps, for clips up to duration_base_s
+    per_output_second: dict[str, float]
+    # Longer clips cost more per second (attention grows with the frame count): the share added per second past the base.
+    duration_slope: float = 0.0
+    duration_base_s: float = 5.0
+    # fps -> multiplier on the weight; 48 and 50 fps render twice the frames of 24 and 25. An fps not listed counts once.
+    fps_multiplier: dict[int, float] = Field(default_factory=dict)
+    note: str = ""
+
+    @field_validator("per_output_second")
+    @classmethod
+    def _check_weights(cls, value: dict[str, float]) -> dict[str, float]:
+        if not value:
+            raise ValueError("a profile needs a VCU weight for at least one resolution")
+        for resolution, weight in value.items():
+            if not math.isfinite(weight) or weight <= 0:
+                raise ValueError(f"{resolution}: a VCU weight must be a finite, positive number")
+        return value
+
+    @field_validator("fps_multiplier")
+    @classmethod
+    def _check_multipliers(cls, value: dict[int, float]) -> dict[int, float]:
+        for fps, multiplier in value.items():
+            if not math.isfinite(multiplier) or multiplier <= 0:
+                raise ValueError(f"{fps} fps: a VCU multiplier must be a finite, positive number")
+        return value
+
+    @field_validator("duration_slope", "duration_base_s")
+    @classmethod
+    def _check_duration(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("the VCU duration slope and base must be finite and non-negative")
+        return value
+
+    def per_second(self, resolution: str, fps: int | None, seconds: float) -> float | None:
+        """VCU per output second of a job, or None when there is no weight for its resolution. fps None counts once."""
+        weight = self.per_output_second.get(resolution)
+        if weight is None:
+            return None
+        multiplier = self.fps_multiplier.get(fps, 1.0) if fps is not None else 1.0
+        return weight * multiplier * (1.0 + self.duration_slope * max(0.0, seconds - self.duration_base_s))
+
+
 class ModelProfile(BaseModel):
     id: str
     family: str
@@ -197,11 +271,48 @@ class ModelProfile(BaseModel):
     steps: int
     license: LicenseInfo
     pricing: Pricing
-    vcu_per_output_second: float
+    # What a verified output second is worth in GPU time, by resolution, fps and duration. Profiles written before these
+    # weights carry one `vcu_per_output_second` instead, read as that weight everywhere.
+    vcu_weights: VcuWeights
     timeout_s: int = 1800
     provisional: bool = False
     # Deterministic variant with per-step commitments; None where no verified mode is defined.
     verified: VerifiedMode | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_one_vcu_weight(cls, data):
+        """A profile from before VcuWeights: its one `vcu_per_output_second` weighs every resolution, fps and duration
+        alike, exactly as it was paid then."""
+        if isinstance(data, dict) and "vcu_weights" not in data and "vcu_per_output_second" in data:
+            data = dict(data)
+            weight = data.pop("vcu_per_output_second")
+            limits = data.get("limits")
+            sizes = limits.sizes if isinstance(limits, Limits) else (limits.get("sizes") if isinstance(limits, dict) else None)
+            data["vcu_weights"] = {"per_output_second": {resolution: weight for resolution in sizes or {}}}
+        return data
+
+    def vcu_for(self, params: GenerationParams, seconds: float | None = None) -> float:
+        """The job's VCU from its public params: its resolution's weight × its fps multiplier × the duration factor ×
+        `seconds` (the billable seconds, by default the requested duration). ParamError for a resolution without a weight."""
+        return self.vcu_at(params.resolution, params.fps, params.duration_s if seconds is None else seconds)
+
+    def vcu_at(self, resolution: str, fps: int | None, seconds: float) -> float:
+        """VCU for `seconds` of output at this resolution and fps (None counts as 24/25 fps)."""
+        per_second = self.vcu_weights.per_second(resolution, fps, seconds)
+        if per_second is None:
+            raise ParamError(f"{self.name} has no VCU weight for {resolution}")
+        return per_second * seconds
+
+    @property
+    def base_vcu_resolution(self) -> str:
+        """The lowest resolution with a VCU weight: fewest pixels, then the lowest weight."""
+        weights = self.vcu_weights.per_output_second
+
+        def pixels(resolution: str) -> float:
+            return max((width * height for width, height in self.limits.sizes.get(resolution, {}).values()), default=math.inf)
+
+        return min(weights, key=lambda resolution: (pixels(resolution), weights[resolution]))
 
     def size_for(self, resolution: str, aspect_ratio: str) -> tuple[int, int]:
         try:
@@ -210,14 +321,34 @@ class ModelProfile(BaseModel):
             raise ParamError(f"{self.name} does not support {resolution} at {aspect_ratio}") from None
         return width, height
 
-    def price_usd(self, params: GenerationParams) -> float:
-        rate = self.pricing.usd_per_second.get(params.resolution)
+    @property
+    def privacy_modes(self) -> list[str]:
+        """The privacy modes this profile is sold in: Private always, Standard where it has a Standard price."""
+        return list(PRIVACY_MODES) if self.pricing.standard_usd_per_second is not None else ["private"]
+
+    def offers(self, privacy: str) -> bool:
+        return privacy in self.privacy_modes
+
+    def price_usd(self, params: GenerationParams, privacy: str = "private") -> float:
+        """Per-second rate x duration x the fps and long-clip multipliers, never below the profile's minimum charge."""
+        if privacy not in PRIVACY_MODES:
+            raise ParamError(f"unknown privacy mode {privacy!r}")
+        if not self.offers(privacy):
+            raise PrivacyModeUnavailable(f"{self.name} is offered in Private mode only")
+        pricing = self.pricing
+        rates = pricing.usd_per_second if privacy == "private" else pricing.standard_usd_per_second
+        rate = rates.get(params.resolution)
         if rate is None:
-            raise ParamError(f"{self.name} has no price for {params.resolution}")
-        return round(rate * params.duration_s, 4)
+            raise ParamError(f"{self.name} has no {privacy} price for {params.resolution}")
+        usd = rate * params.duration_s * pricing.fps_multipliers.get(params.fps, 1.0)
+        if pricing.long_clip is not None and params.duration_s > pricing.long_clip.over_s:
+            usd *= pricing.long_clip.multiplier
+        return round(max(pricing.min_job_usd, usd), 4)
 
     def vcu(self, duration_s: float) -> float:
-        return self.vcu_per_output_second * duration_s
+        """VCU for a job known only by its duration: the lowest resolution's weight (`base_vcu_resolution`) at the default
+        fps, with the duration factor. It underpays higher resolutions and frame rates; callers with the params use `vcu_for`."""
+        return self.vcu_at(self.base_vcu_resolution, self.limits.default_fps, duration_s)
 
     def num_frames(self, duration_s: float, fps: int) -> int:
         """Frame count the model actually renders for a requested duration."""
@@ -240,6 +371,10 @@ class ParamError(ValueError):
     """A request doesn't fit the chosen profile."""
 
 
+class PrivacyModeUnavailable(ParamError):
+    """The profile isn't sold in the requested privacy mode (full H3 and H3 Director are Private-only)."""
+
+
 def validate_params(profile: ModelProfile, params: GenerationParams) -> None:
     """Checks the public (gateway-visible) parameters against a profile."""
     lim = profile.limits
@@ -255,6 +390,9 @@ def validate_params(profile: ModelProfile, params: GenerationParams) -> None:
     profile.size_for(params.resolution, params.aspect_ratio)
     if params.fps not in lim.fps:
         raise ParamError(f"fps must be one of {lim.fps}")
+    fps_max = lim.max_duration_s_by_fps.get(params.fps)
+    if fps_max is not None and params.duration_s > fps_max:
+        raise ParamError(f"at {params.fps} fps, duration must be at most {fps_max:g} seconds")
     if params.audio and not lim.audio:
         raise ParamError(f"{profile.name} cannot generate audio")
     validate_roles(profile, params.mode, params.input_roles)

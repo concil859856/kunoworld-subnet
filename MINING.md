@@ -411,24 +411,36 @@ abuse does.
 - **Collateral.** `KUNO_MIN_COLLATERAL_PER_GPU_OPEN` alpha per GPU, by default twice the
   confidential requirement. Your GPUs count as the larger of `KUNO_HW_GPU_COUNT` and
   `KUNO_CAPACITY` × one GPU per LTX job.
-- **Rate.** Verified open-tier work earns half of what the same work earns on the confidential
-  tier (`KUNO_OPEN_TIER_RATE`, default 0.5).
+- **Rate.** Verified open-tier work earns three quarters of what the same work earns on the
+  confidential tier (`KUNO_OPEN_TIER_RATE`, default 0.75).
 - **Canaries, receipts, replay detection and the success-rate gate** apply unchanged. Hardware
   dedupe does not: there is no verified identity to dedupe.
 
 ## What earns
 
-Validators score verified video compute units from enclave-signed receipts, split between
-model families by the owner-signed switch.
+Validators score verified video compute units (VCU) from enclave-signed receipts, split between
+model families by the owner-signed switch. A job's VCU follows its GPU cost: the profile's weight
+for the job's resolution, twice that at 48 or 50 fps, and a little more per second past 5 s
+(`vcu_weights` in `protocol/src/kuno_protocol/profiles.json`, placeholders until benchmarked).
+
+**Only paid jobs earn job pay.** A job earns only when a customer paid for it (the gateway's
+`billable_usd`). Validators' canaries, standard canaries and Turbo benchmarks, failed or refunded
+jobs, and the promo-credit share of a job earn nothing by themselves. They still count everywhere
+else: the success rate, canary checks and penalties, replay detection, step audits, open-tier
+admission, and capacity pay's served-job requirement below. Buying jobs that land on your own
+miner doesn't pay either: in USD mode, job pay is capped at the network's customer revenue.
 
 **Ready capacity.** When the switch sets `capacity_share`, part of each family's pay also goes to
 the time your confidential-tier GPUs are verified by validators' own challenges, so a ready
-server earns even when traffic is low.
+server earns even when traffic is low. Surplus emission goes to verified capacity too: in USD
+mode, once every paid job is paid in full, the rest of the pool goes to capacity miners in
+proportion to their capacity pay, and in VCU mode a family with no paid work gives its whole split
+to capacity.
 - A GPU counts only after an hour of continuous verification (`capacity_min_uptime_s`); then the
   whole run counts. A missed or failed challenge restarts the clock.
 - Each GPU needs its NVIDIA identity, so open-tier GPUs earn from jobs only.
-- You need at least one succeeded job of that family in the 24-hour window. Validators' canaries go
-  first to miners that don't have one yet.
+- You need at least one succeeded job of that family in the 24-hour window. A validator canary
+  counts, and validators' canaries go first to miners that don't have one yet.
 - Each family is capped at the owner's GPU target: more GPUs than the target share the same pay
   instead of adding to it. The share and targets are placeholders until launch (VALIDATING.md,
   "Capacity pay").
@@ -438,7 +450,7 @@ Scores are gated on:
 - reliability: at least 98% success once you have 20 finished jobs in the 24-hour window;
 - enough locked collateral for your attested GPUs (open tier: per open-tier GPU, at the higher rate);
 - not sharing hardware with a hotkey that showed it first (confidential tier);
-- open tier: admission probes passed, and earnings at `KUNO_OPEN_TIER_RATE` of confidential-tier work;
+- open tier: admission probes passed, and earnings at `KUNO_OPEN_TIER_RATE` (default 0.75) of confidential-tier work;
 - capacity pay: an attested GPU identity, and a succeeded confidential-tier job per family in the window.
 
 Jobs that fail because of your machine (crash, timeout, going offline with work assigned)

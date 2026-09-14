@@ -3,9 +3,10 @@
 An open-tier miner's hardware, image and memory are not attested, so three things carry the
 weight attestation carries for the confidential tier:
 
-  rate        its verified work earns `open_rate` (default 0.5) of a confidential miner's VCU:
+  rate        its verified work earns `open_rate` (default 0.75) of a confidential miner's VCU:
               the confidential tier serves private jobs, costs more to run, and its results are
-              attested as well as audited (`KUNO_OPEN_TIER_RATE`).
+              attested as well as audited (`KUNO_OPEN_TIER_RATE`). At 0.5 only RTX 4090/5090 open
+              miners broke even at 60% utilization (research/pricing/costs.md §8.2).
   admission   a new open-tier hotkey earns nothing until it has passed `admission_probes`
               (default 5) of this validator's canaries in a row; an attributable canary or audit
               failure during probation starts the count again (`KUNO_OPEN_TIER_PROBES`). It is
@@ -30,7 +31,7 @@ from kuno_protocol.tiers import CONFIDENTIAL, OPEN
 
 log = logging.getLogger("kuno.validator.open_tier")
 
-DEFAULT_OPEN_RATE = 0.5
+DEFAULT_OPEN_RATE = 0.75
 DEFAULT_ADMISSION_PROBES = 5
 
 

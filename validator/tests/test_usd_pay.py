@@ -252,7 +252,7 @@ def test_undersubscribed_rounds_renormalize_up_and_burn_nothing():
 
 
 def test_oversubscribed_rounds_renormalize_down():
-    work = OwedWork(owed_usd={"A": 0.60, "B": 0.20})
+    work = OwedWork(owed_usd={"A": 0.60, "B": 0.20}, revenue_usd=0.80)  # revenue covers job owed, so the job cap doesn't bind
     weights, report = settle(work, emission(tao_per_alpha=1e-7), oracle().quote(), RateCard(usd_per_second=RATES), now=5.0, window_s=86400.0)
     assert report.regime == "oversubscribed" and report.subscription > 1
     assert report.subsidy_ratio < 1
@@ -285,7 +285,9 @@ def test_a_normal_round_pays_by_usd_owed_logs_and_exports_the_kpis(tmp_path, own
     [line] = (tmp_path / "pay.jsonl").read_text().splitlines()
     report = json.loads(line)
     assert report["regime"] == "undersubscribed" and report["subsidy_ratio"] > 1 and report["emission_to_revenue"] > 0
-    assert report["miners"]["A"]["usd_owed"] == pytest.approx(12 * 0.05)
+    assert report["miners"]["A"]["job_usd_owed"] == pytest.approx(12 * 0.05)
+    # These rows carry no billable_usd, so revenue is their list price and job owed is held to it; nobody is owed capacity.
+    assert report["miners"]["A"]["usd_owed"] == pytest.approx(12 * 0.05 * report["job_scale"]) and report["residual_to"] == "jobs"
     assert json.loads((tmp_path / "state.json").read_text())["rate_card"]["card"]["issued_at"] == 1000
 
 

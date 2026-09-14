@@ -99,4 +99,4 @@ def test_gpu_hour_rates_are_signed_validated_and_placeholders_by_default():
         with pytest.raises(ValidationError):
             RateCard(usd_per_second={}, gpu_hour_usd={"ltx-2.5": bad})
     template = placeholder_rate_card(issued_at=1)
-    assert template.placeholder and template.gpu_hour_usd == {family: PLACEHOLDER_USD_PER_GPU_HOUR for family in FAMILIES}
+    assert template.placeholder and template.gpu_hour_usd == PLACEHOLDER_USD_PER_GPU_HOUR and set(template.gpu_hour_usd) == FAMILIES

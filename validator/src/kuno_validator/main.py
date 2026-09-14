@@ -65,7 +65,7 @@ def main() -> None:
     collateral = CollateralGate.from_env(env, args.netuid, args.network)
     if collateral is not None and args.netuid is None:
         log.error("KUNO_MIN_COLLATERAL_PER_GPU is set but --netuid is not: collateral can't be read, so every miner fails it")
-    # Open tier: KUNO_OPEN_TIER_RATE (default 0.5), KUNO_OPEN_TIER_PROBES (default 5); tolerance thresholds from
+    # Open tier: KUNO_OPEN_TIER_RATE (default 0.75), KUNO_OPEN_TIER_PROBES (default 5); tolerance thresholds from
     # KUNO_TOLERANCE_CALIBRATION, else the file shipped with kuno-protocol (empty until the owner calibrates: unproven).
     from kuno_protocol.tolerance import load_calibration
 

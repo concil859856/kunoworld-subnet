@@ -76,7 +76,9 @@ def test_verified_receipts_are_scored(miners):
     result = audit([a.entry(), b.entry(duration_s=12.0)], miners)
     assert result.dropped_total == 0 and len(result.entries) == 2
     weights = normalize(compute_scores(result.entries, {"A", "B"}, PROFILES, SwitchConfig(), NOW))
-    assert weights["A"] == pytest.approx(0.25) and weights["B"] == pytest.approx(0.75)
+    # Paid by VCU: 4 s and 12 s of ltx-2.5-fast 720p, the longer clip with its duration factor.
+    fast = PROFILES["ltx-2.5-fast"]
+    assert weights["A"] == pytest.approx(fast.vcu(4) / (fast.vcu(4) + fast.vcu(12))) and weights["B"] == pytest.approx(1 - weights["A"])
 
 
 def test_a_forged_signature_is_dropped_and_counted(miners):

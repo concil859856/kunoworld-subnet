@@ -112,8 +112,10 @@ def test_capacity_is_blended_in_at_the_share_scaled_by_utilization_of_the_target
     scores = compute_scores(ledger, {"A", "B"}, PROFILES, switch(), NOW, capacity=credit)
     ltx = credit.families[LTX]
     assert (ltx.average_gpus, ltx.utilization, ltx.scale, ltx.blend) == (2.0, 0.5, 1.0, 0.125)
-    assert scores["A"].score == pytest.approx(0.875 * 0.25 + 0.125)
-    assert scores["B"].score == pytest.approx(0.875 * 0.75)
+    # Job shares follow VCU: B's 15 s clip weighs more than three times A's 5 s one (the duration factor).
+    a_job = PROFILES["ltx-2.5-fast"].vcu(5) / (PROFILES["ltx-2.5-fast"].vcu(5) + PROFILES["ltx-2.5-fast"].vcu(15))
+    assert scores["A"].score == pytest.approx(0.875 * a_job + 0.125)
+    assert scores["B"].score == pytest.approx(0.875 * (1 - a_job))
     assert scores["A"].capacity == {LTX: 2 * DAY} and "capacity ltx-2.5: 48.00 GPU-hours credited" in scores["A"].flags
 
 
@@ -269,22 +271,29 @@ def test_usd_capacity_pay_is_priced_per_gpu_hour_and_capped_at_the_share_of_the_
         "B": MinerScore("B", capacity={LTX: DAY, H3: 10 * HOUR}),
         "Z": MinerScore("Z", capacity={LTX: DAY}, reasons=["failed canary"]),
     }
-    work = capacity_owed(OwedWork(owed_usd={"A": 0.6}), scores, card)
+    work = capacity_owed(OwedWork(owed_usd={"A": 0.6}, revenue_usd=0.6), scores, card)
     assert work.capacity_usd == pytest.approx({"A": 48.0, "B": 48.0}) and work.capacity_unpriced == {H3: 10.0}
     per_tempo = 4320 / DAY
     job = 0.6 * per_tempo
 
-    # $48 a day is $2.40 per tempo each, far below a quarter of the $442.80 pool: nothing is capped.
+    # $48 a day is $2.40 per tempo each, far below a quarter of the $442.80 pool: nothing is capped. Job owed is paid at
+    # face value and the rest of the pool goes to capacity, half each.
     weights, report = settle(work, emission(), oracle().quote(), card, now=5.0, window_s=DAY, capacity_share=0.25)
     assert report.capacity_scale == 1.0 and report.capacity_usd_per_tempo == pytest.approx(4.8)
-    assert weights == pytest.approx({"A": (job + 2.4) / (job + 4.8), "B": 2.4 / (job + 4.8)})
+    pool = report.pool_usd_per_tempo
+    residual = pool - job - 4.8
+    assert report.residual_to == "capacity" and report.residual_to_capacity_usd_per_tempo == pytest.approx(residual)
+    assert weights == pytest.approx({"A": (job + 2.4 + residual / 2) / pool, "B": (2.4 + residual / 2) / pool})
 
-    # A pool worth $4.43 per tempo: capacity owed is held to a quarter of it, scaled down alike; job owed is not.
+    # A pool worth $4.43 per tempo: capacity owed is held to a quarter of it, scaled down alike; job owed is not. The
+    # residual after both still goes to capacity.
     weights, report = settle(work, emission(tao_per_alpha=0.0001), oracle().quote(), card, now=5.0, window_s=DAY, capacity_share=0.25)
-    limit = 0.25 * report.pool_usd_per_tempo
+    pool = report.pool_usd_per_tempo
+    limit = 0.25 * pool
+    residual = pool - job - limit
     assert report.capacity_limit_usd_per_tempo == pytest.approx(limit) and report.capacity_scale == pytest.approx(limit / 4.8)
     assert report.capacity_usd_per_tempo == pytest.approx(limit) and report.capacity_usd_window == pytest.approx(limit / per_tempo)
-    assert weights == pytest.approx({"A": (job + limit / 2) / (job + limit), "B": (limit / 2) / (job + limit)})
+    assert weights == pytest.approx({"A": (job + limit / 2 + residual / 2) / pool, "B": (limit / 2 + residual / 2) / pool})
     line = json.loads(report.to_json())
     assert line["miners"]["B"]["capacity_gpu_hours"] == 24.0 and line["miners"]["A"]["job_usd_owed"] == 0.6
     assert line["capacity_gpu_hours"] == {LTX: 48.0} and line["capacity_unpriced"] == {H3: 10.0}
@@ -313,4 +322,7 @@ def test_a_usd_round_adds_capacity_owed_and_reports_it(tmp_path):
     assert report["capacity_families"][LTX]["target"] == 4
     assert report["miners"]["A"]["capacity_usd_owed"] == pytest.approx(2.0 * hours)
     assert report["miners"]["A"]["job_usd_owed"] == pytest.approx(4 * 0.05) and report["miners"]["B"]["capacity_usd_owed"] == 0
-    assert weights == pytest.approx({"A": (0.2 + 2.0 * hours) / (0.4 + 2.0 * hours), "B": 0.2 / (0.4 + 2.0 * hours)})
+    # B's job is paid at face value (after the job cap); the rest of the pool goes to A, the only miner owed capacity.
+    assert report["miners"]["B"]["job_usd_per_tempo"] == pytest.approx(4 * 0.05 * report["job_scale"] * 4320 / DAY)
+    b = report["miners"]["B"]["job_usd_per_tempo"] / report["pool_usd_per_tempo"]
+    assert report["residual_to"] == "capacity" and weights == pytest.approx({"A": 1 - b, "B": b})

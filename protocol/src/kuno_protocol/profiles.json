@@ -72,10 +72,24 @@
       },
       "pricing": {
         "usd_per_second": {
-          "768p": 0.06
+          "768p": 0.065
+        },
+        "standard_usd_per_second": {
+          "768p": 0.05
+        },
+        "min_job_usd": 0.1,
+        "long_clip": {
+          "over_s": 10,
+          "multiplier": 1.2
         }
       },
-      "vcu_per_output_second": 16,
+      "vcu_weights": {
+        "per_output_second": {
+          "768p": 17
+        },
+        "duration_slope": 0.05,
+        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked"
+      },
       "min_vram_gb": 80,
       "verified": {
         "variant": "deterministic",
@@ -227,10 +241,22 @@
       },
       "pricing": {
         "usd_per_second": {
-          "768p": 0.12
+          "768p": 0.2
+        },
+        "standard_usd_per_second": null,
+        "min_job_usd": 0.1,
+        "long_clip": {
+          "over_s": 10,
+          "multiplier": 1.2
         }
       },
-      "vcu_per_output_second": 60,
+      "vcu_weights": {
+        "per_output_second": {
+          "768p": 60
+        },
+        "duration_slope": 0.06,
+        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked"
+      },
       "min_vram_gb": 80,
       "verified": {
         "variant": "deterministic",
@@ -411,10 +437,22 @@
       },
       "pricing": {
         "usd_per_second": {
-          "768p": 0.1
+          "768p": 0.3
+        },
+        "standard_usd_per_second": null,
+        "min_job_usd": 0.1,
+        "long_clip": {
+          "over_s": 10,
+          "multiplier": 1.2
         }
       },
-      "vcu_per_output_second": 64,
+      "vcu_weights": {
+        "per_output_second": {
+          "768p": 90
+        },
+        "duration_slope": 0.065,
+        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked"
+      },
       "min_vram_gb": 80,
       "verified": {
         "variant": "deterministic",
@@ -516,6 +554,10 @@
         "min_duration_s": 2,
         "max_duration_s": 20,
         "duration_step_s": 1,
+        "max_duration_s_by_fps": {
+          "48": 10,
+          "50": 10
+        },
         "sizes": {
           "720p": {
             "16:9": [
@@ -599,11 +641,31 @@
       },
       "pricing": {
         "usd_per_second": {
-          "720p": 0.024,
-          "1080p": 0.04
+          "720p": 0.05,
+          "1080p": 0.08
+        },
+        "standard_usd_per_second": {
+          "720p": 0.04,
+          "1080p": 0.06
+        },
+        "min_job_usd": 0.1,
+        "fps_multipliers": {
+          "48": 1.5,
+          "50": 1.5
         }
       },
-      "vcu_per_output_second": 5,
+      "vcu_weights": {
+        "per_output_second": {
+          "720p": 3,
+          "1080p": 5
+        },
+        "duration_slope": 0.03,
+        "fps_multiplier": {
+          "48": 2,
+          "50": 2
+        },
+        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked; the duration slope is provisional"
+      },
       "min_vram_gb": 80,
       "verified": {
         "variant": "deterministic",
@@ -753,7 +815,7 @@
       ],
       "limits": {
         "min_duration_s": 2,
-        "max_duration_s": 20,
+        "max_duration_s": 10,
         "duration_step_s": 1,
         "sizes": {
           "720p": {
@@ -839,11 +901,31 @@
       },
       "pricing": {
         "usd_per_second": {
-          "720p": 0.04,
-          "1080p": 0.07
+          "720p": 0.075,
+          "1080p": 0.11
+        },
+        "standard_usd_per_second": {
+          "720p": 0.055,
+          "1080p": 0.085
+        },
+        "min_job_usd": 0.1,
+        "fps_multipliers": {
+          "48": 1.5,
+          "50": 1.5
         }
       },
-      "vcu_per_output_second": 15,
+      "vcu_weights": {
+        "per_output_second": {
+          "720p": 9,
+          "1080p": 20
+        },
+        "duration_slope": 0.03,
+        "fps_multiplier": {
+          "48": 2,
+          "50": 2
+        },
+        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked; the duration slope is provisional"
+      },
       "min_vram_gb": 80,
       "verified": {
         "variant": "deterministic",
@@ -1007,11 +1089,31 @@
       },
       "pricing": {
         "usd_per_second": {
+          "1440p": 0.15,
+          "2160p": 0.32
+        },
+        "standard_usd_per_second": {
           "1440p": 0.12,
-          "2160p": 0.2
+          "2160p": 0.25
+        },
+        "min_job_usd": 0.1,
+        "fps_multipliers": {
+          "48": 1.5,
+          "50": 1.5
         }
       },
-      "vcu_per_output_second": 40,
+      "vcu_weights": {
+        "per_output_second": {
+          "1440p": 22,
+          "2160p": 60
+        },
+        "duration_slope": 0.03,
+        "fps_multiplier": {
+          "48": 2,
+          "50": 2
+        },
+        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked; the duration slope is provisional"
+      },
       "timeout_s": 3600,
       "min_vram_gb": 141,
       "verified": {

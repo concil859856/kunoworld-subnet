@@ -67,8 +67,9 @@ Each round the validator:
 1. challenges every active enclave with its own nonce and verifies the answer itself;
 2. sends canary jobs through the normal encrypted path (indistinguishable from customer jobs)
    and checks that the requested model served them and the output matches the request;
-3. scores miners from the public receipt ledger: verified video compute units per model
-   family, split by the owner-signed switch, gated on a live attestation and on reliability
+3. scores miners from the public receipt ledger: verified video compute units of the jobs
+   customers paid for, per model family, split by the owner-signed switch, gated on a live
+   attestation and on reliability
    (≥ 98% success once a miner has 20 finished jobs in the window);
 4. sets weights (never to the owner hotkey or a burn UID — burned miner emission cuts the
    subnet's TAO emission share).

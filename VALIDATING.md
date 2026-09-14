@@ -26,7 +26,7 @@ export KUNO_OWNER_PUBLIC_KEY=...                   # verifies the owner-signed s
 export KUNO_VALIDATOR_STATE=/var/lib/kuno/validator-state.json  # default $KUNO_DATA_DIR/validator-state.json
 export KUNO_MIN_COLLATERAL_PER_GPU=<alpha>         # locked collateral required per attested GPU; unset or 0 disables
 export KUNO_MIN_COLLATERAL_PER_GPU_OPEN=<alpha>    # per open-tier GPU; default twice the above, never lower
-export KUNO_OPEN_TIER_RATE=0.5                     # open-tier work earns this share of confidential-tier work
+export KUNO_OPEN_TIER_RATE=0.75                    # open-tier work earns this share of confidential-tier work
 export KUNO_OPEN_TIER_PROBES=5                     # canaries a new open-tier hotkey must pass before its work earns
 export KUNO_TOLERANCE_CALIBRATION=/path/to/tolerance_calibration.json  # default: the file shipped with kuno-protocol
 export KUNO_COLLATERAL_MAX_STALE_S=8640            # how long a failed chain read may reuse the last reading
@@ -88,8 +88,9 @@ vector it would submit.
    licence applies, or they will be rerouted to LTX and prove nothing.
 3. **Ledger audit.** Every ledger row is re-verified before it can earn; see
    [Ledger audit](#ledger-audit).
-4. **Scoring.** Verified video compute units over a 24-hour window: the profile's per-second
-   weight times the seconds the customer *requested*. They are split across model families by
+4. **Scoring.** Verified video compute units over a 24-hour window: a GPU-cost weight for the job's
+   profile, resolution and frame rate times the seconds the customer *requested*, counted only for
+   jobs a customer paid for ([Job pay](#job-pay)). They are split across model families by
    the owner-signed switch and gated on three things: a live attestation, reliability (at least
    98% success once a miner has 20 finished jobs, counting only failures the miner caused), and
    no penalty in the window. Penalties include [hardware dedupe](#hardware-dedupe) and
@@ -134,6 +135,56 @@ A `content_digest` that appears in more than one verified receipt is a replay:
   identical request can legitimately reproduce identical output.
 
 Replays are detected within the scoring window the validator fetched, not across all history.
+
+## Job pay
+
+### Verified video compute units
+
+A job's VCU is what its output costs in GPU time, comparable across profiles
+(`ModelProfile.vcu_for`; each profile's `vcu_weights` in `protocol/src/kuno_protocol/profiles.json`):
+
+```
+VCU = weight(resolution) × fps multiplier × (1 + duration slope × max(0, seconds − 5)) × seconds
+```
+
+| Profile | VCU per output second | Duration slope |
+|---|---|---|
+| `ltx-2.5-fast` | 720p 3, 1080p 5 | 0.03 (provisional) |
+| `ltx-2.5-pro` | 720p 9, 1080p 20 | 0.03 (provisional) |
+| `ltx-2.5-4k` | 1440p 22, 2160p 60 | 0.03 (provisional) |
+| `h3-turbo` | 768p 17 | 0.05 |
+| `h3` | 768p 60 | 0.06 |
+| `h3-reference` | 768p 90 | 0.065 |
+
+- **fps.** 48 and 50 fps count twice what 24 and 25 fps do.
+- **Inputs.** Seconds are the billable seconds from the ledger audit, and resolution and fps come
+  from the same bound params. A row with only `duration_s` uses the row's `resolution` and `fps`
+  when present; without them, or for a resolution your profiles have no weight for, it uses the
+  profile's lowest resolution at its default fps (`ModelProfile.vcu`).
+- **Placeholders.** The weights follow GPU cost (research/pricing/costs.md §8.4, anchored at `h3`
+  5 s = 60) and haven't been benchmarked. A profile written before them, with one
+  `vcu_per_output_second`, is read as that weight at every resolution, fps and duration.
+
+### Only paid jobs earn
+
+A job earns job pay only if a customer paid for it. The gateway's ledger feed carries
+`billable_usd` on every row: the US dollars of real customer money the job earned the network. It
+is 0 for validator accounts' jobs (canaries, standard canaries, Turbo benchmarks), for failed or
+refunded jobs, and for the share paid with promo credit. In both pay modes a job whose
+`billable_usd` is 0 earns no VCU and no USD (`scoring.earns_job_pay`), and the miner's round log
+line flags how many did (`N verified job(s) earn no job pay`).
+
+Such a job still counts everywhere else:
+- the success rate;
+- canary checks and penalties;
+- replay detection and dedupe;
+- step audits;
+- open-tier admission probes;
+- capacity pay's requirement of a succeeded confidential-tier job of the family in the window, so a
+  canary satisfies it.
+
+Rows from a gateway that predates `billable_usd` are billable, as every job was before it existed.
+Like a row without params, the field is only as trustworthy as the gateway: no receipt signs it.
 
 ## Canary policy
 
@@ -259,7 +310,7 @@ about their hardware, image or memory is attested, so the validator weighs them 
 
 | Rule | Default | Setting |
 |---|---|---|
-| Earning rate: open-tier VCU count at this share of confidential-tier VCU | 0.5 | `KUNO_OPEN_TIER_RATE` (0–1) |
+| Earning rate: open-tier VCU count at this share of confidential-tier VCU. At 0.5 only RTX 4090/5090 open miners broke even at 60% utilization (research/pricing/costs.md §8.2). In USD mode the rate card's `open` rates take its place. | 0.75 | `KUNO_OPEN_TIER_RATE` (0–1) |
 | Admission: a new open-tier hotkey's work earns nothing until it has passed this many of your canaries. An attributable canary or audit failure during probation restarts the count; failures the gateway or validator caused don't. | 5 | `KUNO_OPEN_TIER_PROBES` (0 disables) |
 | Collateral per open-tier GPU | twice `KUNO_MIN_COLLATERAL_PER_GPU`, never lower | `KUNO_MIN_COLLATERAL_PER_GPU_OPEN` |
 | Step audits of open-tier standard jobs | 25 % | `AuditPolicy.open_tier_rate` |
@@ -366,13 +417,21 @@ s_f     = capacity_share × min(1, avg_f / target_f)
 
 **USD mode** (`KUNO_PAY_MODE=usd`): `capacity_i = Σ_f C_i,f / 3600 × gpu_hour_usd(f)` from the rate
 card, averaged per tempo like job owed. The sum over miners is limited to `capacity_share ×
-pool_usd`; above it every miner's capacity owed is scaled down by the same factor. Each miner's
-capacity owed is then added to its job owed and renormalized as described below. A family the card
+pool_usd`; above it every miner's capacity owed is scaled down by the same factor. A family the card
 has no `gpu_hour_usd` for earns no capacity pay, and that is logged.
 
+When the pool is undersubscribed, capacity miners also get the residual: what is left after every
+paid job is paid at face value, split in proportion to capacity owed ([USD-denominated
+pay](#usd-denominated-pay)). The residual can lift capacity pay above `capacity_share`, which
+limits only what capacity is *owed*. The residual is surplus emission. Renormalizing it over job
+owed, as before, would scale up every job, including jobs a miner bought for itself. Verified,
+target-capped GPUs are the one thing a miner can't inflate by sending traffic.
+
 **Placeholders.** `kuno-devkit init` signs `switch.placeholder_switch()`: `capacity_share` 0.25 and
-targets of 8 GPUs for `minimax-h3` and 4 for `ltx-2.5`. The rate card template prices every family
-at $2.00 per GPU-hour (`PLACEHOLDER_USD_PER_GPU_HOUR`). None of these are owner decisions.
+targets of 8 GPUs for `minimax-h3` and 4 for `ltx-2.5`. The rate card template prices capacity at
+$0.80 per GPU-hour for `ltx-2.5` and $1.50 for `minimax-h3` (`PLACEHOLDER_USD_PER_GPU_HOUR`). Each is
+below its family's lowest owned GPU cost, so an idle GPU never profits from capacity pay alone
+(research/pricing/costs.md §8.3). None of these are owner decisions.
 
 ## USD-denominated pay
 
@@ -380,10 +439,16 @@ at $2.00 per GPU-hour (`PLACEHOLDER_USD_PER_GPU_HOUR`). None of these are owner 
 video-seconds at US-dollar rates the owner sets, instead of splitting the emission by VCU. The
 default, `vcu`, is the scoring described above.
 
+**Run USD mode on mainnet.** Only USD mode has the guardrails against subsidy abuse: job pay is
+held to customer revenue, and surplus emission goes to verified capacity instead of scaling up job
+pay. At launch emissions dwarf revenue, and in VCU mode a miner that buys jobs landing on itself
+takes a share of the emission in proportion to their VCU, whatever the jobs cost it.
+
 ```bash
 export KUNO_PAY_MODE=usd
 export KUNO_RATE_CARD=/path/to/rate-card.signed.json   # owner-signed; required
 export KUNO_PAY_RESIDUAL=renormalize                   # the default, and the only accepted value
+export KUNO_JOB_PAY_REVENUE_MULTIPLE=1.0               # job pay per tempo is capped at this × customer revenue
 export KUNO_PAY_PRICE_TOLERANCE=0.02                   # largest spread allowed between TAO/USD sources
 export KUNO_PAY_PRICE_MAX_AGE_S=900                    # a dated quote older than this doesn't count
 export KUNO_PAY_REPORT=/var/lib/kuno/pay.jsonl         # default: <state file stem>-pay.jsonl beside the state file
@@ -392,17 +457,30 @@ kuno-validator run --netuid <netuid> ...               # --netuid is required: t
 
 **What stays the same.** Every gate and penalty: attestation, reliability, canaries, replays, step
 audits, hardware dedupe, collateral, open-tier admission and the fraud rule. A miner zeroed in VCU
-mode earns nothing here either. Billable seconds and each job's tier come from the audited ledger
-exactly as scoring sees them. The Turbo track (mechanism 1) is untouched.
+mode earns nothing here either. Billable seconds, params and each job's tier come from the audited
+ledger exactly as scoring sees them, and only paid jobs earn ([Only paid jobs earn](#only-paid-jobs-earn)).
+The Turbo track (mechanism 1) is untouched.
 
-**The formula**, for each miner that passed every gate, over the 24-hour scoring window:
+**The formula**, over the 24-hour scoring window. Every amount is averaged per tempo
+(`× tempo_seconds / window_s`), so a burst of demand is paid out over 24 h.
 
 | Term | Definition |
 |---|---|
-| `usd_owed_i` | Σ billable seconds × `rate(profile, tier)` over the miner's credited jobs |
-| `owed_i` | `usd_owed_i × tempo_seconds / window_s`: the window's average per tempo, so a burst of demand is paid out over 24 h |
+| `job_i` | Σ over miner i's credited, paid jobs: the job's VCU × `usd_per_vcu_second[tier]` when the card sets a VCU rate for the tier, else billable seconds × `usd_per_second[profile][tier]` |
+| `capacity_i` | [capacity pay](#capacity-pay) at the card's `gpu_hour_usd`, for a miner that passed every gate |
+| `revenue` | Σ `billable_usd` of the window's succeeded jobs (replays excluded); list price for rows from a gateway without the field |
 | `pool_usd` | serving miners' alpha per tempo × TAO per alpha × USD per TAO |
-| `weight_i` | `owed_i / pool_usd`, then renormalized (below) |
+
+Settling a round:
+1. **Job cap.** `J = Σ job_i` is limited to `KUNO_JOB_PAY_REVENUE_MULTIPLE × revenue` (default 1.0).
+   Above it, every miner's job owed is scaled down by the same factor.
+2. **Capacity cap.** `C = Σ capacity_i` is limited to `capacity_share × pool_usd`, the same way.
+3. **`J + C ≤ pool_usd`.** Job owed is paid at face value: `weight_i = job_i / pool_usd`. The residual,
+   `pool_usd − J − C`, goes to capacity miners in proportion to their capacity owed:
+   `weight_i += capacity_i × (pool_usd − J) / (C × pool_usd)`. With `C = 0` nobody can take it, so job
+   owed is renormalized up to the whole pool instead, as before: `weight_i = job_i / J`.
+4. **`J + C > pool_usd`.** Everything is renormalized down, `weight_i = (job_i + capacity_i) / (J + C)`,
+   so every miner gets the same fraction of what it is owed.
 
 - **Serving miners' alpha per tempo** = `SubnetAlphaOutEmission × (Tempo + 1) × (1 − owner cut) × ½ ×`
   mechanism 0's share of `MechanismEmissionSplit` (an even split when unset). The owner cut is
@@ -413,16 +491,28 @@ exactly as scoring sees them. The Turbo track (mechanism 1) is untouched.
   metadata at spec_version 455, and the price call was answered by finney.
 - **USD per TAO** is the median of Kraken, Coinbase and CoinGecko (`price_feeds.py`). At least two
   must answer with a fresh quote, and the quotes must agree within `KUNO_PAY_PRICE_TOLERANCE`.
-- **Rates.** The card's rate for a job's profile and tier replaces the profile's VCU weight,
-  `KUNO_OPEN_TIER_RATE` and the switch's `emission_split`. A family the switch turns off still earns
-  nothing. Work on a profile or tier the card doesn't price earns nothing and is logged.
+- **Rates.** The card's rates replace the VCU split, `KUNO_OPEN_TIER_RATE` and the switch's
+  `emission_split`. One USD rate per VCU per tier prices every profile in proportion to GPU cost,
+  and the per-profile table covers tiers the card gives no VCU rate. A family the switch turns off
+  still earns nothing. Work on a profile or tier the card doesn't price earns nothing and is logged.
+- **Revenue** counts only real customer money. Canaries, refunds and promo credit carry
+  `billable_usd` 0, so they add nothing and can't raise the job cap. Rows from a gateway that
+  predates the field count at list price, canaries included.
+
+**Why the residual goes to capacity.** At launch emissions dwarf revenue. When an undersubscribed
+pool was renormalized over everything owed, a miner that bought jobs landing on itself had its
+job owed scaled up to most of the pool: it was paid far more than it spent. The job cap holds job
+pay to what customers paid, and paying jobs at face value stops a small job growing into the pool.
+The surplus goes to ready, attested GPUs instead. The switch's targets cap them, and a miner
+can't inflate them by sending traffic.
 
 **Oversubscribed and undersubscribed.**
-- **Σ weights > 1 (oversubscribed):** weights are renormalized down, so every miner gets the same
-  fraction of what it is owed.
-- **Σ weights < 1 (undersubscribed):** `KUNO_PAY_RESIDUAL` decides what happens to the rest.
-  - `renormalize` (default): weights are scaled up to sum to 1. Miners receive the whole pool,
-    more than the card says they're owed, and nothing is burned.
+- **`J + C > pool_usd` (oversubscribed):** weights are renormalized down, so every miner gets the
+  same fraction of what it is owed.
+- **`J + C < pool_usd` (undersubscribed):** `KUNO_PAY_RESIDUAL` decides what happens to the rest.
+  - `renormalize` (default): nothing is burned or recycled, and miners receive the whole pool. The
+    residual goes to capacity miners (step 3), or, when no capacity is owed, job owed is scaled
+    up to sum to 1.
   - `recycle` is **documented, not implemented**, and the validator refuses to start with it. It
     would send the residual to the owner uid, where the chain withholds it from miners. Since June
     2026 the withheld share of a tempo's miner incentive (`MinerBurned`) multiplies the subnet's TAO
@@ -431,24 +521,33 @@ exactly as scoring sees them. The Turbo track (mechanism 1) is untouched.
     pool would keep 30% of its TAO share, less still if that drops it under the gate. Revisit only
     if the chain rule changes.
 
-Bittensor normalizes weights, so under `renormalize` the dollar amounts decide only each miner's
-relative share: `usd_owed_i / Σ usd_owed`. The pool's value decides the regime and the KPIs below.
+Bittensor normalizes weights. When no capacity is owed, the dollar amounts decide only each miner's
+relative share, `job_i / J`. When capacity is owed, the pool's dollar value also decides how much
+of the pool jobs take at face value and how much the residual lifts capacity. The pool's value
+always decides the regime and the KPIs below.
 
 **Failing closed.** Nothing is submitted, and the previous weights stay on chain, when:
 - no rate card has been accepted (none set, missing, unreadable, or not signed by `KUNO_OWNER_PUBLIC_KEY`);
 - the chain can't be read, or the serving pool is worth nothing;
 - fewer than two fresh TAO/USD sources answer, or they disagree beyond the tolerance.
 
-The log says why (`USD pay is unavailable this round (…)`). Under `renormalize` the price doesn't
-change the weights, but a round that can't be priced still isn't submitted: its report would be
-wrong.
+The log says why (`USD pay is unavailable this round (…)`). A round that can't be priced isn't
+submitted: the pool's dollar value decides how much of it jobs take at face value, and the report
+would be wrong.
 
 **The rate card** is `{"card": RateCard, "signature"}`, signed by the owner over
-`"kuno/v1/rate-card\n" + canonical_json(card)` (`kuno_protocol/rate_card.py`). It gives USD per
-verified video-second per profile and tier (`confidential`, `open`), and for [capacity pay](#capacity-pay)
-USD per credited GPU-hour per family (`gpu_hour_usd`). `gpu_hour_usd` is left out of the file and
-the signed bytes while empty, so cards signed before it still verify. Validators older than the
-field refuse a card that sets it, so upgrade validators before publishing one. It is accepted like the switch:
+`"kuno/v1/rate-card\n" + canonical_json(card)` (`kuno_protocol/rate_card.py`). It prices verified
+work on each tier (`confidential`, `open`) in one of two ways, and capacity per family:
+
+| Field | Prices |
+|---|---|
+| `usd_per_vcu_second` | tier → USD per VCU. A tier listed here prices every job by its VCU (resolution, fps and duration), and `usd_per_second` isn't used for that tier. |
+| `usd_per_second` | profile → tier → USD per verified second, whatever the resolution, fps or duration. Used for tiers without a VCU rate; cards signed before VCU rates price this way. |
+| `gpu_hour_usd` | family → USD per credited GPU-hour of [capacity pay](#capacity-pay) |
+
+`usd_per_vcu_second` and `gpu_hour_usd` are left out of the file and the signed bytes while empty, so
+cards signed before them still verify. Validators older than a field refuse a card that sets it, so
+upgrade validators before publishing one. It is accepted like the switch:
 the signature must verify, and `issued_at` never goes backwards. A different card with the same
 `issued_at` is ignored. The accepted card is kept in the state file, so a restart can't roll it back.
 A card file that later goes missing or turns bad keeps the accepted card in use (logged). The owner
@@ -460,20 +559,30 @@ python -m kuno_protocol.rate_card template --out rate-card.json     # every rate
 python -m kuno_protocol.rate_card sign --key owner.key --card rate-card.json --out rate-card.signed.json
 ```
 
-**Every rate is a placeholder today.** The owner has not set miner prices. The template derives each
-rate from `PLACEHOLDER_USD_PER_VCU_SECOND` ($0.01 per VCU-weighted second, the open tier at half) and
-marks the card `"placeholder": true`, which is also the default for any card that doesn't say
-otherwise. A placeholder card is logged at error level every round and flagged in the report.
+**Every rate is a placeholder today.** The owner has not set miner prices. The template prices by
+VCU:
+- $0.0019 per VCU on the confidential tier (`PLACEHOLDER_USD_PER_VCU_SECOND`), and 0.75 of that on
+  the open tier;
+- capacity at $0.80 per GPU-hour for `ltx-2.5` and $1.50 for `minimax-h3`.
+
+With the placeholder VCU weights that is about $0.114/s for a 5 s `h3` clip and $0.0095/s for
+`ltx-2.5-fast` at 1080p, within about ±5% of the miner rates recommended in
+research/research_pricing.md §3 (`ltx-2.5-fast` at 720p pays +14%). The template marks the card
+`"placeholder": true`, which is also the default for any card that doesn't say otherwise. A
+placeholder card is logged at error level every round and flagged in the report.
 
 **Reporting.** Each priced round is logged and appended as one JSON line to the pay report:
 
 | Field | Meaning |
 |---|---|
-| `regime`, `subscription` | `undersubscribed`, `oversubscribed`, `balanced` or `no_work`; `subscription` is `Σ owed_i / pool_usd` before renormalizing |
-| `subsidy_ratio` | emission value ÷ miner USD owed, per tempo (`pool_usd_per_tempo / owed_usd_per_tempo`). Above 1, emissions pay miners more than their work is worth at card rates. It should fall as demand grows. |
+| `regime`, `subscription` | `undersubscribed`, `oversubscribed`, `balanced` or `no_work`; `subscription` is `(J + C) / pool_usd`, both after their caps |
+| `job_*`, `revenue_usd_per_tempo` | the job cap: `job_pay_revenue_multiple`, customer revenue per tempo, job owed per tempo at card rates (`job_uncapped_usd_per_tempo`), the cap (`job_cap_usd_per_tempo`), the multiplier that holds job owed under it (`job_scale`, 1 when already under), and job owed after it (`job_usd_per_tempo`) |
+| `residual_to`, `residual_to_capacity_usd_per_tempo` | where an undersubscribed pool's residual went: `capacity` (and how much per tempo), `jobs` (renormalized over job owed, because no capacity is owed) or `none` |
+| `subsidy_ratio` | emission value ÷ miner USD owed after the caps, per tempo (`pool_usd_per_tempo / owed_usd_per_tempo`). Above 1, emissions pay miners more than their work is worth at card rates. It should fall as demand grows. |
 | `emission_to_revenue` | value of everything the subnet mints over the window (owner, validators and miners, both mechanisms) ÷ customer revenue over the window |
-| `revenue_usd_window` | list price of the window's succeeded jobs (replays excluded), from each job's public params and the profile's pricing, or the ledger's `price_usd` if the gateway publishes one. Validators can't see discounts, credits or refunds, and canaries count as revenue. |
-| `miners` | per hotkey: USD owed over the window and per tempo, priced seconds, `job_usd_owed`, `capacity_usd_owed` (after the cap), `capacity_gpu_hours`, raw and final weight |
+| `revenue_usd_window` | customer revenue over the window, replays excluded. It is Σ `billable_usd` (`revenue_billable_usd_window`), so canaries, refunds and promo credit add nothing. Rows from a gateway without the field add their list price instead (`revenue_list_price_usd_window`): the ledger's `price_usd`, else the profile's price in the job's privacy mode. `revenue_jobs`, `unbilled_jobs` (`billable_usd` 0) and `revenue_unknown_jobs` count the jobs. |
+| `miners` | per hotkey: `usd_owed` over the window and per tempo (after both caps), priced seconds, `job_usd_owed` (at card rates) and `job_usd_per_tempo` (after the job cap), `capacity_usd_owed` and `capacity_usd_per_tempo` (after the capacity cap), `residual_usd_per_tempo`, `capacity_gpu_hours`, raw and final weight |
+| `unpaid_seconds` | per hotkey: credited seconds no customer paid for, which earn no job pay |
 | `capacity_*` | [Capacity pay](#capacity-pay): `capacity_share`; capacity owed per tempo before the cap (`capacity_uncapped_usd_per_tempo`), the limit (`capacity_limit_usd_per_tempo`), the multiplier (`capacity_scale`) and after it (`capacity_usd_per_tempo`, `capacity_usd_window`); priced GPU-hours per family (`capacity_gpu_hours`), GPU-hours without a card rate (`capacity_unpriced`), and each family's target, average GPUs, target scale and utilization (`capacity_families`). `owed_usd_*` include capacity. |
 | also | prices and their sources, `miner_burned`, `moving_tao_per_alpha`, `unpriced` seconds, `rate_card_issued_at`, `rate_card_placeholder` |
 

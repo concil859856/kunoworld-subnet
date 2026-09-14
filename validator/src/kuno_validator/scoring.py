@@ -2,14 +2,19 @@
 
 score_m = Σ_family split_f × [(1 − s_f) × VCU_m,f / Σ_miners VCU_f + s_f × C_m,f / Σ_miners C_f]
                                                                         for miners that pass the gates
-VCU_m,f = Σ_jobs rate_tier × profile weight × requested seconds
+VCU_m,f = Σ_paid jobs rate_tier × VCU(profile, resolution, fps, requested seconds)
 
-  VCU        verified video compute units: the profile's per-second weight × the seconds
-             the customer requested in the job's public parameters, for each receipt that
-             survived `ledger.audit_ledger` (customer and canary jobs alike). The miner's
-             own reported duration is only checked, never paid.
+  VCU        verified video compute units (`ModelProfile.vcu_for`): the profile's weight for the job's
+             resolution × its fps multiplier × a duration factor × the seconds the customer requested
+             in the job's public parameters, for each receipt that survived `ledger.audit_ledger`.
+             Weights follow GPU cost (profiles.py, VcuWeights). The miner's own reported duration is
+             only checked, never paid.
+  paid jobs  only jobs customers paid for earn job pay (`earns_job_pay`): a row whose `billable_usd` is 0
+             (validator accounts' canaries and benchmarks, failed or refunded jobs, promo credit) earns no
+             VCU, but still counts for the success rate, canaries, replays, step audits, open-tier
+             admission and capacity pay's served-job gate. Rows without the field earn, as before.
   rate_t     the tier rate of the enclave that ran the job (open_tier.py): 1 for the confidential tier,
-             KUNO_OPEN_TIER_RATE (default 0.5) for the open tier; entries without a tier earn at 1
+             KUNO_OPEN_TIER_RATE (default 0.75) for the open tier; entries without a tier earn at 1
   split_f    the owner-signed switch's emission share for each family in use
   gates      a currently attested enclave; success rate ≥ min_success once a miner has
              at least min_samples finished jobs in the window; and no penalty in the
@@ -36,10 +41,14 @@ don't.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from kuno_protocol.profiles import ModelProfile
+from pydantic import ValidationError
+
+from kuno_protocol.profiles import ModelProfile, ParamError
+from kuno_protocol.schemas import GenerationParams
 from kuno_protocol.switch import SwitchConfig
 from kuno_protocol.tiers import OPEN
 
@@ -57,10 +66,13 @@ class MinerScore:
     score: float = 0.0
     # Observations that did not disqualify the miner (e.g. an uncredited duration mismatch).
     flags: list[str] = field(default_factory=list)
-    # Families with a succeeded, credited confidential-tier job in the window: capacity pay needs one per family.
+    # Families with a succeeded, credited confidential-tier job in the window, paid or not (a canary counts): capacity pay
+    # needs one per family.
     served: set[str] = field(default_factory=set)
     # Capacity pay: gated GPU-seconds per family after the target cap. Empty unless the switch pays for capacity.
     capacity: dict[str, float] = field(default_factory=dict)
+    # Credited jobs that earned no job pay because no customer paid for them (`earns_job_pay`).
+    unpaid_jobs: int = 0
 
     @property
     def success_rate(self) -> float:
@@ -111,6 +123,42 @@ def billable_seconds(entry: dict) -> float | None:
     return float(seconds) if isinstance(seconds, (int, float)) else None
 
 
+def earns_job_pay(entry: Mapping) -> bool:
+    """Only paid jobs earn job pay, in VCU and USD mode alike.
+
+    `billable_usd` is the real customer money the gateway says a job earned the network. It is 0 for validator accounts'
+    jobs (canaries, standard canaries, Turbo benchmarks), for failed or refunded jobs and for the promo-credit-funded
+    share, and such a job earns no job pay. It still counts everywhere else: the success rate, canary checks and
+    penalties, replay and dedupe, step audits, open-tier admission probes, and capacity pay's served-job gate. Rows from
+    gateways that predate the field are billable, as every job was before it existed.
+    """
+    value = entry.get("billable_usd")
+    if value is None:
+        return True
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+
+def job_vcu(profile: ModelProfile, entry: Mapping, seconds: float) -> float:
+    """VCU for an audited job's billable seconds (`ModelProfile.vcu_for`), from the public params `audit_ledger` bound to
+    the signed digest. Rows without params use the ledger's `resolution` and `fps`; rows without either, or with a
+    resolution this validator's profiles have no weight for, the lowest resolution's weight (`ModelProfile.vcu`)."""
+    params = entry.get("params")
+    if params is not None:
+        try:
+            return profile.vcu_for(GenerationParams.model_validate(params), seconds)
+        except (ValidationError, ParamError):
+            pass
+    resolution, fps = entry.get("resolution"), entry.get("fps")
+    if isinstance(resolution, str):
+        if not isinstance(fps, int) or isinstance(fps, bool):
+            fps = profile.limits.default_fps
+        try:
+            return profile.vcu_at(resolution, fps, seconds)
+        except ParamError:
+            pass
+    return profile.vcu(seconds)
+
+
 def compute_scores(
     ledger: list[dict],
     attested_hotkeys: set[str],
@@ -137,10 +185,14 @@ def compute_scores(
         if entry["status"] == "succeeded" and entry.get("receipt") and profile is not None:
             seconds = billable_seconds(entry)
             if seconds is not None:
-                rate = float((tier_rates or {}).get(entry.get("tier") or "", 1.0))
-                miner.work[profile.family] = miner.work.get(profile.family, 0.0) + profile.vcu(seconds) * rate
+                # Paid or not, a credited confidential-tier job shows the miner can serve the family (capacity pay's gate).
                 if entry.get("tier") != OPEN:
                     miner.served.add(profile.family)
+                if earns_job_pay(entry):
+                    rate = float((tier_rates or {}).get(entry.get("tier") or "", 1.0))
+                    miner.work[profile.family] = miner.work.get(profile.family, 0.0) + job_vcu(profile, entry, seconds) * rate
+                else:
+                    miner.unpaid_jobs += 1
             miner.succeeded += 1
         elif entry["status"] == "failed" and entry.get("error_code") in MINER_FAULT_CODES:
             miner.failed += 1
@@ -157,6 +209,8 @@ def compute_scores(
             miner.reasons.append(f"success rate {miner.success_rate:.1%} is below {min_success:.0%}")
         miner.reasons.extend((penalties or {}).get(miner.hotkey, []))
         miner.flags.extend((flags or {}).get(miner.hotkey, []))
+        if miner.unpaid_jobs:
+            miner.flags.append(f"{miner.unpaid_jobs} verified job(s) earn no job pay: no customer paid for them (billable_usd 0)")
 
     eligible = [m for m in miners.values() if not m.reasons]
     # With capacity_share 0 nothing below touches capacity, so every score is exactly the VCU score.

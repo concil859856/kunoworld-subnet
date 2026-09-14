@@ -3,8 +3,6 @@ only exercised through the end-to-end tests."""
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from kuno_protocol.profiles import load_profiles
@@ -33,10 +31,14 @@ def score(ledger, attested=("A", "B"), switch=None, **kwargs):
     return compute_scores(ledger, set(attested), PROFILES, switch or SwitchConfig(), NOW, **kwargs)
 
 
-def test_pay_is_proportional_to_verified_video_seconds():
-    scores = score([job("A", "ltx-2.5-fast", 5), job("B", "ltx-2.5-fast", 15)])
+def test_pay_is_proportional_to_verified_video_compute_units():
+    scores = score([job("A", "ltx-2.5-fast", 5)] + [job("B", "ltx-2.5-fast", 5) for _ in range(3)])
     weights = normalize(scores)
     assert weights["A"] == pytest.approx(0.25) and weights["B"] == pytest.approx(0.75)
+    # A longer clip costs more GPU time per second, so one 15 s clip is worth more than three 5 s ones.
+    fast = PROFILES["ltx-2.5-fast"]
+    longer = normalize(score([job("A", "ltx-2.5-fast", 5), job("B", "ltx-2.5-fast", 15)]))
+    assert longer["A"] == pytest.approx(fast.vcu(5) / (fast.vcu(5) + fast.vcu(15))) and fast.vcu(15) > 3 * fast.vcu(5)
 
 
 def test_heavier_models_earn_more_per_second():
