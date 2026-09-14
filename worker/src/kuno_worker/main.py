@@ -57,8 +57,8 @@ def check_safety(config: WorkerConfig, gate) -> None:
     """A production (TDX) worker refuses to start without a working prompt classifier and frame classifier.
 
     Private content is judged only inside the enclave, so these checks are the whole safety story there.
-    Mock (dev) workers keep the permissive default; open-tier workers run the same gate, and the platform
-    also moderates standard content server-side.
+    Mock (dev) and open-tier workers may start without classifiers, but every worker still enforces the
+    shared content policy (all sexual content banned); for standard jobs the gateway runs that policy too.
     """
     if config.tee != "tdx":
         return

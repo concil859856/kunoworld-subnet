@@ -70,9 +70,16 @@ def read_prompts(path: Path) -> list[str | dict]:
 def new_eval_set(competition_id: str, window: int, prompts: list[str | dict], durations: list[float]) -> EvalSet:
     if not prompts or not durations:
         raise TurboError("an eval set needs prompts and durations")
+    from .content_policy import ContentPolicyViolation, check_prompt
+
     items = []
     for index, prompt in enumerate(prompts):
         item = prompt if isinstance(prompt, dict) else {"prompt": prompt}
+        try:
+            # A benchmark prompt the network's own policy blocks would count against honest miners.
+            check_prompt(item["prompt"])
+        except ContentPolicyViolation:
+            raise TurboError(f"eval prompt {index} violates the content policy; replace it") from None
         items.append(
             EvalPrompt(
                 id=secrets.token_hex(6),

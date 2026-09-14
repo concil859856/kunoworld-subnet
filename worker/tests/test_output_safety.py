@@ -142,15 +142,18 @@ def test_the_gate_samples_at_the_largest_model_input_size(mock_video):
     ("policy", "rows", "signals", "expected"),
     [
         (FramePolicy(), [{"sexual": 0.6, "minor": 0.0}], None, "sexual"),
+        (FramePolicy(), [{"sexual": 0.95, "minor": 0.05}], None, "sexual"),  # adult explicit content: always banned
+        (FramePolicy(), [{"sexual": 0.42, "minor": 0.0}], None, "sexual"),  # nudity below even odds
+        (FramePolicy(), [{"sexual": 0.1, "suggestive": 0.85, "minor": 0.0}], None, "sexual"),  # sexualised, not nude
+        (FramePolicy(), [{"sexual": 0.05, "suggestive": 0.6, "minor": 0.0}], None, None),  # swimwear-like, adults only
         (FramePolicy(), [{"sexual": 0.01, "suggestive": 0.02, "minor": 0.95}], None, None),  # kids at the beach
         (FramePolicy(), [{"sexual": 0.3, "minor": 0.5}], None, "sexual_minors"),  # below the explicit bar, still blocked
-        (FramePolicy(allow_explicit=True), [{"sexual": 0.95, "minor": 0.05}], None, None),
-        (FramePolicy(allow_explicit=True), [{"sexual": 0.2, "minor": 0.4}], None, "sexual_minors"),
-        (FramePolicy(allow_explicit=True), [{"sexual": 0.05, "suggestive": 0.55, "minor": 0.5}], None, "sexual_minors"),
+        (FramePolicy(), [{"sexual": 0.2, "minor": 0.4}], None, "sexual_minors"),
+        (FramePolicy(), [{"sexual": 0.05, "suggestive": 0.55, "minor": 0.5}], None, "sexual_minors"),
         # A minor in one frame and sexual content in another block together.
-        (FramePolicy(allow_explicit=True), [{"sexual": 0.0, "minor": 0.9}, {"sexual": 0.3, "minor": 0.0}], None, "sexual_minors"),
+        (FramePolicy(), [{"sexual": 0.0, "minor": 0.9}, {"sexual": 0.3, "minor": 0.0}], None, "sexual_minors"),
         # Without a minor-presence model a minor is assumed.
-        (FramePolicy(allow_explicit=True), [{"sexual": 0.2}], None, "sexual_minors"),
+        (FramePolicy(), [{"sexual": 0.2}], None, "sexual_minors"),
         (FramePolicy(), [{"sexual": 0.05}], None, None),
         # A prompt naming a minor overrides a detector that saw none.
         (FramePolicy(), [{"sexual": 0.2, "minor": 0.0}], RequestSignals(mentions_minor=True), "sexual_minors"),
@@ -168,12 +171,28 @@ def test_invalid_scores_are_rejected(bad):
 
 
 def test_policy_settings_come_from_the_environment():
-    policy = FramePolicy.from_env({"KUNO_SAFETY_ALLOW_NSFW": "1", "KUNO_SAFETY_FRAME_THRESHOLDS": '{"minor": 0.2}'})
-    assert policy.allow_explicit and policy.minor == 0.2 and policy.minor_sexual == FramePolicy.minor_sexual
-    assert not FramePolicy.from_env({}).allow_explicit  # strict by default
-    for bad in ('{"sexy": 0.3}', '{"minor": 2}', "[0.3]"):
+    policy = FramePolicy.from_env({"KUNO_SAFETY_FRAME_THRESHOLDS": '{"minor": 0.2, "sexual": 0.3}'})
+    assert policy.minor == 0.2 and policy.sexual == 0.3 and policy.minor_sexual == FramePolicy.minor_sexual
+    assert FramePolicy.from_env({}) == FramePolicy()
+    # Unknown keys, nonsense, and anything looser than the default are refused.
+    for bad in ('{"sexy": 0.3}', '{"minor": 2}', "[0.3]", '{"sexual": 0.9}', '{"suggestive": 0.95}',
+                '{"minor_sexual": 0.5}', '{"sexual": true}', '{"allow_explicit": 1}'):
         with pytest.raises(ValueError):
             FramePolicy.from_env({"KUNO_SAFETY_FRAME_THRESHOLDS": bad})
+
+
+def test_there_is_no_way_to_allow_sexual_content(indexed_clip):
+    assert "allow_explicit" not in FramePolicy.__dataclass_fields__
+    env = {"KUNO_SAFETY_CLASSIFIER": "none", "KUNO_SAFETY_ALLOW_NSFW": "1"}
+    assert SafetyGate.from_env(env).frame_policy == FramePolicy()  # the old switch is ignored
+    assert FramePolicy.from_env(env).decide([{"sexual": 0.95, "suggestive": 0.99, "minor": 0.0}]) == "sexual"
+    gate = SafetyGate.from_env(env)
+    gate.frame_classifiers = [Scorer({"sexual": 0.95, "minor": 0.0})]
+    with pytest.raises(SafetyViolation) as exc:
+        gate.check_output(indexed_clip[0])
+    assert exc.value.category == "sexual"
+    for module in (safety, __import__("kuno_worker.safety_frames", fromlist=["x"])):
+        assert "ALLOW_NSFW" not in Path(module.__file__).read_text()
 
 
 @pytest.mark.parametrize(

@@ -263,10 +263,12 @@ Every registration and re-registration carries your hotkey proof; the gateway re
 registrations without one on every network. Your hardware dictionary (`KUNO_HW_*`) is published as
 self-reported and is never treated as a verified identity.
 
-**Content safety.** The worker runs the same in-process safety gate (blocklist, and the prompt and
-frame classifiers when configured). The platform also moderates standard content server-side,
-since it can read it. Unlike a TDX worker, an open-tier worker starts without classifiers, but
-configure them anyway: blocked jobs cost you nothing, delivered abuse does.
+**Content safety.** The worker runs the same in-process safety gate (the shared content policy,
+and the prompt and frame classifiers when configured). All sexual content is banned in both
+modes, and no setting allows it. The gateway runs the same content policy on the standard prompts
+it can read; nobody at KunoWorld browses stored videos. Unlike a TDX worker, an open-tier worker
+starts without classifiers, but configure them anyway: blocked jobs cost you nothing, delivered
+abuse does.
 
 **How you are checked.** Attestation proves nothing here, so:
 - **Step audits.** Every receipt on a verified profile must carry a step commitment. Validators

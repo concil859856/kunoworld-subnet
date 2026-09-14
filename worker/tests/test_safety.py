@@ -1,6 +1,7 @@
-"""The safety gate: obfuscation-resistant blocklist, pluggable classifiers that fail
-closed, and the unchanged contract worker.py relies on. Classifiers here are fakes;
-the real models are never downloaded in tests."""
+"""The safety gate: the shared content policy as its first stage (all sexual content banned),
+pluggable classifiers that fail closed, and the unchanged contract worker.py relies on.
+Classifiers here are fakes; the real models are never downloaded in tests. The policy's own
+cases live in subnet/protocol/tests/test_content_policy.py."""
 
 from __future__ import annotations
 
@@ -11,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from kuno_protocol import content_policy
+from kuno_protocol.content_policy import ContentPolicyViolation
 from kuno_worker import safety
 from kuno_worker.backends.media_tools import ffmpeg_exe
 from kuno_worker.safety import (
@@ -75,13 +78,51 @@ def test_the_worker_contract_is_unchanged():
     assert check_request("A lighthouse in a storm") is None
 
 
-def test_violation_messages_never_vary_with_the_request():
+@pytest.mark.parametrize("prompt", [f"csam {SECRET}", f"a naked woman {SECRET}"])
+def test_violation_messages_never_vary_with_the_request(prompt):
     with pytest.raises(SafetyViolation) as exc:
-        check_request(f"csam {SECRET}")
+        check_request(prompt)
     assert SECRET not in str(exc.value) and str(exc.value) == "request violates the acceptable use policy"
 
 
-# ---------------------------------------------------------------- stage 1
+# ---------------------------------------------------------------- stage 1: the shared content policy
+
+
+def test_the_worker_enforces_the_shared_content_policy(monkeypatch):
+    assert SafetyViolation is ContentPolicyViolation
+    calls = []
+
+    def recording(prompt, negative_prompt=None):
+        calls.append((prompt, negative_prompt))
+        raise ContentPolicyViolation("sexual")
+
+    monkeypatch.setattr(content_policy, "check_prompt", recording)
+    with pytest.raises(SafetyViolation):
+        check_request("a lighthouse", "blurry")
+    assert calls == [("a lighthouse", "blurry")]
+
+
+@pytest.mark.parametrize(
+    ("prompt", "negative"),
+    [("a naked woman on a bed", None), ("sexy woman in lingerie", None), ("chicken breast on the grill", None),
+     ("an adult model on a runway", "clothes"), ("teen nsfw", None), ("a lighthouse in a storm", "nsfw, nude")],
+)
+def test_worker_and_gateway_block_exactly_the_same_prompts(prompt, negative):
+    def outcome(fn):
+        try:
+            fn(prompt, negative)
+        except ContentPolicyViolation as exc:
+            return exc.category
+        return None
+
+    assert outcome(check_request) == outcome(content_policy.check_prompt)
+
+
+@pytest.mark.parametrize("prompt", ["a naked woman", "two people having sex", "erotic roleplay", "foot fetish", "p0rn"])
+def test_adult_sexual_content_is_blocked_in_the_enclave(prompt):
+    with pytest.raises(SafetyViolation) as exc:
+        check_request(prompt)
+    assert exc.value.category == "sexual"
 
 
 @pytest.mark.parametrize(
@@ -123,7 +164,7 @@ def test_obfuscated_abuse_is_blocked(prompt):
         "A 40 year old chef plating dessert",
         "A physics amateur explains lasers",
         "Sexy sports car commercial on a mountain road",
-        "A nude marble statue in a museum, slow dolly",
+        "Breast cancer awareness walk, slow dolly",
         "A comic strip comes alive for kids",
         "A toddler laughing at bubbles, 5 years old",
         "Chicken breasts sizzling, kids waiting for dinner",
@@ -141,9 +182,9 @@ def test_absolute_terms_in_negative_prompts_still_block():
     assert blocked("a playground", "csam")
 
 
-def test_steering_a_minor_toward_nudity_through_the_negative_prompt_is_blocked():
+def test_steering_toward_nudity_through_the_negative_prompt_is_blocked():
     assert blocked("an 11 year old girl on a bed", "clothes, clothing")
-    assert not blocked("an adult model on a runway", "clothes")
+    assert blocked("an adult model on a runway", "clothes")  # nudity is banned for adults too
 
 
 # ---------------------------------------------------------------- stage 2
@@ -260,8 +301,22 @@ def test_a_configured_classifier_that_cannot_load_fails_closed(env):
 
 
 def test_require_and_thresholds_come_from_the_environment():
-    gate = SafetyGate.from_env({"KUNO_SAFETY_CLASSIFIER": "none", "KUNO_SAFETY_REQUIRE_CLASSIFIER": "1", "KUNO_SAFETY_THRESHOLDS": '{"violence": 0.4}'})
-    assert gate.require_classifier and gate.thresholds["violence"] == 0.4 and gate.thresholds["sexual"] == 0.5
+    gate = SafetyGate.from_env({"KUNO_SAFETY_CLASSIFIER": "none", "KUNO_SAFETY_REQUIRE_CLASSIFIER": "1", "KUNO_SAFETY_THRESHOLDS": '{"violence": 0.4, "sexual": 0.3}'})
+    assert gate.require_classifier and gate.thresholds["violence"] == 0.4 and gate.thresholds["sexual"] == 0.3
+
+
+@pytest.mark.parametrize("overrides", ['{"sexual": 0.9}', '{"sexual_minors": 1.0}', '{"sexual": "off"}', "[0.9]"])
+def test_the_environment_cannot_loosen_the_sexual_content_ban(overrides):
+    with pytest.raises(ValueError):
+        SafetyGate.from_env({"KUNO_SAFETY_CLASSIFIER": "none", "KUNO_SAFETY_THRESHOLDS": overrides})
+
+
+@pytest.mark.parametrize(("category", "score"), [("sexual", 0.5), ("sexual_minors", 0.3)])
+def test_sexual_categories_block_at_their_ceiling_even_with_looser_thresholds(category, score):
+    for thresholds in ({category: 1.0}, {}):
+        with pytest.raises(SafetyViolation):
+            SafetyGate(classifier=FakeClassifier({category: score}), thresholds=thresholds).check_request("x")
+    assert "allow_nsfw" not in SafetyGate().status()
 
 
 # ---------------------------------------------------------------- output frames

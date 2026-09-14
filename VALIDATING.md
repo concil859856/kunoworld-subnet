@@ -154,7 +154,10 @@ counts the miner-caused ones. A canary that the switch reroutes to another famil
 as failed but not attributed.
 
 Keep your canary prompt set private and rotate it, drawn from the same distribution as real
-traffic. The prompts in `canaries.py` are a public fallback: miners can read them.
+traffic. The prompts in `canaries.py` are a public fallback: miners can read them. Every canary
+prompt must pass `kuno_protocol.content_policy.check_prompt`: the enclave and the gateway run
+that list on every job, and sexual content is banned in both modes, so a canary that breaks it
+comes back `safety_blocked` and tells you nothing about the miner.
 
 ## Hardware dedupe
 

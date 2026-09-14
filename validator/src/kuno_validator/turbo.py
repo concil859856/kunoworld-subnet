@@ -386,6 +386,22 @@ def leading_streak(spec: TurboSpec, finalized: Mapping[int, Mapping[str, float]]
     return streak
 
 
+def drop_blocked_prompts(eval_set: EvalSet) -> EvalSet:
+    """The eval set minus prompts the content policy blocks. A miner must refuse those, so benchmarking with them
+    would count an honest miner's `safety_blocked` against it. The commitment was verified on the full set first."""
+    from kuno_protocol.content_policy import ContentPolicyViolation, check_prompt
+
+    kept = []
+    for prompt in eval_set.prompts:
+        try:
+            check_prompt(prompt.prompt)
+        except ContentPolicyViolation:
+            log.error("eval prompt %s in window %d violates the content policy and is skipped", prompt.id, eval_set.window)
+            continue
+        kept.append(prompt)
+    return eval_set if len(kept) == len(eval_set.prompts) else eval_set.model_copy(update={"prompts": kept})
+
+
 def exclude_benchmark_rows(rows: list[dict], enclaves: list[dict], benchmark_job_ids: Iterable[str] = ()) -> list[dict]:
     """Serving-ledger rows minus Turbo benchmark work, which mechanism 1 already pays for: jobs this
     validator dispatched as benchmarks, and anything run by a candidate enclave."""
@@ -644,7 +660,7 @@ class TurboTrack:
         except (ValueError, TurboError) as exc:
             log.error("eval set for window %d refused: %s", window, exc)
             return None
-        return eval_set
+        return drop_blocked_prompts(eval_set)
 
     def submissions(self, spec: TurboSpec) -> list[AcceptedSubmission]:
         accepted, rejected = collect_submissions(spec, self.commitments(), self.fetch)

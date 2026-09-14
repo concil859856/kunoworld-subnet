@@ -233,6 +233,15 @@ Worker calls after registration carry `X-Kuno-Enclave`, `X-Kuno-Timestamp` (Unix
 "kuno/v1/request" \n METHOD \n path?query \n timestamp \n hex(SHA-256(body))
 ```
 
+## Content policy
+
+Every implementation enforces the same prompt policy: `kuno_protocol.content_policy.check_prompt(prompt,
+negative_prompt)`, which raises `ContentPolicyViolation` with a `category` of `sexual_minors`,
+`sexual_deepfake` or `sexual`. All sexual content is banned in both privacy modes. Workers call it
+inside the enclave for every job, and gateways call it wherever they can read the prompt. A worker
+reports a block as `safety_blocked` with a fixed message that never depends on the prompt; the
+category is never sent. A worker whose configured classifiers cannot run reports `internal_error`.
+
 ## Receipts (certificates)
 
 Ed25519 by the enclave's attested signing key over `"kuno/v1/receipt\n" + canonical_json(body)`.

@@ -1,9 +1,10 @@
 # Security model
 
-KunoWorld's promise is narrow and precise: **the operator of a GPU cannot read the prompts,
-reference media or videos that pass through it, and anyone can verify which model produced
-a video on which attested hardware.** This document states what that does and does not
-cover.
+KunoWorld's promise is narrow and precise: **in Private mode, the operator of a GPU cannot read
+the prompts, reference media or videos that pass through it, and anyone can verify which model
+produced a video on which attested hardware.** Standard mode gives that up by design: KunoWorld
+and the GPU provider can read Standard jobs ([PRIVACY_MODES.md](PRIVACY_MODES.md) says plainly
+who can see what in each mode). This document states what the promise does and does not cover.
 
 **This is the design, not yet the deployed reality.** Several layers below are not built; the
 [Current state](#current-state) section lists them, and none of this is a guarantee until they
@@ -13,14 +14,15 @@ land.
 
 | Layer | Protects against | Mechanism |
 |---|---|---|
-| End-to-end encryption | the platform, the network, the GPU host | HPKE to a key that exists only inside the enclave; the output is sealed to a key only the customer holds |
+| End-to-end encryption (Private mode) | the platform, the network, the GPU host | HPKE to a key that exists only inside the enclave; the output is sealed to a key only the customer holds. Standard mode is not end to end: the gateway seals the job and decrypts the result |
+| Storage and access | anyone but the owner opening a stored video | videos are stored on Cloudflare R2 until their owner deletes them: Private ones as ciphertext under a key only the customer holds, Standard ones encrypted at rest. The gateway serves a video only to the account that made it. Operators open content only for a report of child sexual abuse material or under a legal preservation hold, and every view is logged — *enforced by the gateway in the private platform repository; nothing in this repository can prove it* |
 | Parameter binding | a relay silently changing what you asked for | the public job parameters are the AEAD associated data, so any change makes decryption fail inside the enclave |
 | Attestation | a miner running different code or fake hardware | Intel TDX quote (DCAP, via dcap-qvl) plus NVIDIA GPU evidence (NRAS or `nvattest`), bound to a fresh validator nonce and to the enclave's own keys, checked against an owner-signed manifest of measurements. The gateway and every validator build the same policy (`KUNO_ATTESTATION=production` refuses to start without both verifiers) — *tested against sample quotes and simulated NVIDIA responses; not yet run against a live TDX + NVIDIA CC machine*. **Open-tier miners (`tee: "open"`) attest nothing**: they are admitted only where the owner-signed manifest enables the open tier, serve standard jobs only, never private ones, and rely on step audits, collateral and admission probes instead ([PRIVACY_MODES.md](PRIVACY_MODES.md)) |
 | Hotkey proof | claiming another miner's hotkey (and its rewards) | the worker signs the registration nonce, enclave id and enclave signing key with the miner's sr25519 hotkey; the gateway credits an enclave's hotkey only when the proof verifies; production requires it, and so does the open tier on every network |
 | Signed receipts | claims about work that never happened; a gateway misreporting work | every result is signed by the attested enclave key. Validators re-verify each ledger receipt against a key bound to the enclave id, pay only the duration the customer requested, and treat a digest delivered twice as a replay |
 | Canary audits | a miner serving a cheaper or broken model behind a valid quote | validator jobs indistinguishable from customer traffic. The output is checked against its receipt and its own MP4 structure; a failure attributable to a miner zeroes its weight for the window. In verified mode every receipt also commits to each denoising step, and validators open and bitwise-replay a random step of their own canaries ([VERIFIED_MODE.md](VERIFIED_MODE.md)) — *the GPU executors have not run on real hardware* |
 | Owner-signed switch | a gateway redirecting emissions between model families | validators accept only an owner-signed switch whose `issued_at` does not go backwards |
-| Content safeguards | generating material that breaks the acceptable use policy | a normalized blocklist and a pluggable prompt classifier inside the enclave, and a check of frames sampled from every finished video before it is signed or sealed ([Output safety](#output-safety)) — *no classifier weights ship in an image yet* |
+| Content safeguards | generating material that breaks the acceptable use policy, including any sexual content, which is banned in both modes | the shared content policy (`kuno_protocol.content_policy`: the same list at the gateway and in the enclave), a pluggable prompt classifier inside the enclave, and a check of frames sampled from every finished video before it is signed or sealed ([Output safety](#output-safety)). No setting allows sexual content — *no classifier weights ship in an image yet* |
 | C2PA provenance | a clip losing its origin once separated from its receipt | a C2PA manifest embedded before sealing, signed with the enclave key under a short-lived certificate that the gateway's CA issues only to a freshly attested enclave, timestamped so it outlives the certificate ([PROVENANCE.md](PROVENANCE.md)) — *the root is not on the C2PA Trust List* |
 | Uniqueness rules | one machine posing as many miners | verified hardware identities (the TDX platform's PPID, each GPU's UEID) bound to one hotkey's live enclave at the gateway, deduplicated again by validators from their own challenges, plus per-GPU registration collateral read from the chain — *the collateral amount per GPU is not set yet*. Open-tier hardware is self-reported and never deduplicated: one machine posing as many open-tier miners is limited only by higher collateral per GPU, per-hotkey admission probes and a lower earning rate |
 
@@ -38,13 +40,18 @@ land.
   implemented. Neither eliminates it.
 - **What the model itself does.** Attestation proves which code ran, not that the model is
   well-behaved. That is why content safeguards run inside the enclave
-  (`worker/src/kuno_worker/safety.py`):
-  - **Blocklist.** It folds homoglyphs, leetspeak, zero-width characters, spaced-out letters
-    and repeated letters before matching. It blocks sexual content involving minors outright,
-    and also sexual deepfakes of real people.
+  (`worker/src/kuno_worker/safety.py`). All sexual content is banned in both modes:
+  - **Content policy.** `kuno_protocol.content_policy.check_prompt`, the same function the
+    gateway runs. It folds homoglyphs, leetspeak, zero-width characters, spaced-out letters
+    and repeated letters before matching. It blocks pornography, nudity, sexual acts, fetish
+    content, sexualised depictions and erotic roleplay, and treats sexual content involving
+    minors and sexual deepfakes of real people as the gravest categories. A short list of
+    ordinary phrases with ambiguous words ("breast cancer", "chicken breast", "nude colour
+    palette", "the sex of a bird") passes through narrow allow-contexts.
   - **Prompt classifier.** The recommended model is Qwen3Guard-Gen-0.6B, Apache-2.0, run on
-    CPU from local weights. Once configured, any failure to load or answer refuses the job;
-    it never lets the job through.
+    CPU from local weights. Its sexual categories block at "Controversial" and above, and
+    `KUNO_SAFETY_THRESHOLDS` can lower those thresholds but not raise them. Once configured,
+    any failure to load or answer refuses the job; it never lets the job through.
   - **Frame check.** Classifiers over frames sampled from the rendered video, run before
     the video is signed, sealed or uploaded. See [Output safety](#output-safety).
 
@@ -53,8 +60,13 @@ land.
     weights; the frame adapters have, on benign synthetic clips only.
   - A worker without `KUNO_SAFETY_CLASSIFIER` or `KUNO_SAFETY_FRAME_MODEL_PATH` logs that as
     an error but keeps serving, unless `KUNO_SAFETY_REQUIRE_CLASSIFIER=1`. With that set,
-    which production images must do, it refuses to start without both.
-  - A blocklist catches known phrasings, not intent.
+    which production images must do, it refuses to start without both. An open-tier worker
+    is not attested, so nothing proves it runs the checks at all; the gateway's own check of
+    Standard prompts is the one it cannot skip.
+  - The content policy catches known phrasings, not intent. It is mostly English, and it has
+    known false positives (for example "orgy of colour", clothing words in a negative prompt)
+    and false negatives (coded language, other languages, a sexual request hidden behind an
+    allow-context phrase). Its docstring lists them. The classifiers exist for what it misses.
 - **The gateway's account of failures.** Failed jobs carry no receipt, so the reliability gate
   trusts the gateway's error codes, and a canary that never returns cannot be pinned on a miner.
   Replay detection sees only the scoring window. Validators map enclaves to hotkeys from the
@@ -63,10 +75,21 @@ land.
   see manifests as trusted; everyone else sees them as intact but `signingCredential.untrusted`
   until the root is on the C2PA Trust List. Revocation relies on day-long certificates, not CRLs.
   Any tool that re-encodes a video strips the manifest.
+- **Standard-mode content.** Standard jobs are readable by KunoWorld's gateway, by the GPU
+  provider (an open-tier miner holds them in ordinary memory), and, for the prompt, seed and
+  parameters, by any registered validator that audits the job. The rule that nobody at
+  KunoWorld opens them except for a report of child sexual abuse material or a legal hold is
+  enforced by access control and logging, not by cryptography.
+- **Operator access to reported or held content.** An operator who opens content for a report
+  or a hold sees it in full, including a Private video whose key a reporter supplied. The view
+  is logged, but the log records the access; it does not prevent it.
 - **The customer's own device.** The output key lives in the browser or the SDK process. If
   that machine is compromised, so is the video.
+- **Lost keys.** A Private video's key is held only by the customer. If it is lost, the stored
+  ciphertext is permanently unreadable and cannot be recovered.
 - **Metadata the platform needs to bill.** The gateway sees account, model, duration,
-  resolution and input roles — never content.
+  resolution and input roles for every job, and the content of Standard jobs — never the
+  content of Private jobs.
 - **Availability.** A miner can refuse work; it cannot read it.
 
 ## Output safety
@@ -105,13 +128,14 @@ frame and sexual content in another block together.
 |---|---|---|
 | Sexual content with an apparent minor blocks | `minor` ≥ 0.3 and (`sexual` ≥ 0.15 or `suggestive` ≥ 0.5) | This is the absolute prohibition, so the thresholds sit far below "probably". A young-looking adult is treated as a minor here. On the recommended models, benign clips peaked at 0.012 `sexual` (a flat grey frame). `minor` reached 0.22 on a photo of cats and 0.20 on an adult seen from behind, so the 0.3 margin is thin. |
 | With no minor model configured, or a prompt that names a minor (blocklist match) | a minor is assumed present | Errs toward blocking when the detector is missing or the request has already said what it wants. |
-| Explicit sexual content blocks | `sexual` ≥ 0.5 unless `KUNO_SAFETY_ALLOW_NSFW=1` | The terms draft does not ban adult content outright. It does ban non-consensual intimate imagery of real people, which frames cannot tell apart from consensual content, and the model licenses carry their own acceptable use policies. Strict is the default; allowing adult content is a deliberate owner decision. |
+| Sexual content and nudity block, always | `sexual` ≥ 0.4 | All sexual content is banned in both modes, so the threshold sits below even odds and over-blocking is the preferred error. There is no setting that allows it. |
+| Sexualised content without nudity blocks | `suggestive` ≥ 0.8 | Sexualised depictions are banned too. The bar is high because the suggestive class also covers ordinary swimwear and dance clips; the content policy catches sexualised intent in the prompt. Not evaluated. |
 | Any other category a frame model reports | the ordinary `KUNO_SAFETY_THRESHOLDS` | — |
 
-Thresholds can be overridden with `KUNO_SAFETY_FRAME_THRESHOLDS`, for example
-`{"minor": 0.25, "minor_sexual": 0.1}`. Here `sexual` covers explicit content and nudity
-(Freepik's medium and high). `suggestive` covers sexualized content that is not explicit
-(low, medium and high).
+Thresholds can only be tightened: `KUNO_SAFETY_FRAME_THRESHOLDS`, for example
+`{"minor": 0.25, "minor_sexual": 0.1}`, refuses any value above the default, and the worker
+then does not start. Here `sexual` covers explicit content and nudity (Freepik's medium and
+high). `suggestive` covers sexualised content that is not explicit (low, medium and high).
 
 **Failing closed.** A configured frame model that is missing, unloadable, or has labels the
 policy does not recognize makes the worker refuse every job before generation. So do a
@@ -126,7 +150,8 @@ in logs.
   content this exists for needs a vetted evaluation set handled under the subnet owner's
   legal process. Never assemble one ad hoc.
 - *Zero-shot age estimation is coarse.* Expect false positives on young-looking adults,
-  which block adult content when adult content is allowed. Expect false negatives on
+  which block their mildly suggestive clips (swimwear, dance) at the lower minor thresholds.
+  Expect false negatives on
   partially visible, stylized or unusually lit children. OpenAI's CLIP model card calls
   deployed use out of scope without in-domain testing.
 - *Evasion.* The check only sees sampled frames. A few flashed frames between samples,
@@ -166,16 +191,22 @@ Not implemented yet:
   built), and published golden measurements;
 - a chosen per-GPU collateral amount, output padding, and the enterprise tier;
 - shipped classifier weights (frame models are chosen and their hashes pinned in
-  `image/CVM.md`, but no image bakes them in yet), and any accuracy evaluation of them;
+  `image/CVM.md`, but no image bakes them in yet), and any accuracy evaluation of them or of
+  the content policy's word lists on real traffic;
 - C2PA Trust List membership for the KunoWorld root.
+
+Outside this repository: R2 storage, deletion, the owner-only access rule, operator access
+for reports and legal holds, and its logging are implemented in the private platform
+gateway. They are not tested here and have not been validated against live infrastructure.
 
 What is in place and tested against a simulated TEE:
 - the attestation types, bindings and policy checks, used by the gateway and validators;
 - hotkey proofs, the hardware-identity registry and validator dedupe, and collateral gating
   (the chain read was checked read-only against finney);
 - validator receipt re-verification, the replay and canary penalties, and the switch rules;
-- the safety pipeline, with fake classifiers, including the output check wired into the
-  worker; the frame adapters also load and score real weights on CPU (benign clips only);
+- the safety pipeline, with fake classifiers, including the shared content policy and the
+  output check wired into the worker; the frame adapters also load and score real weights on
+  CPU (benign clips only);
 - C2PA manifests signed under gateway-issued certificates that verify as trusted against the
   KunoWorld root.
 

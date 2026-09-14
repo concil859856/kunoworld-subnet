@@ -6,6 +6,7 @@ inside a confidential VM, and the validator.
 - [PROTOCOL.md](PROTOCOL.md) — the byte-level wire spec every implementation must match
 - [MINING.md](MINING.md) — running a miner: what to rent, weights, dev network, mainnet
 - [VALIDATING.md](VALIDATING.md) — running a validator: attestation, canaries, scoring, weights
+- [PRIVACY_MODES.md](PRIVACY_MODES.md) — who can see a video in Private and Standard mode, and how the content policy is enforced
 - [SECURITY.md](SECURITY.md) — what the enclave protects, what it does not, how to report a flaw
 
 ## For miners
@@ -35,8 +36,11 @@ confidential VM. Consumer GPUs (RTX 4090/5090) have no confidential mode and can
 - Attests with a fresh gateway nonce, then re-attests every 10 minutes and answers
   validator challenges at any time.
 - Only makes outbound connections; the VM exposes no ports.
-- Rejects replayed jobs, tampered requests and mismatched inputs, runs the safety gate
-  (currently a placeholder filter), and never logs content.
+- Rejects replayed jobs, tampered requests and mismatched inputs, and never logs content.
+- Runs the safety gate on every job, in both privacy modes: the shared content policy
+  (`kuno_protocol.content_policy`, the same list the gateway uses), then prompt and frame
+  classifiers. All sexual content is banned; no setting allows it. No classifier weights ship
+  in an image yet ([SECURITY.md](SECURITY.md)).
 
 Local development with a simulated TEE:
 

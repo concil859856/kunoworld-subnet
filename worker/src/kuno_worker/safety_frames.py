@@ -15,6 +15,8 @@ the attested image, never downloaded):
   - a zero-shot apparent-minor detector (`ZeroShotMinorFrames`) over a CLIP checkpoint,
     openai/clip-vit-large-patch14 (MIT) recommended, openai/clip-vit-base-patch16 lighter.
 
+All sexual content is banned in every privacy mode; nothing in this module can allow it.
+
 Scores are probabilities in [0, 1] per category, one mapping per frame:
   sexual      explicit sexual content or nudity
   suggestive  sexual, or sexualized without explicit nudity (always >= sexual)
@@ -62,10 +64,15 @@ class FramePolicy:
 
     Every category is reduced to its maximum over all sampled frames, so a minor visible in
     one frame and sexual content in another still block together. That over-blocks some
-    legitimate edits (a family scene cut against adult content); it is the intended error.
+    legitimate edits (a family scene cut against a mildly suggestive adult clip); it is the
+    intended error.
 
-    Defaults and why:
-      sexual 0.5            explicit content blocks at even odds in strict mode (the default).
+    Defaults and why (none of them has been evaluated for recall; see SECURITY.md):
+      sexual 0.4            explicit content or nudity blocks below even odds: sexual content is
+                            banned, so the error to prefer is over-blocking.
+      suggestive 0.8        clearly sexualised content without nudity (Freepik's "low" class and
+                            above) blocks too. Set high because "low" also covers ordinary
+                            swimwear and dance clips; the prompt policy catches sexualised intent.
       minor 0.3             CLIP zero-shot mass on child/teen prompts. Deliberately low: a
                             young-looking adult counts as a minor for this rule.
       minor_sexual 0.15     with an apparent minor, a sexual score far below "probably
@@ -75,15 +82,17 @@ class FramePolicy:
                             even odds; lower catches swimwear and dance clips of children.
     Without a minor-presence model, or when the prompt itself mentions a minor, a minor is
     assumed present in every frame, so the minor_* thresholds apply to all content.
+
+    Configuration can only make the policy stricter: an override above the default is refused.
     """
 
-    allow_explicit: bool = False
-    sexual: float = 0.5
+    sexual: float = 0.4
+    suggestive: float = 0.8
     minor: float = 0.3
     minor_sexual: float = 0.15
     minor_suggestive: float = 0.5
 
-    THRESHOLD_KEYS = ("sexual", "minor", "minor_sexual", "minor_suggestive")
+    THRESHOLD_KEYS = ("sexual", "suggestive", "minor", "minor_sexual", "minor_suggestive")
 
     def decide(self, rows: Sequence[Mapping[str, float]], signals: RequestSignals | None = None) -> str | None:
         """The violated category ("sexual_minors" or "sexual"), or None to allow."""
@@ -99,13 +108,13 @@ class FramePolicy:
             minor = 1.0
         if minor >= self.minor and (sexual >= self.minor_sexual or suggestive >= self.minor_suggestive):
             return "sexual_minors"
-        if not self.allow_explicit and sexual >= self.sexual:
+        if sexual >= self.sexual or suggestive >= self.suggestive:
             return "sexual"
         return None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> FramePolicy:
-        """KUNO_SAFETY_ALLOW_NSFW=1 and KUNO_SAFETY_FRAME_THRESHOLDS={"minor": 0.25, ...}. Bad values raise ValueError."""
+        """KUNO_SAFETY_FRAME_THRESHOLDS={"minor": 0.25, ...}, each at most its default. Bad values raise ValueError."""
         overrides = json.loads(env["KUNO_SAFETY_FRAME_THRESHOLDS"]) if env.get("KUNO_SAFETY_FRAME_THRESHOLDS") else {}
         if not isinstance(overrides, dict):
             raise ValueError("KUNO_SAFETY_FRAME_THRESHOLDS must be a JSON object")
@@ -113,10 +122,10 @@ class FramePolicy:
         if unknown:
             raise ValueError(f"unknown KUNO_SAFETY_FRAME_THRESHOLDS keys: {', '.join(sorted(unknown))}")
         for key, value in overrides.items():
-            if not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
-                raise ValueError(f"KUNO_SAFETY_FRAME_THRESHOLDS[{key!r}] must be a number in [0, 1]")
-        allow = env.get("KUNO_SAFETY_ALLOW_NSFW", "").strip().lower() in ("1", "true", "yes")
-        return cls(allow_explicit=allow, **{k: float(v) for k, v in overrides.items()})
+            ceiling = getattr(cls, key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= ceiling:
+                raise ValueError(f"KUNO_SAFETY_FRAME_THRESHOLDS[{key!r}] must be a number in [0, {ceiling}]: thresholds can only be tightened")
+        return cls(**{k: float(v) for k, v in overrides.items()})
 
 
 # ---------------------------------------------------------------- sampling

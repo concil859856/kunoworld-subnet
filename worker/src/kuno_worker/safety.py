@@ -4,15 +4,18 @@ Nobody outside the VM can see prompts or outputs, so the safety filter has to
 live here, baked into every attested image. The MiniMax H3 license also requires
 hosted services to maintain safeguards against its Acceptable Use Policy.
 
-The gate is a pipeline:
-  1. a deterministic blocklist over normalized text, hardened against the usual
-     obfuscations (homoglyphs, leetspeak, zero-width characters, spaced or dotted
-     letters, repeated letters), with co-occurrence rules for sexual content
-     involving minors;
+All sexual content (NSFW) is banned in both Private and Standard mode. The gate is a pipeline:
+  1. the shared content policy, `kuno_protocol.content_policy.check_prompt`: a deterministic
+     blocklist over normalized text, hardened against the usual obfuscations (homoglyphs,
+     leetspeak, zero-width characters, spaced or dotted letters, repeated letters), with
+     allow-contexts for ordinary phrases and co-occurrence rules for minors and deepfakes. The
+     gateway runs the same function, so both enforce one list;
   2. a pluggable prompt classifier (recommended: Qwen3Guard-Gen-0.6B, Apache-2.0,
-     loaded from a local path, CPU only; see `Qwen3GuardClassifier`);
+     loaded from a local path, CPU only; see `Qwen3GuardClassifier`). Its sexual categories
+     always block: thresholds for them can be lowered, never raised past BANNED_CEILINGS;
   3. frame classifiers over frames sampled from the finished video, before it is sealed
-     (sexual content, and apparent minors; see `safety_frames`).
+     (sexual and sexualised content, and apparent minors; see `safety_frames`). There is no
+     setting that allows sexual content.
 
 Contract with worker.py: `check_request(prompt, negative_prompt)` returns None or raises
 `SafetyViolation`, which the worker reports as `safety_blocked`; `check_output(video, signals)`
@@ -26,13 +29,12 @@ Configuration (environment, read once):
   KUNO_SAFETY_CLASSIFIER           qwen3guard | sequence | none      (unset: blocklist only, logged as an error)
   KUNO_SAFETY_MODEL_PATH           local directory with the classifier weights (never downloaded)
   KUNO_SAFETY_REQUIRE_CLASSIFIER   1 to refuse to start without a working prompt classifier and frame classifier
-  KUNO_SAFETY_THRESHOLDS           JSON {category: score} overriding DEFAULT_THRESHOLDS
+  KUNO_SAFETY_THRESHOLDS           JSON {category: score} overriding DEFAULT_THRESHOLDS (sexual ones may only be lowered)
   KUNO_SAFETY_LABEL_MAP            JSON {model label: category} for the `sequence` adapter
   KUNO_SAFETY_FRAME_MODEL_PATH     sexual-content image classifier directory (unset: outputs unchecked, logged as an error)
   KUNO_SAFETY_MINOR_MODEL_PATH     CLIP directory for apparent-minor presence (unset: minors assumed in every frame)
   KUNO_SAFETY_FRAMES               frames sampled per video, first and last included (default 10)
-  KUNO_SAFETY_ALLOW_NSFW           1 to allow explicit adult content; sexual content with apparent minors always blocks
-  KUNO_SAFETY_FRAME_THRESHOLDS     JSON overriding FramePolicy thresholds: sexual, minor, minor_sexual, minor_suggestive
+  KUNO_SAFETY_FRAME_THRESHOLDS     JSON lowering FramePolicy thresholds: sexual, suggestive, minor, minor_sexual, minor_suggestive
   KUNO_SAFETY_FRAME_LABEL_MAP, KUNO_SAFETY_FRAME_DTYPE, KUNO_SAFETY_THREADS   see safety_frames.load_frame_models
 """
 
@@ -43,27 +45,23 @@ import logging
 import os
 import re
 import threading
-import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from kuno_protocol import content_policy
+from kuno_protocol.content_policy import ContentPolicyViolation
+
 from .safety_frames import POLICY_CATEGORIES, FramePolicy, RequestSignals, load_frame_models, sample_frames
 
 log = logging.getLogger("kuno.worker.safety")
 
-
-class SafetyViolation(Exception):
-    """The request or output breaks the acceptable use policy.
-
-    `category` is for tests and aggregate counters only; the message never varies,
-    so nothing about the request can leak through it.
-    """
-
-    def __init__(self, category: str = "policy"):
-        super().__init__("request violates the acceptable use policy")
-        self.category = category
+# The request or output breaks the acceptable use policy. The same class the shared content policy
+# raises, so a prompt blocked by the list and a video blocked by the frame check are handled alike.
+# `category` is for tests and aggregate counters only; the message never varies, so nothing about
+# the request can leak through it.
+SafetyViolation = ContentPolicyViolation
 
 
 class SafetyUnavailable(RuntimeError):
@@ -77,160 +75,32 @@ class SafetyConfigError(ValueError):
     """The safety configuration forbids starting (e.g. a required classifier is missing)."""
 
 
-# ---------------------------------------------------------------- stage 1: normalized blocklist
-
-_CONFUSABLES = str.maketrans(
-    {
-        # Cyrillic and Greek letters that render like Latin ones.
-        "а": "a", "в": "b", "с": "c", "ԁ": "d", "е": "e", "ё": "e", "һ": "h", "н": "h", "і": "i", "ї": "i",
-        "ј": "j", "к": "k", "м": "m", "о": "o", "р": "p", "ԛ": "q", "ѕ": "s", "т": "t", "у": "y", "х": "x",
-        "α": "a", "β": "b", "ε": "e", "η": "n", "ι": "i", "κ": "k", "ν": "v", "ο": "o", "ρ": "p", "τ": "t",
-        "υ": "u", "χ": "x", "ω": "w", "ɡ": "g", "ı": "i", "ł": "l", "ø": "o", "đ": "d", "ß": "ss",
-    }
-)
-_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b", "9": "g",
-                       "@": "a", "$": "s", "!": "i", "|": "l", "+": "t"})
-_SPLIT = re.compile(r"[^\w@$!|+]+|_+")
-_AGE = re.compile(r"^(\d{1,2})(?:yo|yr|yrs|y|year|years|yearold|yearsold)?$")
-_AGE_UNITS = {"yo", "y", "yr", "yrs", "year", "years", "yearold", "yearsold", "old"}
-_MINOR_TOKEN = "\x00minor"
-
-ABSOLUTE_TERMS = [
-    "csam", "cp porn", "child porn", "child pornography", "child sexual", "child nude", "child nudes", "kiddie porn",
-    "kiddy porn", "kid porn", "preteen porn", "preteen nude", "preteen sex", "underage porn", "underage sex",
-    "underage nude", "pedo porn", "pedophile porn", "jailbait", "lolicon", "shotacon", "toddlercon",
-]
-_ABSOLUTE_PREFIXES = ["childporn", "kiddieporn", "kiddyporn", "underageporn", "pedoporn", "lolicon", "shotacon"]
-MINOR_TERMS = [
-    "child", "children", "kid", "kids", "kiddie", "kiddy", "minor", "minors", "underage", "under age", "preteen", "pre teen",
-    "preteens", "tween", "tweens", "toddler", "toddlers", "infant", "infants", "schoolgirl", "schoolgirls", "schoolboy",
-    "schoolboys", "teen", "teens", "teenage", "teenager", "teenagers", "young girl", "young boy", "little girl",
-    "little boy", "loli", "shota", "middle schooler", "elementary schooler", _MINOR_TOKEN,
-]
-# Kept deliberately narrow: these only block next to a minor term, where over-blocking is the
-# acceptable error, but words like "strip", "breasts" or "bottomless" catch too many innocent prompts.
-SEXUAL_TERMS = [
-    "porn", "porno", "pron", "sex", "sexy", "sexual", "sexually", "nude", "nudes", "naked", "nudity", "nsfw", "explicit",
-    "lewd", "hentai", "xxx", "topless", "genitals", "lingerie", "fetish", "seductive", "orgasm", "intercourse",
-    "rape", "raped", "grope", "groped", "stripper",
-]
-_SEXUAL_PREFIXES = ["porn", "erotic", "masturbat", "molest", "undress", "genital", "fornicat"]
-CLOTHING_TERMS = ["clothes", "clothing", "clothed", "dressed", "underwear", "swimsuit", "bra", "panties"]
-DEEPFAKE_TERMS = ["deepfake", "deep fake", "faceswap", "face swap", "celebrity", "real person"]
-COOCCURRENCE_WINDOW = 12
-MAX_JOIN = 4
-
-
-def _collapse(word: str) -> str:
-    """Squeezes repeated letters ("chiiild" -> "child") on both sides of a comparison."""
-    return re.sub(r"(.)\1+", r"\1", word)
-
-
-def normalize_tokens(text: str) -> list[str]:
-    """Folds text into comparable tokens. Used for matching only; never logged."""
-    text = unicodedata.normalize("NFKC", text)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
-    text = unicodedata.normalize("NFKD", text.casefold().translate(_CONFUSABLES))
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    tokens: list[str] = []
-    raw = [t for t in _SPLIT.split(text) if t]
-    for index, token in enumerate(raw):
-        age = _AGE.match(token)
-        if age and (token != age.group(1) or (index + 1 < len(raw) and raw[index + 1] in _AGE_UNITS)):
-            tokens.append(_MINOR_TOKEN if int(age.group(1)) < 18 else token)
-            continue
-        if token.isdigit():
-            tokens.append(token)
-            continue
-        folded = "".join(ch for ch in token.translate(_LEET) if ch.isalpha())
-        if folded:
-            tokens.append(folded)
-    return _merge_single_letters(tokens)
-
-
-def _merge_single_letters(tokens: list[str]) -> list[str]:
-    """Joins spelled-out words: "c s a m" and "c.s.a.m" both become "csam"."""
-    merged, run = [], []
-    for token in tokens + [""]:
-        if len(token) == 1 and token.isalpha():
-            run.append(token)
-            continue
-        if len(run) >= 3:
-            merged.append("".join(run))
-        else:
-            merged.extend(run)
-        run = []
-        if token:
-            merged.append(token)
-    return merged
-
-
-@dataclass(frozen=True)
-class _TermSet:
-    exact: frozenset[str]
-    prefixes: tuple[str, ...]
-
-    @classmethod
-    def build(cls, terms: Sequence[str], prefixes: Sequence[str] = ()) -> _TermSet:
-        exact: set[str] = set()
-        for term in terms:
-            joined = term.replace(" ", "")
-            exact.add(joined)
-            if len(_collapse(joined)) >= 4:
-                exact.add(_collapse(joined))
-        return cls(frozenset(exact), tuple(p for p in prefixes) + tuple(_collapse(p) for p in prefixes))
-
-    def matches(self, candidate: str) -> bool:
-        return candidate in self.exact or _collapse(candidate) in self.exact or candidate.startswith(self.prefixes)
+# ---------------------------------------------------------------- stage 1: the shared content policy
 
 
 class Blocklist:
-    """Deterministic first stage. Extra absolute terms can be added per deployment."""
+    """Stage 1: `kuno_protocol.content_policy`, the same deterministic list the gateway enforces.
 
-    def __init__(self, extra_absolute_terms: Sequence[str] = ()):
-        self.absolute = _TermSet.build(ABSOLUTE_TERMS + [t.casefold() for t in extra_absolute_terms], _ABSOLUTE_PREFIXES)
-        self.minor = _TermSet.build(MINOR_TERMS)
-        self.sexual = _TermSet.build(SEXUAL_TERMS, _SEXUAL_PREFIXES)
-        self.clothing = _TermSet.build(CLOTHING_TERMS)
-        self.deepfake = _TermSet.build(DEEPFAKE_TERMS)
-
-    @staticmethod
-    def _hits(tokens: list[str], terms: _TermSet) -> list[int]:
-        """Token positions where a term starts, trying joins of up to MAX_JOIN tokens ("ch ild" -> "child")."""
-        hits = []
-        for start in range(len(tokens)):
-            candidate = ""
-            for token in tokens[start : start + MAX_JOIN]:
-                candidate += token
-                if terms.matches(candidate):
-                    hits.append(start)
-                    break
-        return hits
+    The list lives in the protocol package so that the gateway and every worker image block exactly
+    the same prompts; this wrapper only gives the gate something to hold (and tests something to swap).
+    """
 
     def check(self, prompt: str, negative_prompt: str | None = None) -> None:
-        tokens = normalize_tokens(prompt)
-        negative = normalize_tokens(negative_prompt or "")
-        if self._hits(tokens, self.absolute) or self._hits(negative, self.absolute):
-            raise SafetyViolation("sexual_minors")
-        minors = self._hits(tokens, self.minor)
-        if not minors:
-            sexual = self._hits(tokens, self.sexual)
-            if sexual and self._hits(tokens, self.deepfake):
-                raise SafetyViolation("sexual_deepfake")
-            return
-        sexual = self._hits(tokens, self.sexual)
-        if any(abs(m - s) <= COOCCURRENCE_WINDOW for m in minors for s in sexual):
-            raise SafetyViolation("sexual_minors")
-        # A negative prompt steers away from what it lists: "clothing" there pushes toward nudity.
-        if self._hits(negative, self.clothing):
-            raise SafetyViolation("sexual_minors")
+        content_policy.check_prompt(prompt, negative_prompt)
 
     def mentions_minor(self, prompt: str) -> bool:
         """True when the prompt (not the negative prompt, which lists what to avoid) names a minor."""
-        return bool(self._hits(normalize_tokens(prompt), self.minor))
+        return content_policy.mentions_minor(prompt)
 
 
 # ---------------------------------------------------------------- stage 2: prompt classifier
+
+# All sexual content is banned, so these categories block at no more than these scores whatever the
+# configuration says: an override may lower them (stricter), never raise them.
+BANNED_CEILINGS: dict[str, float] = {
+    "sexual_minors": 0.3,
+    "sexual": 0.5,
+}
 
 # A category blocks when its score reaches the threshold. Unlisted categories never block.
 DEFAULT_THRESHOLDS: dict[str, float] = {
@@ -325,6 +195,7 @@ class Qwen3GuardClassifier:
 
 OPENAI_STYLE_LABELS = {
     "s": "sexual", "sexual": "sexual", "s3": "sexual_minors", "sexual/minors": "sexual_minors",
+    "nsfw": "sexual", "porn": "sexual", "sexual_explicit": "sexual",
     "h": "hate", "hate": "hate", "h2": "hate", "hate/threatening": "hate",
     "v": "violence", "violence": "violence", "v2": "violence", "violence/graphic": "violence",
     "sh": "self_harm", "self-harm": "self_harm", "self_harm": "self_harm",
@@ -459,6 +330,9 @@ class SafetyGate:
     def _judge(self, scores: Mapping[str, float]) -> None:
         for category, score in scores.items():
             threshold = self.thresholds.get(category, 1.0 if category == "unknown_unsafe" else None)
+            if category in BANNED_CEILINGS:  # no configuration or constructor argument can loosen the ban
+                ceiling = BANNED_CEILINGS[category]
+                threshold = ceiling if threshold is None else min(threshold, ceiling)
             if threshold is not None and score >= threshold:
                 raise SafetyViolation(category)
 
@@ -473,7 +347,7 @@ class SafetyGate:
             "frame_classifiers": [getattr(m, "name", type(m).__name__) for m in self.frame_classifiers],
             "frame_classifier_unavailable": self.frame_unavailable,
             "frames_to_sample": self.frames_to_sample,
-            "allow_nsfw": self.frame_policy.allow_explicit,
+            "content_policy": "kuno_protocol.content_policy",
         }
 
     def startup_errors(self, required: bool = False) -> list[str]:
@@ -495,7 +369,14 @@ class SafetyGate:
         kind = env.get("KUNO_SAFETY_CLASSIFIER", "").strip().lower()
         gate = cls(require_classifier=env.get("KUNO_SAFETY_REQUIRE_CLASSIFIER", "") in ("1", "true", "yes"))
         if env.get("KUNO_SAFETY_THRESHOLDS"):
-            gate.thresholds = {**DEFAULT_THRESHOLDS, **json.loads(env["KUNO_SAFETY_THRESHOLDS"])}
+            overrides = json.loads(env["KUNO_SAFETY_THRESHOLDS"])
+            if not isinstance(overrides, dict):
+                raise ValueError("KUNO_SAFETY_THRESHOLDS must be a JSON object")
+            for category, ceiling in BANNED_CEILINGS.items():
+                value = overrides.get(category)
+                if value is not None and (not isinstance(value, (int, float)) or not 0.0 <= value <= ceiling):
+                    raise ValueError(f"KUNO_SAFETY_THRESHOLDS[{category!r}] must be a number in [0, {ceiling}]: sexual content is banned")
+            gate.thresholds = {**DEFAULT_THRESHOLDS, **overrides}
         # An explicit KUNO_SAFETY_CLASSIFIER=none is a deliberate opt-out: stay quiet about missing frame models too.
         gate._load_frames(env, quiet=kind == "none")
         if kind in ("", "none"):
