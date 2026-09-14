@@ -476,15 +476,17 @@ class SafetyGate:
             "allow_nsfw": self.frame_policy.allow_explicit,
         }
 
-    def startup_errors(self) -> list[str]:
-        """Reasons this gate must not serve at all. Only KUNO_SAFETY_REQUIRE_CLASSIFIER produces any."""
-        if not self.require_classifier:
+    def startup_errors(self, required: bool = False) -> list[str]:
+        """Reasons this gate must not serve at all: missing classifiers, when KUNO_SAFETY_REQUIRE_CLASSIFIER is set
+        or the caller requires them (`required`, e.g. a production TDX worker)."""
+        if not (self.require_classifier or required):
             return []
+        why = "KUNO_SAFETY_REQUIRE_CLASSIFIER is set" if self.require_classifier else "classifiers are required"
         errors = []
         if self.classifier is None or self.unavailable:
-            errors.append("KUNO_SAFETY_REQUIRE_CLASSIFIER is set but no prompt classifier loaded (KUNO_SAFETY_CLASSIFIER)")
+            errors.append(f"{why} but no prompt classifier loaded (KUNO_SAFETY_CLASSIFIER)")
         if not self._frame_models() or self.frame_unavailable:
-            errors.append("KUNO_SAFETY_REQUIRE_CLASSIFIER is set but no frame classifier loaded (KUNO_SAFETY_FRAME_MODEL_PATH)")
+            errors.append(f"{why} but no frame classifier loaded (KUNO_SAFETY_FRAME_MODEL_PATH)")
         return errors
 
     @classmethod

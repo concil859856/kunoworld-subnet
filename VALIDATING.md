@@ -25,11 +25,19 @@ export KUNO_MANIFEST=/path/to/golden-manifest.json # required
 export KUNO_OWNER_PUBLIC_KEY=...                   # verifies the owner-signed switch
 export KUNO_VALIDATOR_STATE=/var/lib/kuno/validator-state.json  # default $KUNO_DATA_DIR/validator-state.json
 export KUNO_MIN_COLLATERAL_PER_GPU=<alpha>         # locked collateral required per attested GPU; unset or 0 disables
+export KUNO_MIN_COLLATERAL_PER_GPU_OPEN=<alpha>    # per open-tier GPU; default twice the above, never lower
+export KUNO_OPEN_TIER_RATE=0.5                     # open-tier work earns this share of confidential-tier work
+export KUNO_OPEN_TIER_PROBES=5                     # canaries a new open-tier hotkey must pass before its work earns
+export KUNO_TOLERANCE_CALIBRATION=/path/to/tolerance_calibration.json  # default: the file shipped with kuno-protocol
 export KUNO_COLLATERAL_MAX_STALE_S=8640            # how long a failed chain read may reuse the last reading
 export KUNO_CHAIN_ENDPOINT=wss://...               # optional; defaults to the --network's public endpoint
 kuno-validator run --interval 4320 --netuid <netuid> \
-  --wallet-name <name> --wallet-hotkey <hotkey> --canary ltx-2.5-fast
+  --wallet-name <name> --wallet-hotkey <hotkey> --canary ltx-2.5-fast --standard-canary ltx-2.5-fast
 ```
+
+`--canary` sends private (end-to-end encrypted) canaries, which only confidential-tier miners
+can receive. `--standard-canary` sends standard-mode canaries through `POST /v1/standard/videos`;
+those can land on open-tier miners too, and they are the admission probes (see [Open tier](#open-tier)).
 
 Each setting can also come from `$KUNO_DATA_DIR/dev.env` (default `data/dev.env`), which is how a
 dev network provides them.
@@ -69,6 +77,9 @@ vector it would submit.
    `policy_from_env`, exactly as the gateway does: `KUNO_ATTESTATION=production` uses the Intel
    DCAP and NVIDIA verifiers, requires an owner-signed manifest and refuses simulated evidence.
    Turbo candidates are skipped here; the Turbo track challenges them against their own manifest.
+   Open-tier enclaves answer with `tee: "open"` evidence (no quote), accepted only when the
+   manifest's `open_tier` policy allows the image; the verdict's tier is what this validator
+   records as the enclave's tier.
 2. **Canaries.** Ordinary encrypted jobs, indistinguishable from customer traffic, checked as
    described under [Canary policy](#canary-policy). Send H3 canaries from a region where the H3
    licence applies, or they will be rerouted to LTX and prove nothing.
@@ -79,7 +90,8 @@ vector it would submit.
    the owner-signed switch and gated on three things: a live attestation, reliability (at least
    98% success once a miner has 20 finished jobs, counting only failures the miner caused), and
    no penalty in the window. Penalties include [hardware dedupe](#hardware-dedupe) and
-   [collateral](#collateral) as well as canaries and replays. Every zeroed hotkey is logged with
+   [collateral](#collateral) as well as canaries, replays, step audits and the open-tier fraud
+   rule. Open-tier work earns at `KUNO_OPEN_TIER_RATE` and only after admission ([Open tier](#open-tier)). Every zeroed hotkey is logged with
    its reasons (`miner <hotkey>: score=0.0000 … <reasons>`).
 5. **Weights.** Set for registered hotkeys, renormalized over those actually on the subnet.
    Never to the owner hotkey and never to a burn UID: burned miner emission cuts the
@@ -231,6 +243,35 @@ coldkey (or root):
 - `AdminUtils.sudo_set_collateral_drain_ratio(netuid, drain_ratio: U64F64)`. The value is passed
   as raw bits (1.0 = 2^64) and must be above 0 and at most 10.
 
+## Open tier
+
+Open-tier miners run without a TEE and serve standard jobs only (PRIVACY_MODES.md). Nothing
+about their hardware, image or memory is attested, so the validator weighs them differently
+(`validator/src/kuno_validator/open_tier.py`):
+
+| Rule | Default | Setting |
+|---|---|---|
+| Earning rate: open-tier VCU count at this share of confidential-tier VCU | 0.5 | `KUNO_OPEN_TIER_RATE` (0–1) |
+| Admission: a new open-tier hotkey's work earns nothing until it has passed this many of your canaries. An attributable canary or audit failure during probation restarts the count; failures the gateway or validator caused don't. | 5 | `KUNO_OPEN_TIER_PROBES` (0 disables) |
+| Collateral per open-tier GPU | twice `KUNO_MIN_COLLATERAL_PER_GPU`, never lower | `KUNO_MIN_COLLATERAL_PER_GPU_OPEN` |
+| Step audits of open-tier standard jobs | 25 % | `AuditPolicy.open_tier_rate` |
+| Fraud: a succeeded **private** job whose receipt came from an enclave you verified as open tier zeroes the miner for the window | always | |
+
+- **Which tier an enclave is.** Your own challenge verdicts decide it, and are kept in the state
+  file. An enclave you never challenged (a short-lived worker) takes the tier from the gateway's
+  feed, and an enclave nobody describes counts as confidential. The fraud rule uses only your
+  own verdicts, so a feed can't frame a confidential miner. The job's `privacy` label comes from
+  the gateway's ledger; rows without one are never judged.
+- **Open-tier GPUs for collateral.** Not attested, so each open-tier enclave counts the larger of
+  its self-reported `hardware.gpu_count` and `capacity × max(gpus_per_worker)` of its profiles.
+  Under-reporting GPUs to lower the requirement also caps the jobs it can take.
+- **Admission probes.** Only standard canaries reach open-tier miners, and the gateway picks
+  which miner serves one, so run `--standard-canary` every round. The admission count and
+  verified tiers persist in the state file.
+- **Hardware dedupe** doesn't apply: open-tier evidence carries no hardware identity. One
+  machine posing as many open-tier miners is limited by collateral per GPU, admission per hotkey
+  and the lower rate, not by identities.
+
 ## Model switch rules
 
 - With `KUNO_OWNER_PUBLIC_KEY` set, a switch is used only if the owner's signature verifies.
@@ -303,14 +344,23 @@ first with `dry_run=True`.
 ## Step-replay audits (verified mode)
 
 In a verified profile, every receipt commits to the latent state after each denoising step. A
-validator re-executes one random step of its **own** canaries and compares the result bit for bit
+validator re-executes one random step of its **own** canaries, and of **standard** jobs, and
+compares the result bit for bit, or within a calibrated tolerance on open-tier hardware classes
 (`validator/src/kuno_validator/audits.py`). The full design is in [VERIFIED_MODE.md](VERIFIED_MODE.md).
 
 - **What gets audited.** `Auditor.select` samples canaries whose receipts carry a step commitment,
-  at `AuditPolicy.rate` or the profile's `verified.audit_rate` (2–5 %). 10 % of audits also open
-  every leaf and re-run the whole trajectory.
-- **Which jobs.** The gateway refuses audits of any job your validator account did not create.
+  at `AuditPolicy.rate` or the profile's `verified.audit_rate` (2–5 %). `Auditor.sample_standard`
+  samples standard jobs from the ledger (`privacy: "standard"`, finished within the last 50
+  minutes): open-tier ones at `open_tier_rate` (25 %), confidential-tier ones at `standard_rate`
+  or the profile's rate. 10 % of audits also open every leaf and re-run the whole trajectory
+  (bitwise classes only).
+- **Which jobs.** The gateway refuses audits of a private job your validator account did not
+  create; any standard job may be audited. For a standard job the validator fetches the prompt,
+  seed and params from `GET /validator/v1/standard-jobs/{job_id}`. Jobs without an explicit seed,
+  with inputs or with model options are skipped: the validator can't replay them faithfully.
   Openings are sealed to a fresh key you send with each request.
+- **Open-tier receipts** on a verified profile must carry a step commitment; one without it
+  fails its audit.
 - **Checks.** Each opening must be:
   1. signed by the enclave's key;
   2. consistent with the root signed in the receipt (Merkle proofs, transcript digest, schedule);
@@ -318,19 +368,31 @@ validator re-executes one random step of its **own** canaries and compares the r
      conditioning;
   4. started from the seed's noise.
 
-  The replayed step must reproduce the committed latent exactly. There is no tolerance mode.
+  On a bitwise hardware class the replayed step must reproduce the committed latent exactly. On a
+  tolerance class (open-tier hardware) its relative update error must stay under the calibrated
+  threshold for (profile, miner class, executor class). With no calibration entry the audit
+  concludes **`unproven`**: logged with the measured distance, never a penalty. The shipped
+  calibration file is empty, so today every open-tier audit is unproven; see VERIFIED_MODE.md,
+  "Tolerance mode".
 - **Penalty.** Same as canaries: any attributable failure in the scoring window zeroes the miner.
   - Attributable: a signed opening that fails any check, a declined audit, and (by default) no
     opening within 10 minutes.
-  - Not attributable, only logged: an unsigned opening, a gateway refusal, a missing executor.
+  - Not attributable, only logged: an unsigned opening, a gateway refusal, a missing executor,
+    an uncalibrated tolerance class, and on standard jobs a seed or conditioning mismatch (the
+    gateway's record, not yours, says what the prompt was; canaries still catch a miner who
+    commits a wrong conditioning).
 - **Executors.** Dev networks use the reference executor for the mock backend's toy denoiser, so
   audits really run without a GPU. LTX-2.5 and MiniMax H3 need `executors.LtxStepExecutor` /
   `H3StepExecutor` on the **same hardware class** as the miner (same GPU SKU, count and parallel
-  layout), with the pinned weights. Those executors have not run on a GPU yet, so keep them off
-  until the class passes its golden-set check.
+  layout), with the pinned weights. For open-tier classes pass `tolerance_classes=[...]` and the
+  class's weights digest as `model_digests["<profile>@<class>"]`. Those executors have not run on
+  a GPU yet, so keep them off until the class passes its golden-set check.
+- **Calibration.** `python -m kuno_validator.calibrate toy|summarize|show` builds tolerance entries
+  from measured distances (VERIFIED_MODE.md, "Calibration procedure").
 - **Golden sets.** `python -m kuno_validator.golden compute|check` records and compares per-step
   latent hashes for fixed prompts and seeds per hardware class, to certify a miner image.
 - **State.** Keep audit outcomes on persistent storage (`Auditor(state_path=…)`), like the canary
   history.
 
-Wiring into `Validator.step()` and `score()` is pending (see VERIFIED_MODE.md, "Integration").
+`Validator.step()` requests the audits after its canaries (`run_audits`) and `score()` merges
+`Auditor.penalties` with the canary penalties.

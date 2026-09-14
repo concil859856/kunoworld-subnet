@@ -79,6 +79,11 @@ default audit rate.
 | `h3-turbo` | `diffusers-modular-h3/1` | 8 | stage 0 | `C4.h100-sxm-80gb.x4.ulysses4`, `C4.h200-sxm-141gb.x4.ulysses4` | 3 % |
 | `h3`, `h3-reference` | `diffusers-modular-h3/1` | 50 | stage 0 | as above | 2 % |
 
+Open-tier classes (`comparison: "tolerance"`, see [Tolerance mode](#tolerance-mode)) are listed
+after the confidential ones: `ltx-2.5-fast` adds `O1.rtx-4090-24gb.x1.int8`,
+`O1.rtx-5090-32gb.x1.fp8-cast`, `O1.rtx-pro-6000-bw-96gb.x1` and `O1.h100-80gb.x1`; `ltx-2.5-pro`
+adds the last two. `ltx-2.5-4k` (141 GB) and the H3 profiles (4 × 80 GB) have none.
+
 Every profile also lists `dev-cpu` (`dev: true`): the mock backend's toy denoiser for dev networks.
 Production validators (`AuditPolicy(production=True)`) treat a commitment on a simulated class as
 a failure, exactly as production attestation refuses the simulated TEE.
@@ -200,9 +205,16 @@ content, only refusal codes.
 6. For `full_rerun_rate` of audits (10 %) it opens every leaf and re-runs the whole trajectory on
    reference hardware.
 
-Only bitwise comparison exists. A tolerance mode (per-operator IEEE-754 acceptance regions, TAO,
-arXiv 2510.16028) would allow cross-class checks, but would give up much of the strength against
-subtle substitutions. It is future work.
+Step 5 compares bit for bit on confidential-tier classes. Open-tier classes compare within a
+calibrated tolerance instead ([Tolerance mode](#tolerance-mode)). Operator-level IEEE-754
+acceptance regions (TAO, arXiv 2510.16028) would be stronger still, and remain future work.
+
+**Standard jobs.** Any validator may audit any standard job (PRIVACY_MODES.md), not only its own
+canaries: the gateway gives it the prompt, seed and params
+(`GET /validator/v1/standard-jobs/{job_id}`). Open-tier standard jobs are sampled at 25 %. Because
+that record comes from the gateway, a seed or conditioning mismatch on a standard job is
+`unproven` rather than attributable; a miner committing a wrong conditioning on purpose is caught
+by canaries, which it can't tell apart from customer jobs.
 
 **Attribution and penalties.** The same policy as canaries: any *attributable* failure inside the
 scoring window zeroes the miner (`Auditor.penalties`, merged with `canary_penalties`).
@@ -212,6 +224,7 @@ scoring window zeroes the miner (`Auditor.penalties`, merged with `canary_penalt
 | an enclave-signed opening that fails decryption, proofs, layout, transcript or replay; wrong noise; a class the profile doesn't pin; a simulated class in production | an opening not signed by the enclave (relay tampering) |
 | the enclave declines the audit (`failed`) | the gateway refuses the audit or loses it |
 | no opening before the deadline (`missing_is_attributable`, default on) | the validator has no executor for that runtime or class, or its executor crashes |
+| a tolerance-class replay outside its calibrated threshold; an open-tier receipt without a commitment | a tolerance class with no calibration entry (`unproven`); a seed or conditioning mismatch on a gateway-reported standard job (`unproven`) |
 
 A caveat on missing openings: a malicious gateway could withhold audit items to frame a miner, the
 same exposure challenges already have. Validators that don't trust the relay can set
@@ -259,6 +272,90 @@ the golden cases.
 Publishing golden sets per (profile, class, image) certifies an image before it earns in verified
 mode (research §4.2). Only the dev class has a GPU-free reference executor.
 
+## Tolerance mode
+
+Open-tier hardware (GeForce RTX 4090 and 5090, workstation RTX PRO 6000, H100 with confidential
+computing off) can't share a reproducibility domain with a validator's GPU: different SKUs pick
+different kernels, and the consumer classes run quantized weights. Replaying one step there
+diverges slightly even when the miner is honest, so these classes are marked
+`comparison: "tolerance"` in `profiles.json` and compared within a calibrated distance.
+
+**Metric** (`kuno_protocol/tolerance.py`). With Δ = x_k − x_{k−1} the committed update and
+e = x̂_k − x_k the replay's error, per tensor in float64:
+
+```
+rel_l2      = ‖e‖₂  / max(‖Δ‖₂,  1e-6 · ‖x_k‖₂)
+max_abs_rel = max|e| / max(max|Δ|, 1e-6 · max|x_k|)
+```
+
+The worst tensor (video or audio) decides. Why this and not something simpler:
+- Relative to the **update**, not the latent: both sides start from the same committed x_{k−1},
+  so the latent's norm is shared and tells nothing. Honest drift is a small fraction of what a
+  step computes; a substituted model or a skipped step changes the update itself by a fraction
+  of order one. A latent-relative error would shrink late steps (small dσ) toward the noise floor.
+- **L2** catches diffuse changes; **max-abs** catches a localized edit that L2 averages away.
+- Not cosine similarity: it ignores magnitude, so a rescaled update would pass.
+- Committed latents holding NaN or infinity fail; a replay that does is the executor's problem.
+
+Leaf 0 is still compared exactly (noise comes from a CPU generator), and so are the Merkle
+proofs, transcript and conditioning. Full re-runs are skipped: leaf digests can't match.
+
+**Verdicts.**
+
+| Calibration entry for (profile, miner class, executor class) | Replay within threshold | Verdict |
+|---|---|---|
+| none (every class today) | — | `unproven`: logged with the measured distance, never a penalty |
+| present | yes | `pass` |
+| present | no | `fail`, attributable |
+
+**Calibration format.** `kuno_protocol/tolerance_calibration.json` ships empty. A validator can
+point `KUNO_TOLERANCE_CALIBRATION` at its own copy.
+
+```json
+{"version": 1, "entries": [{
+  "profile_id": "ltx-2.5-fast", "hardware_class": "O1.rtx-5090-32gb.x1.fp8-cast", "executor_class": "C2.h200-141gb.x1",
+  "metric": "kuno/v1/step-update-rel-l2",
+  "honest": {"samples": 2000, "mean": 0.0021, "p50": 0.0018, "p99": 0.0061, "p999": 0.0094, "max": 0.011},
+  "honest_max_abs": {"samples": 2000, "mean": 0.01, "p50": 0.009, "p99": 0.03, "p999": 0.05, "max": 0.06},
+  "substituted": {"samples": 2000, "mean": 0.41, "p50": 0.39, "p99": 0.8, "p999": 0.9, "max": 0.95},
+  "threshold": 0.022, "max_abs_threshold": null, "step_thresholds": {},
+  "image_digest": "sha256:…", "runtime": "diffusers-ltx2/1", "calibrated_at": "2026-…", "notes": "…"}]}
+```
+
+(The numbers are an illustration of the shape, not measurements.) `executor_class` may be `"*"`;
+an exact match wins. `step_thresholds` overrides the threshold for single leaves where early and
+late steps behave differently.
+
+### Calibration procedure
+
+For each (profile, open-tier class, executor class) the owner will enable:
+
+1. On the miner class, with the class's worker image and weights recipe, generate the golden cases
+   in verified mode and keep every opening (at least 200 steps; aim for a few thousand over varied
+   prompts, seeds and durations).
+2. On the executor class, replay every replayable step with the GPU executor
+   (`tolerance_classes=[<class>]`) and write one line per step with `StepDistance.record(step)`:
+   `{"step", "rel_l2", "max_abs_rel"}` into `honest.jsonl`.
+3. Repeat with deliberate substitutions: another checkpoint, a coarser quantization (int4/NVFP4
+   claiming the fp8 class), a skipped step. Write `substituted.jsonl`.
+4. `python -m kuno_validator.calibrate summarize --profile P --hardware-class C --executor-class E
+   --honest honest.jsonl --substituted substituted.jsonl --calibration tolerance_calibration.json`.
+   The threshold is 2 × the worst honest distance, or the geometric midpoint between the worst
+   honest and the best substituted distance if that is lower. It refuses too few samples, or
+   honest and substituted distributions that overlap: then this metric can't police that class.
+5. Review the entry, commit the file to `kuno-protocol`, release, and only then expect penalties
+   for that class.
+
+`python -m kuno_validator.calibrate toy --out-dir d` rehearses steps 2–4 with the toy denoiser and
+injected float noise; its numbers mean nothing for real hardware.
+
+**What tolerance mode gives up.** A substitution that stays inside the honest envelope passes:
+for example serving at a slightly different precision than the class declares. That is why the
+threshold sits just above measured honest drift rather than midway to the cheats, and why the
+open tier also carries admission probes, higher collateral and a lower earning rate. The
+research note on adaptive thresholds (arXiv 2609.10601) suggests per-execution thresholds beat a
+constant one; `step_thresholds` is the first step in that direction.
+
 ## Phase 0, before enabling a GPU class
 
 1. On the class's hardware, run a worker image in verified mode over the golden cases twice, in two
@@ -288,10 +385,10 @@ Not proven:
 - **Which steps a miner cheats on**, if it cheats rarely: detection is probabilistic.
 - **Stage-1 (refine) steps**, except by full re-runs; stage transitions such as upsampling are not
   steps and aren't replayed.
-- **Cross-class honesty.** A miner on hardware outside its declared class simply fails; nothing
-  checks against a tolerance.
-- **Non-canary jobs.** Customer jobs are never opened. Their protection is the indistinguishability
-  of canaries.
+- **Cross-class honesty** on bitwise classes: a miner on hardware outside its declared class simply
+  fails. Open-tier classes are compared within a tolerance, and only once calibrated.
+- **Private customer jobs.** They are never opened. Their protection is the indistinguishability
+  of canaries. Standard jobs can be audited by any validator.
 - **Anything on a GPU class until Phase 0 passes.**
 
 ## Integration

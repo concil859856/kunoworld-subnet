@@ -1,7 +1,11 @@
-"""Step-replay audits of a validator's own canaries (verified mode; see VERIFIED_MODE.md).
+"""Step-replay audits of a validator's own canaries and of standard jobs (verified mode; see VERIFIED_MODE.md).
 
-For a sample (1–5 %, configurable) of the canaries this validator created whose receipts
-carry a step commitment, the auditor:
+What is audited: a sample (1–5 %, configurable) of the canaries this validator created, and a
+sample of *standard* jobs from the ledger (PRIVACY_MODES.md): any standard job may be opened,
+since its content is readable by the platform and the GPU provider anyway. Standard jobs of
+open-tier miners are sampled at `AuditPolicy.open_tier_rate` (25 % by default): with no
+attestation, audits are what keeps those miners honest. For each audited job whose receipt
+carries a step commitment, the auditor:
 
 1. picks a random step k the executor for that runtime can replay;
 2. asks the gateway to open step k, supplying a fresh X25519 key (the gateway refuses any
@@ -19,8 +23,20 @@ establishes who produced the opening (or when the enclave declines or misses the
 and any attributable failure in the scoring window zeroes that miner. A missing signature,
 a gateway refusal or a validator-side gap (no executor for the runtime) costs nothing.
 
-Bitwise comparison is the only mode: verified profiles pin everything that changes bits.
-Tolerance-based comparison (TAO-style acceptance regions) is future work.
+Comparison follows the committed hardware class (profiles.HardwareClass.comparison):
+
+  bitwise    the confidential tier: every bit must match, as above.
+  tolerance  open-tier hardware: the replayed step must fall within the calibrated distance for
+             (profile, miner class, executor class) in the calibration file (kuno_protocol.tolerance).
+             Without a calibration entry the audit concludes `unproven`: it is recorded, never
+             attributable, and costs the miner nothing. A full re-run can't compare leaf digests in
+             this mode, so it is skipped.
+
+Standard-job records come from the gateway (`GET /validator/v1/standard-jobs/{job_id}`), not from
+the validator's own knowledge, so a failure that a gateway lie about the prompt or seed would also
+explain (a conditioning or seed mismatch) is `unproven`, not attributable. Params are bound by the
+receipt's signed digest and stay attributable. A miner that commits a wrong conditioning on purpose
+to dodge standard audits is still caught by canaries, which it can't tell apart.
 """
 
 from __future__ import annotations
@@ -42,7 +58,10 @@ from kuno_protocol.crypto import DecryptionError, generate_hpke_keypair
 from kuno_protocol.profiles import ModelProfile
 from kuno_protocol.receipts import Receipt, verify_receipt
 from kuno_protocol.schemas import GenerationParams
+from kuno_protocol.tiers import OPEN
+from kuno_protocol.tolerance import TOLERANCE, Calibration, comparison_for, load_calibration, step_distance
 from kuno_protocol.toy_denoiser import (
+    DEV_HARDWARE_CLASS,
     TOY_RUNTIME,
     run_toy_trajectory,
     toy_model_digest,
@@ -88,6 +107,17 @@ class CanaryRecord:
     receipt: dict
     negative_prompt: str | None = None
     created_at: float = 0.0
+    # "canary": created by this validator, which knows the prompt and seed itself.
+    # "standard": a standard job's record as the gateway reported it (see the module docstring).
+    source: str = "canary"
+    # The tier of the enclave that ran it, as this validator knows it (None: unknown).
+    tier: str | None = None
+
+
+# Standard-job records from the gateway can't prove these; failures on them are unproven, not attributable.
+GATEWAY_DEPENDENT_FIELDS = ("conditioning", "seed")
+
+PASS, FAIL, UNPROVEN = "pass", "fail", "unproven"
 
 
 @dataclass
@@ -103,6 +133,13 @@ class AuditOutcome:
     audit_id: str | None = None
     full_rerun: bool = False
     at: float = 0.0
+    # "pass", "fail" (attributable), "unproven" (a tolerance class without calibration, or a standard-job record
+    # the gateway alone vouches for), or None for other unattributable problems.
+    verdict: str | None = None
+    source: str = "canary"
+    tier: str | None = None
+    # Tolerance mode: the measured relative update error (kuno_protocol.tolerance).
+    distance: float | None = None
 
 
 class StepExecutor(Protocol):
@@ -130,6 +167,8 @@ class ToyStepExecutor:
     """Reference executor for the mock backend's toy denoiser, so audits really run on dev networks."""
 
     runtime = TOY_RUNTIME
+    # Where this executor replays: tolerance-mode calibration entries are keyed by it.
+    hardware_class = DEV_HARDWARE_CLASS
 
     def candidate_steps(self, commitment: StepCommitment, profile: ModelProfile) -> list[int]:
         return list(range(1, commitment.leaves))
@@ -181,7 +220,14 @@ class AuditPolicy:
     # A missing or late opening is the miner's fault. See VERIFIED_MODE.md for the caveat.
     missing_is_attributable: bool = True
     # Once the network requires verified mode, a canary receipt without a commitment is a failure.
+    # Open-tier receipts on verified profiles always need one: audits are their only integrity check.
     require_commitment: bool = False
+    # Share of open-tier standard jobs to audit; confidential-tier standard jobs use `standard_rate`
+    # (None: each profile's verified.audit_rate).
+    open_tier_rate: float = 0.25
+    standard_rate: float | None = None
+    # Standard jobs older than this aren't sampled: the miner's retention (and the gateway's) is one hour.
+    standard_max_age_s: float = 3000.0
 
 
 @dataclass
@@ -210,6 +256,7 @@ class Auditor:
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        calibration: Calibration | None = None,
     ):
         """`request(method, path, **httpx kwargs)` is the validator's authenticated gateway call
         (Validator._request); `keys(enclave_id)` returns a self-certified enclave key."""
@@ -224,6 +271,10 @@ class Auditor:
         self.sleep = sleep
         self.pending: dict[str, PendingAudit] = {}
         self.outcomes: list[AuditOutcome] = []
+        # Tolerance thresholds per (profile, miner class, executor class); the packaged file until the owner calibrates.
+        self.calibration = calibration if calibration is not None else load_calibration()
+        # Standard jobs already considered for sampling: job id -> finished_at.
+        self._considered: dict[str, float] = {}
         self._load_state()
 
     # ------------------------------------------------------------ selection
@@ -245,6 +296,58 @@ class Auditor:
     def select(self, canaries: list[CanaryRecord]) -> list[CanaryRecord]:
         return [c for c in canaries if self.should_audit(c)]
 
+    def sample_standard(self, rows: list[dict], tiers: dict[str, str], now: float) -> list[dict]:
+        """Ledger rows of standard jobs to audit this round, each job considered once.
+
+        `tiers` maps enclave id -> tier as this validator knows it; unknown enclaves are sampled at the
+        open-tier rate. Open-tier rows without a commitment are selected too, so `request` records the failure.
+        """
+        self._considered = {j: t for j, t in self._considered.items() if t >= now - 2 * self.policy.standard_max_age_s}
+        chosen = []
+        for row in rows:
+            job_id = row.get("job_id")
+            if row.get("privacy") != "standard" or row.get("status") != "succeeded" or not row.get("receipt") or not job_id:
+                continue
+            finished = float(row.get("finished_at") or 0.0)
+            if job_id in self._considered or now - finished > self.policy.standard_max_age_s:
+                continue
+            profile = self.profiles.get(row.get("profile_id") or "")
+            if profile is None or profile.verified is None:
+                continue
+            try:
+                receipt = Receipt.model_validate(row["receipt"])
+            except ValidationError:
+                continue
+            tier = tiers.get(row.get("enclave_id") or "", OPEN)
+            if receipt.body.step_commitment is None and tier != OPEN and not self.policy.require_commitment:
+                continue
+            self._considered[job_id] = finished
+            if tier == OPEN:
+                rate = self.policy.open_tier_rate
+            else:
+                rate = self.policy.standard_rate if self.policy.standard_rate is not None else profile.verified.audit_rate
+            if self.rng.random() < rate:
+                chosen.append({**row, "tier": tier})
+        return chosen
+
+    @staticmethod
+    def standard_record(row: dict, job: dict) -> CanaryRecord | None:
+        """A replayable record from a ledger row and the gateway's standard-job record, or None when this validator
+        could not replay it honestly (no explicit seed, inputs it isn't given, or options that change conditioning)."""
+        if job.get("privacy") != "standard" or job.get("job_id") != row.get("job_id") or job.get("seed") is None:
+            return None
+        options = {k: v for k, v in (job.get("options") or {}).items() if k != "kuno_audit_key"}
+        if job.get("inputs") or options or not isinstance(job.get("prompt"), str):
+            return None
+        params = job.get("params") or row.get("params")
+        if params is None or (row.get("params") is not None and params != row["params"]):
+            return None
+        return CanaryRecord(
+            job_id=row["job_id"], profile_id=row["profile_id"], params=params, prompt=job["prompt"], seed=int(job["seed"]),
+            receipt=row["receipt"], negative_prompt=job.get("negative_prompt"), created_at=float(row.get("finished_at") or 0.0),
+            source="standard", tier=row.get("tier"),
+        )
+
     def _runtime_for(self, profile: ModelProfile, hardware_class: str) -> str | None:
         hardware = profile.verified.hardware_class(hardware_class) if profile.verified else None
         if hardware is None:
@@ -254,6 +357,10 @@ class Auditor:
     # ------------------------------------------------------------ requesting
 
     def _outcome(self, canary: CanaryRecord, ok: bool, detail: str, **extra: Any) -> AuditOutcome:
+        extra.setdefault("source", canary.source)
+        extra.setdefault("tier", canary.tier)
+        if "verdict" not in extra:
+            extra["verdict"] = PASS if ok else (FAIL if extra.get("attributable") else None)
         outcome = AuditOutcome(canary.job_id, canary.profile_id, ok, detail, **extra)
         outcome.at = outcome.at or self.clock()
         self.outcomes.append(outcome)
@@ -280,7 +387,7 @@ class Auditor:
         if profile is None or profile.verified is None:
             return None
         if commitment is None:
-            if self.policy.require_commitment:
+            if self.policy.require_commitment or canary.tier == OPEN:
                 return self._outcome(canary, False, "receipt carries no step commitment for a verified-mode profile", attributable=True, **facts)
             return None
         hardware = profile.verified.hardware_class(commitment.hardware_class)
@@ -372,8 +479,13 @@ class Auditor:
     def verify(self, pending: PendingAudit, opening_json: dict) -> AuditOutcome:
         canary, step, facts = pending.canary, pending.step, self._facts(pending)
 
-        def fail(detail: str, attributable: bool = True) -> AuditOutcome:
-            return self._outcome(canary, False, detail, attributable=attributable, **facts)
+        def fail(detail: str, attributable: bool = True, **extra: Any) -> AuditOutcome:
+            return self._outcome(canary, False, detail, attributable=attributable, **facts, **extra)
+
+        gateway_record = canary.source == "standard"
+
+        def unproven(detail: str, **extra: Any) -> AuditOutcome:
+            return self._outcome(canary, False, detail, attributable=False, verdict=UNPROVEN, **facts, **extra)
 
         receipt = Receipt.model_validate(canary.receipt)
         commitment = receipt.body.step_commitment
@@ -401,8 +513,12 @@ class Auditor:
 
         profile = self.profiles[receipt.body.profile_id]
         transcript = opening.transcript
-        if transcript.params_digest != receipt.body.params_digest or transcript.profile_id != profile.id or transcript.seed != canary.seed:
-            return fail("transcript does not describe this canary (params, profile or seed)")
+        if transcript.params_digest != receipt.body.params_digest or transcript.profile_id != profile.id:
+            return fail("transcript does not describe this job (params or profile)")
+        if transcript.seed != canary.seed:
+            if gateway_record:
+                return unproven("transcript seed differs from the gateway's record of this standard job")
+            return fail("transcript does not describe this canary (seed)")
         runtime = self._runtime_for(profile, commitment.hardware_class)
         if transcript.runtime != runtime:
             return fail(f"transcript runtime {transcript.runtime} is not the verified runtime for {commitment.hardware_class}")
@@ -413,7 +529,11 @@ class Auditor:
             )
         reason = executor.check_transcript(transcript, canary, profile)
         if reason is not None:
+            if gateway_record and any(field in reason for field in GATEWAY_DEPENDENT_FIELDS):
+                return unproven(f"{reason} (as the gateway reported the standard job)")
             return fail(reason)
+        hardware = profile.verified.hardware_class(commitment.hardware_class)
+        tolerant = hardware is not None and comparison_for(hardware) == TOLERANCE
 
         leaves = {leaf.index: leaf for leaf in opening.leaves}
         try:
@@ -423,13 +543,23 @@ class Auditor:
             details = []
             if step in executor.candidate_steps(commitment, profile):
                 produced = executor.execute(transcript, canary, step, latents[step - 1])
-                if latent_digest(produced) != leaves[step].latent:
-                    return fail(f"re-executing step {step} does not reproduce the committed latent (bitwise)")
-                details.append(f"step {step} re-executed bitwise")
+                if not tolerant:
+                    if latent_digest(produced) != leaves[step].latent:
+                        return fail(f"re-executing step {step} does not reproduce the committed latent (bitwise)")
+                    details.append(f"step {step} re-executed bitwise")
+                else:
+                    outcome = self._tolerance_verdict(canary, profile, hardware, executor, step, latents, produced, facts)
+                    if outcome is not None:
+                        return outcome
+                    details.append(self._tolerance_detail)
             else:
                 details.append(f"opening for step {step} verified; this executor cannot replay that step")
-            digests = executor.trajectory(transcript, canary) if pending.include_leaves else None
+            digests = executor.trajectory(transcript, canary) if pending.include_leaves and not tolerant else None
+            if pending.include_leaves and tolerant:
+                details.append("full re-run skipped: tolerance-mode classes don't reproduce leaf digests")
         except TranscriptMismatch as exc:
+            if gateway_record:
+                return unproven(f"{exc} (as the gateway reported the standard job)")
             return fail(str(exc))
         except Exception as exc:  # the validator's own executor broke: not the miner's fault
             log.exception("executor %s failed on audit %s", transcript.runtime, pending.audit_id)
@@ -442,6 +572,33 @@ class Auditor:
                     return fail(f"full re-run diverges from the commitment at leaf {mismatch}")
                 details.append("full re-run matches every leaf")
         return self._outcome(canary, True, "; ".join(details), **facts)
+
+    _tolerance_detail = ""
+
+    def _tolerance_verdict(self, canary, profile, hardware, executor, step, latents, produced, facts) -> AuditOutcome | None:
+        """None when the replay is within the calibrated tolerance (its detail is left in `_tolerance_detail`)."""
+        try:
+            distance = step_distance(latents[step - 1], latents[step], produced)
+        except VerifiedModeError as exc:
+            return self._outcome(canary, False, f"validator replay of step {step} is unusable ({exc}); nothing concluded", attributable=False, **facts)
+        if not distance.finite:
+            return self._outcome(canary, False, f"committed latents around step {step} are not finite", attributable=True, **facts)
+        executor_class = getattr(executor, "hardware_class", None)
+        entry = self.calibration.lookup(profile.id, hardware.id, executor_class)
+        measured = f"rel_l2={distance.rel_l2:.3g}, max_abs_rel={distance.max_abs_rel:.3g}"
+        if entry is None:
+            return self._outcome(
+                canary, False, f"step {step} replayed ({measured}), but {hardware.id} has no tolerance calibration for {profile.id} "
+                f"on {executor_class or 'this executor'}: unproven", attributable=False, verdict=UNPROVEN, distance=distance.rel_l2, **facts,
+            )
+        if not entry.accepts(distance, step):
+            limits = f"rel_l2 ≤ {entry.threshold_for(step):.3g}" + (f", max_abs_rel ≤ {entry.max_abs_threshold:.3g}" if entry.max_abs_threshold else "")
+            return self._outcome(
+                canary, False, f"re-executing step {step} is outside the calibrated tolerance for {hardware.id} ({measured}; allowed {limits})",
+                attributable=True, distance=distance.rel_l2, **facts,
+            )
+        self._tolerance_detail = f"step {step} re-executed within tolerance ({measured} ≤ {entry.threshold_for(step):.3g})"
+        return None
 
     # ------------------------------------------------------------ scoring
 

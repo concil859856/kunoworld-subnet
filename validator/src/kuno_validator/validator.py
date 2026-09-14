@@ -11,16 +11,20 @@ from pathlib import Path
 import httpx
 
 from kuno_protocol.attestation import AttestationEvidence, AttestationPolicy, GoldenManifest, Verdict
-from kuno_protocol.canonical import sha256_hex
+from kuno_protocol.canonical import canonical_json, sha256_hex
 from kuno_protocol.mp4 import Mp4Error, probe
-from kuno_protocol.profiles import ModelProfile, load_profiles
+from kuno_protocol.profiles import Mode, ModelProfile, load_profiles
 from kuno_protocol.receipts import Receipt, verify_receipt
+from kuno_protocol.schemas import GenerationParams, JobState, JobStatus
 from kuno_protocol.switch import SignedSwitch, SwitchConfig
+from kuno_protocol.tiers import OPEN, tier_for_tee
+from kuno_protocol.tolerance import Calibration
 from kuno_protocol.turbo import is_candidate_profile_list
 
-from .audits import AuditPolicy, Auditor, CanaryRecord
+from .audits import AuditOutcome, AuditPolicy, Auditor, CanaryRecord
 from .canaries import pick_prompt
 from .collateral import CollateralGate
+from .open_tier import AdmissionTracker, TierPolicy, apply_tiers, fraud_penalties, open_tier_gpus
 from .ledger import DURATION_SLACK_S, EnclaveKey, LedgerAudit, audit_ledger, duration_bounds, enclave_keys
 from .scoring import MinerScore, compute_scores, hardware_conflicts, normalize
 
@@ -29,6 +33,8 @@ log = logging.getLogger("kuno.validator")
 LEDGER_PAGE = 5000
 # Canary outcomes older than this are pruned from the state file; it must exceed any scoring window.
 CANARY_RETENTION_S = 7 * 86400.0
+# How often a standard canary polls its job.
+STANDARD_CANARY_POLL_S = 2.0
 
 
 class GatewayAuthError(RuntimeError):
@@ -66,6 +72,8 @@ class Validator:
         state_path: Path | None = None,
         policy: AttestationPolicy | None = None,
         collateral: CollateralGate | None = None,
+        tier_policy: TierPolicy | None = None,
+        calibration: Calibration | None = None,
     ):
         if not api_key:
             raise ValueError("a validator API key is required: the gateway authenticates every validator read")
@@ -93,13 +101,18 @@ class Validator:
         # token -> {"kind", "hotkeys": {hotkey: [first_seen, last_seen]}} from our own verdicts only.
         self.hardware_sightings: dict[str, dict] = {}
         self._feed_hardware: dict[str, set[str]] = {}
+        # Open tier (open_tier.py): earning rate, admission probes, and the tiers this validator verified itself.
+        self.tier_policy = tier_policy or TierPolicy()
+        self.admission = AdmissionTracker(self.tier_policy.admission_probes)
+        self.enclave_tiers: dict[str, str] = {}
+        self._feed: dict[str, dict] = {}
         self.state_path = state_path
         self._load_state()
         # Step audits of this validator's own canaries: open a random denoising step and replay it (VERIFIED_MODE.md).
         audit_state = state_path.with_name(f"{state_path.stem}-audits.json") if state_path is not None else None
         self.auditor = Auditor(
             self._request, self.profiles, lambda enclave_id: self._keys.get(enclave_id),
-            policy=AuditPolicy(production=self.policy.production), state_path=audit_state,
+            policy=AuditPolicy(production=self.policy.production), state_path=audit_state, calibration=calibration,
         )
         self._unaudited: list[CanaryRecord] = []
         if owner_public_key is None:
@@ -165,6 +178,7 @@ class Validator:
         """All enclaves the gateway knows, refreshing the self-certified signing keys."""
         enclaves = self._request("GET", "/validator/v1/enclaves").raise_for_status().json()
         self._hotkeys = {e["enclave_id"]: e["miner_hotkey"] for e in enclaves}
+        self._feed = {e["enclave_id"]: e for e in enclaves}
         # What the gateway says each enclave's hardware is. Only compared against, never scored on.
         self._feed_hardware = {e["enclave_id"]: {h["token"] for h in e.get("hardware_ids") or []} for e in enclaves}
         # Keys are bound to their ids, so merging keeps retired enclaves' receipts verifiable.
@@ -203,10 +217,16 @@ class Validator:
                 answer = self._request("GET", f"/validator/v1/challenges/{challenge_id}").json()
                 if answer["status"] == "answered" and answer["evidence"]:
                     evidence = AttestationEvidence.model_validate(answer["evidence"])
-                    verdict = self.policy.verify(evidence, self.manifest, expected_nonce=nonce)
+                    # Open-tier enclaves answer with open evidence, accepted only where our manifest's open_tier policy allows it.
+                    # Confidential evidence is verified exactly as before, so policies without `allow_open` keep working.
+                    extra = {"allow_open": True} if evidence.tee == "open" else {}
+                    verdict = self.policy.verify(evidence, self.manifest, expected_nonce=nonce, **extra)
                     if verdict.enclave_id != enclave["enclave_id"]:
                         verdict.ok = False
                         verdict.reasons.append("answered with different keys than the registered enclave")
+                    elif verdict.ok and verdict.tier:
+                        # Only our own verdicts decide an enclave's tier (rates, admission, the fraud rule).
+                        self.enclave_tiers[verdict.enclave_id] = verdict.tier
                     verdicts[enclave["enclave_id"]] = verdict
                     del pending[challenge_id]
                 elif answer["status"] == "expired":
@@ -253,7 +273,7 @@ class Validator:
         unnamed: dict[str, int] = {}
         for enclave_id, verdict in verdicts.items():
             hotkey = self._hotkeys.get(enclave_id)
-            if not verdict.ok or not hotkey:
+            if not verdict.ok or not hotkey or verdict.tier == OPEN:
                 continue
             gpus = verdict.hardware_tokens("gpu")
             named.setdefault(hotkey, set()).update(gpus)
@@ -262,9 +282,35 @@ class Validator:
             unnamed[hotkey] = unnamed.get(hotkey, 0) + (extra if gpus or extra else 1)
         return {hotkey: len(named[hotkey]) + unnamed.get(hotkey, 0) for hotkey in named}
 
+    def open_tier_gpus(self, verdicts: dict[str, Verdict]) -> dict[str, int]:
+        """GPUs each hotkey runs on the open tier this round: reported or capacity-derived, never attested."""
+        needs = {profile_id: profile.gpus_per_worker for profile_id, profile in self.profiles.items()}
+        counts: dict[str, int] = {}
+        for enclave_id, verdict in verdicts.items():
+            hotkey = self._hotkeys.get(enclave_id)
+            if verdict.ok and hotkey and verdict.tier == OPEN:
+                counts[hotkey] = counts.get(hotkey, 0) + open_tier_gpus(self._feed.get(enclave_id, {}), needs)
+        return counts
+
+    def enclave_tier(self, enclave_id: str | None) -> str | None:
+        """The tier this validator verified itself, else what the gateway's feed says; None when neither knows."""
+        tier = self.enclave_tiers.get(enclave_id or "")
+        if tier is None:
+            feed = self._feed.get(enclave_id or "") or {}
+            tier = feed.get("tier") or (tier_for_tee(feed["tee"]) if feed.get("tee") else None)
+        return tier
+
+    def known_tiers(self) -> dict[str, str]:
+        """Enclave id -> tier for rates and admission: the feed, overridden by our own verdicts."""
+        tiers = {eid: tier for eid in self._feed if (tier := self.enclave_tier(eid))}
+        tiers.update(self.enclave_tiers)
+        return tiers
+
     # ------------------------------------------------------------ canaries
 
-    def run_canary(self, profile_id: str) -> CanaryResult:
+    def run_canary(self, profile_id: str, privacy: str = "private") -> CanaryResult:
+        if privacy == "standard":
+            return self.run_standard_canary(profile_id)
         from kunoworld import KunoError  # only canaries need the client SDK
 
         profile = self.profiles[profile_id]
@@ -291,6 +337,43 @@ class Validator:
             self._remember_canary(profile_id, result, prompt, seed, started)
         return self._record(outcome)
 
+    def run_standard_canary(self, profile_id: str, sleep=time.sleep) -> CanaryResult:
+        """A canary in standard mode (STANDARD_MODE.md): the gateway seals it, so it can reach open-tier miners.
+        These are the admission probes an open-tier hotkey must pass before its work earns."""
+        profile = self.profiles[profile_id]
+        prompt, seed, started = pick_prompt(), secrets.randbelow(2**31), time.time()
+        resolution = next(iter(profile.limits.sizes))
+        params = GenerationParams(
+            profile_id=profile.id, mode=Mode.TEXT_TO_VIDEO, duration_s=profile.limits.min_duration_s, resolution=resolution,
+            aspect_ratio=next(iter(profile.limits.sizes[resolution])), fps=profile.limits.default_fps, audio=profile.limits.audio,
+        )
+        response = self._request("POST", "/v1/standard/videos", json={"params": params.model_dump(mode="json"), "prompt": prompt, "seed": seed})
+        if response.status_code != 201:
+            return self._record(CanaryResult(profile_id, False, f"standard canary refused ({response.status_code})"))
+        status = JobStatus.model_validate(response.json())
+        deadline = started + profile.timeout_s
+        while not status.status.terminal and time.time() < deadline:
+            sleep(STANDARD_CANARY_POLL_S)
+            status = JobStatus.model_validate(self._request("GET", f"/v1/videos/{status.job_id}").raise_for_status().json())
+        job_id = status.job_id
+        if status.status != JobState.SUCCEEDED or status.receipt is None:
+            # No receipt, so nothing proves which miner is at fault; the ledger's reliability gate covers it.
+            return self._record(CanaryResult(profile_id, False, status.error_code or status.status.value, job_id=job_id))
+        video = self._request("GET", f"/v1/standard/videos/{job_id}/video")
+        if video.status_code != 200:
+            return self._record(CanaryResult(profile_id, False, f"standard canary video unavailable ({video.status_code})", job_id=job_id))
+        outcome = self.check_canary_output(profile, job_id, video.content, status.receipt, params.duration_s, resolution)
+        signed = status.receipt.body.params_digest == sha256_hex(canonical_json(params.model_dump(mode="json")))
+        if outcome.ok and not signed:
+            outcome = CanaryResult(profile_id, False, "receipt signs different params than the canary requested", job_id,
+                                   outcome.enclave_id, outcome.miner_hotkey, True)
+        if outcome.ok and profile.verified is not None:
+            self._unaudited.append(CanaryRecord(
+                job_id=job_id, profile_id=profile_id, params=params.model_dump(mode="json"), prompt=prompt, seed=seed,
+                receipt=status.receipt.model_dump(mode="json"), created_at=time.time(), tier=self.enclave_tier(outcome.enclave_id),
+            ))
+        return self._record(outcome)
+
     def _remember_canary(self, profile_id: str, result, prompt: str, seed: int, started: float) -> None:
         """Keeps what a step audit needs; the params come from the ledger so they hash to the signed digest."""
         params = next((row.get("params") for row in self.ledger(started - 60) if row.get("job_id") == result.job_id), None)
@@ -302,16 +385,39 @@ class Validator:
             receipt=result.receipt.model_dump(mode="json"), created_at=time.time(),
         ))
 
+    def standard_audit_records(self, now: float) -> list[CanaryRecord]:
+        """Standard jobs sampled from the ledger, with the prompt and seed the gateway gives validators for them."""
+        rows = self.ledger(now - self.auditor.policy.standard_max_age_s)
+        records = []
+        for row in self.auditor.sample_standard(rows, self.known_tiers(), now):
+            response = self._request("GET", f"/validator/v1/standard-jobs/{row['job_id']}")
+            if response.status_code != 200:
+                log.info("standard job %s can't be audited: the gateway answered %s", row["job_id"], response.status_code)
+                continue
+            record = Auditor.standard_record(row, response.json())
+            if record is None:
+                log.info("standard job %s isn't replayable here (no explicit seed, inputs or options); not audited", row["job_id"])
+                continue
+            records.append(record)
+        return records
+
     def run_audits(self) -> None:
-        """Requests step audits for a sample of this round's canaries and waits for them to conclude."""
-        for canary in self.auditor.select(self._unaudited):
-            self.auditor.request(canary)
+        """Requests step audits for a sample of this round's canaries and of recent standard jobs, and waits for them."""
+        outcomes: list[AuditOutcome] = []
+        for canary in [*self.auditor.select(self._unaudited), *self.standard_audit_records(time.time())]:
+            result = self.auditor.request(canary)
+            if isinstance(result, AuditOutcome):
+                outcomes.append(result)
         self._unaudited = []
         give_up = time.time() + self.auditor.policy.deadline_s + 5
         while self.auditor.pending and time.time() < give_up:
-            self.auditor.poll()
+            outcomes.extend(self.auditor.poll())
             if self.auditor.pending:
                 time.sleep(self.auditor.policy.poll_s)
+        for outcome in outcomes:
+            # An attributable audit failure during probation restarts an open-tier miner's admission.
+            if outcome.attributable and not outcome.ok and outcome.miner_hotkey and outcome.tier == OPEN:
+                self.admission.record(outcome.miner_hotkey, False, True, outcome.at)
 
     def check_canary_output(
         self, profile: ModelProfile, job_id: str, video: bytes, receipt: Receipt, duration_s: float, resolution: str
@@ -356,6 +462,8 @@ class Validator:
     def _record(self, result: CanaryResult) -> CanaryResult:
         result.at = result.at or time.time()
         self.canary_results.append(result)
+        if result.miner_hotkey and self.enclave_tier(result.enclave_id) == OPEN:
+            self.admission.record(result.miner_hotkey, result.ok, result.attributable, result.at)
         self._save_state()
         return result
 
@@ -382,6 +490,15 @@ class Validator:
         audit = audit_ledger(rows, self._keys, self.profiles)
         self.last_audit = audit
         penalties = {hotkey: list(reasons) for hotkey, reasons in audit.penalties.items()}
+        # Tiers: open-tier work earns at the tier rate once admitted. The fraud rule trusts only our own verdicts.
+        for enclave_id, verdict in verdicts.items():
+            if verdict.ok and verdict.tier:
+                self.enclave_tiers[enclave_id] = verdict.tier
+        flags = {hotkey: list(items) for hotkey, items in audit.flags.items()}
+        for hotkey, items in apply_tiers(audit.entries, self.known_tiers(), self.admission).items():
+            flags.setdefault(hotkey, []).extend(items)
+        for hotkey, reasons in fraud_penalties(audit.entries, self.enclave_tiers).items():
+            penalties.setdefault(hotkey, []).extend(reasons)
         for hotkey, reasons in self.canary_penalties(now, window_s).items():
             penalties.setdefault(hotkey, []).extend(reasons)
         for hotkey, reasons in self.auditor.penalties(now, window_s).items():
@@ -392,23 +509,25 @@ class Validator:
             penalties.setdefault(hotkey, []).extend(reasons)
         if self.collateral is not None and self.collateral.enabled:
             gpus = {hotkey: count for hotkey, count in self.attested_gpus(verdicts).items() if hotkey in attested}
-            for hotkey, reasons in self.collateral.penalties(gpus, now).items():
+            open_gpus = {hotkey: count for hotkey, count in self.open_tier_gpus(verdicts).items() if hotkey in attested}
+            for hotkey, reasons in self.collateral.penalties(gpus, now, open_gpus).items():
                 penalties.setdefault(hotkey, []).extend(reasons)
         self._save_state()
         return compute_scores(
             audit.entries, attested, self.profiles, self.switch(), now, window_s,
-            penalties=penalties, flags=audit.flags,
+            penalties=penalties, flags=flags, tier_rates=self.tier_policy.rates(),
         )
 
-    def step(self, canary_profiles: list[str] | None = None) -> dict[str, float]:
+    def step(self, canary_profiles: list[str] | None = None, standard_canary_profiles: list[str] | None = None) -> dict[str, float]:
         verdicts = self.check_enclaves()
         for eid, verdict in verdicts.items():
             if not verdict.ok:
                 log.warning("enclave %s failed attestation: %s", eid, "; ".join(verdict.reasons))
-        for profile_id in canary_profiles or []:
-            outcome = self.run_canary(profile_id)
+        canaries = [(p, "private") for p in canary_profiles or []] + [(p, "standard") for p in standard_canary_profiles or []]
+        for profile_id, privacy in canaries:
+            outcome = self.run_canary(profile_id, privacy)
             level = logging.INFO if outcome.ok else logging.WARNING
-            log.log(level, "canary %s on %s: %s", profile_id, outcome.miner_hotkey or "unknown miner", outcome.detail)
+            log.log(level, "%s canary %s on %s: %s", privacy, profile_id, outcome.miner_hotkey or "unknown miner", outcome.detail)
         self.run_audits()
         scores = self.score(verdicts)
         for miner in scores.values():
@@ -444,6 +563,8 @@ class Validator:
         }
         if self.collateral is not None and state.get("collateral"):
             self.collateral.load(state["collateral"])
+        self.admission.load(state.get("admission") or {})
+        self.enclave_tiers = {k: v for k, v in (state.get("tiers") or {}).items() if isinstance(v, str)}
 
     def _save_state(self) -> None:
         if self.state_path is None:
@@ -455,6 +576,8 @@ class Validator:
             "canaries": [asdict(r) for r in self.canary_results],
             "hardware": self.hardware_sightings,
             "collateral": self.collateral.dump() if self.collateral is not None else None,
+            "admission": self.admission.dump(),
+            "tiers": self.enclave_tiers,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")

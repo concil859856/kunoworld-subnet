@@ -12,6 +12,7 @@ from kuno_protocol.canonical import b64d
 from kuno_protocol.policy import policy_from_env
 
 from .collateral import CollateralGate
+from .open_tier import TierPolicy
 from .validator import Validator
 
 log = logging.getLogger("kuno.validator")
@@ -28,6 +29,10 @@ def main() -> None:
     parser.add_argument("command", choices=["once", "run"], help="one scoring round, or loop forever")
     parser.add_argument("--interval", type=float, default=4320.0, help="seconds between rounds (default: one tempo)")
     parser.add_argument("--canary", action="append", default=[], help="profile id to send a canary job to (repeatable)")
+    parser.add_argument(
+        "--standard-canary", action="append", default=[],
+        help="profile id to send a standard-mode canary to (repeatable); these reach open-tier miners and admit them",
+    )
     parser.add_argument("--netuid", type=int, help="set weights on this subnet (requires the chain extra)")
     parser.add_argument("--wallet-name", default="default")
     parser.add_argument("--wallet-hotkey", default="default")
@@ -58,6 +63,11 @@ def main() -> None:
     collateral = CollateralGate.from_env(env, args.netuid, args.network)
     if collateral is not None and args.netuid is None:
         log.error("KUNO_MIN_COLLATERAL_PER_GPU is set but --netuid is not: collateral can't be read, so every miner fails it")
+    # Open tier: KUNO_OPEN_TIER_RATE (default 0.5), KUNO_OPEN_TIER_PROBES (default 5); tolerance thresholds from
+    # KUNO_TOLERANCE_CALIBRATION, else the file shipped with kuno-protocol (empty until the owner calibrates: unproven).
+    from kuno_protocol.tolerance import load_calibration
+
+    calibration = load_calibration(env.get("KUNO_TOLERANCE_CALIBRATION") or None)
     validator = Validator(
         env.get("KUNO_GATEWAY_URL", "http://127.0.0.1:8080"),
         env["KUNO_VALIDATOR_API_KEY"],
@@ -66,6 +76,8 @@ def main() -> None:
         state_path=state_path,
         policy=policy,
         collateral=collateral,
+        tier_policy=TierPolicy.from_env(env),
+        calibration=calibration,
     )
 
     turbo = None
@@ -91,7 +103,7 @@ def main() -> None:
         threading.Thread(target=_turbo_loop, args=(turbo, latest, args, stop), daemon=True).start()
 
     while True:
-        weights = validator.step(args.canary)
+        weights = validator.step(args.canary, args.standard_canary)
         latest["serving"] = weights
         print(json.dumps(weights, indent=2))
         if args.netuid is not None:

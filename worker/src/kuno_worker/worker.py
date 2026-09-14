@@ -67,6 +67,12 @@ class Worker:
             raise ValueError(f"unknown profiles: {', '.join(unknown)}")
         if hotkey is not None and config.miner_hotkey and config.miner_hotkey != hotkey.ss58_address:
             raise ValueError(f"KUNO_MINER_HOTKEY is {config.miner_hotkey} but the configured hotkey secret is {hotkey.ss58_address}")
+        if config.tee == "open":
+            # No quote binds an open-tier worker's keys to anyone; its hotkey proof must (PRIVACY_MODES.md).
+            if hotkey is None:
+                raise ValueError("an open-tier worker (KUNO_TEE=open) needs its miner hotkey secret to prove every registration")
+            if config.provenance == "c2pa" and config.provenance_cert_chain is None:
+                raise ValueError("the gateway issues C2PA certificates to attested enclaves only: run open-tier workers with KUNO_PROVENANCE=off")
         self.hotkey = hotkey
         self.miner_hotkey = hotkey.ss58_address if hotkey is not None else config.miner_hotkey
         self.failures = 0

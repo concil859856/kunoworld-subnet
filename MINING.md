@@ -26,11 +26,11 @@ reachability, then lists which profiles the machine can serve and what is missin
 The subnet README's hardware classes (C1, C2, C4) are how the network groups these profiles;
 the VRAM column is the minimum each one needs.
 
-Mainnet additionally requires an Intel TDX host (Xeon 5th gen "Emerald Rapids" or Xeon 6
-"Granite Rapids") with the GPUs in NVIDIA confidential-computing mode. Consumer cards
-(RTX 4090/5090) have no confidential mode and cannot mine. AMD SEV-SNP is not admitted
-yet. Renting a plain GPU box is fine for the dev network below, but it cannot earn on
-mainnet, because it cannot produce an attestation quote.
+The confidential tier, which serves private jobs, additionally requires an Intel TDX host
+(Xeon 5th gen "Emerald Rapids" or Xeon 6 "Granite Rapids") with the GPUs in NVIDIA
+confidential-computing mode. Consumer cards (RTX 4090/5090) have no confidential mode, so they
+cannot join it. AMD SEV-SNP is not admitted yet. A plain GPU box can still mine standard jobs on
+the **open tier** where the owner enables it; see [section 6](#6-open-tier-mining-without-a-tee).
 
 ## 2. Get the weights
 
@@ -217,14 +217,82 @@ verified attestation. What this means in practice:
 On a dev network each mock worker is its own simulated machine. Set `KUNO_MOCK_MACHINE_ID` on
 two workers to put them on the same simulated hardware.
 
+## 6. Open tier: mining without a TEE
+
+KunoWorld runs two kinds of job ([PRIVACY_MODES.md](PRIVACY_MODES.md)). **Private** jobs are end to
+end encrypted and run only on the confidential tier. **Standard** jobs are readable by the
+platform and by the GPU provider, and any miner may run them, including an open-tier miner with
+no TEE at all.
+
+**Who can mine.** Anyone with a registered hotkey and a supported GPU, once the owner-signed
+golden manifest enables the open tier for the worker image (`open_tier.images`). Production
+manifests don't enable it by default; dev manifests from `kuno-devkit init` do, for the dev image.
+
+**What you can see.** Everything about the standard jobs you run: prompts, inputs and videos, in
+your process memory. You never receive private jobs: the gateway doesn't route them to open-tier
+enclaves, fails one that reaches you before sending it, and validators treat a private-job receipt
+from an open-tier enclave as fraud (zero weight).
+
+**Hardware.** One GPU per worker, LTX-2.5 only. `ltx-2.5-4k` needs 141 GB and MiniMax H3 needs
+4 × 80 GB, so neither has an open-tier class.
+
+| Hardware class | GPU | Weights | Profiles | Why it fits |
+|---|---|---|---|---|
+| `O1.rtx-4090-24gb.x1.int8` | RTX 4090 24 GB | int8 | `ltx-2.5-fast`, short clips | LTX-2.5's int8 build measured 22.67 GiB resident on a 4090 for a 5 s clip; longer clips need weight streaming ([runaihome](https://runaihome.com/blog/ltx-2-5-local-ai-video-hardware-guide-2026/)) |
+| `O1.rtx-5090-32gb.x1.fp8-cast` | RTX 5090 32 GB | fp8-cast | `ltx-2.5-fast` | FP8 cuts the LTX-2.5 transformer from 35.37 GB to 18.11 GB (SGLang docs, research_model_capabilities.md §2.4.3); LTX-2.3 fp8-cast peaked at 24.2 GB for 97 frames at 1280×704 on a 5090 without offload ([benchmark](https://huggingface.co/datasets/witcheer/rtx-5090-benchmarks/blob/main/reports/ltx-2.3.md)) |
+| `O1.rtx-pro-6000-bw-96gb.x1` | RTX PRO 6000 Blackwell 96 GB (workstation, or Server Edition with CC off) | bf16 | `ltx-2.5-fast`, `ltx-2.5-pro` | the full bf16 pipeline needs 80–96 GB (research_model_capabilities.md §2.5) |
+| `O1.h100-80gb.x1` | H100 80 GB, CC off | bf16 | `ltx-2.5-fast`, `ltx-2.5-pro` | as above; the profiles' 80 GB minimum |
+
+Pin `KUNO_PROFILES` and `KUNO_VERIFIED_HARDWARE_CLASS` to your class. A 24–32 GB card that fails
+long or high-resolution jobs counts those failures against its success rate. The worker's resident
+LTX backend loads bf16 today: **the int8 and fp8-cast classes need a quantized loader recipe that
+is not built yet**, so until then only the 80–96 GB classes can actually serve.
+
+**Running it.**
+
+```bash
+export KUNO_TEE=open                                   # no quote; standard jobs only
+export KUNO_HOTKEY_SEED_FILE=/run/secrets/hotkey.seed  # required: the worker refuses to start without a hotkey
+export KUNO_BACKEND=real KUNO_PROFILES=ltx-2.5-fast
+export KUNO_VERIFIED_HARDWARE_CLASS=O1.rtx-5090-32gb.x1.fp8-cast
+export KUNO_PROVENANCE=off                             # the gateway issues C2PA certificates to attested enclaves only
+uv run kuno-worker
+```
+
+Every registration and re-registration carries your hotkey proof; the gateway refuses open-tier
+registrations without one on every network. Your hardware dictionary (`KUNO_HW_*`) is published as
+self-reported and is never treated as a verified identity.
+
+**Content safety.** The worker runs the same in-process safety gate (blocklist, and the prompt and
+frame classifiers when configured). The platform also moderates standard content server-side,
+since it can read it. Unlike a TDX worker, an open-tier worker starts without classifiers, but
+configure them anyway: blocked jobs cost you nothing, delivered abuse does.
+
+**How you are checked.** Attestation proves nothing here, so:
+- **Step audits.** Every receipt on a verified profile must carry a step commitment. Validators
+  audit about a quarter of your standard jobs, and their own canaries, replaying one denoising step
+  within your class's calibrated tolerance ([VERIFIED_MODE.md](VERIFIED_MODE.md#tolerance-mode)).
+  Until the owner calibrates your class these audits conclude `unproven` and cost nothing; after
+  that, a replay outside the tolerance zeroes you for the window.
+- **Admission.** A new open-tier hotkey earns nothing until it has passed 5 validator canaries
+  (`KUNO_OPEN_TIER_PROBES`). An attributable failure during probation restarts the count.
+- **Collateral.** `KUNO_MIN_COLLATERAL_PER_GPU_OPEN` alpha per GPU, by default twice the
+  confidential requirement. Your GPUs count as the larger of `KUNO_HW_GPU_COUNT` and
+  `KUNO_CAPACITY` × one GPU per LTX job.
+- **Rate.** Verified open-tier work earns half of what the same work earns on the confidential
+  tier (`KUNO_OPEN_TIER_RATE`, default 0.5).
+- **Canaries, receipts, replay detection and the success-rate gate** apply unchanged. Hardware
+  dedupe does not: there is no verified identity to dedupe.
+
 ## What earns
 
 Validators score verified video compute units from enclave-signed receipts, split between
 model families by the owner-signed switch. Scores are gated on:
 - a live attestation;
 - reliability: at least 98% success once you have 20 finished jobs in the 24-hour window;
-- enough locked collateral for your attested GPUs;
-- not sharing hardware with a hotkey that showed it first.
+- enough locked collateral for your attested GPUs (open tier: per open-tier GPU, at the higher rate);
+- not sharing hardware with a hotkey that showed it first (confidential tier);
+- open tier: admission probes passed, and earnings at `KUNO_OPEN_TIER_RATE` of confidential-tier work.
 
 Jobs that fail because of your machine (crash, timeout, going offline with work assigned)
 count against the success rate. Customer-side failures such as a blocked prompt do not.

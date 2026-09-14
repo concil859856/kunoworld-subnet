@@ -80,6 +80,15 @@ signed over `"kuno/v1/mock-quote\n" + canonical_json(body)` with a key listed in
 Mock GPU evidence is `canonical_json({"mock_gpu", "nonce", "cc_mode", "gpus": [{"ueid": hex}, …]})`.
 Production manifests list no mock keys, and a production verifier refuses `tee: "mock"` outright.
 
+**Open tier (`tee: "open"`).** A miner without a TEE (PRIVACY_MODES.md) sends evidence with
+`quote: ""`, no `gpu_evidence`, and the usual nonce, keys, image digest, profiles and
+self-reported `hardware`. It proves nothing about the machine. A verifier accepts it only when
+the caller asks for open-tier evidence (`verify_evidence(..., allow_open=True)`: the gateway at
+registration and challenges, validators at challenges; never a client sealing a private job) and
+the manifest's `open_tier` policy allows the image digest for every claimed profile. It must
+still be fresh and bound to the challenge nonce. Its tier is `kuno_protocol.tiers.tier_for_tee(tee)`:
+`tdx` and `mock` are `confidential`, everything else `open`.
+
 ## Hardware identities
 
 A verdict that passes carries the hardware it proved (`kuno_protocol.hardware`). Identities are
@@ -117,6 +126,13 @@ signed manifest whose signature does not verify; production verifiers also refus
 manifests and any manifest that trusts the simulated TEE. A bare `GoldenManifest` document is
 still accepted on development networks.
 
+`GoldenManifest.open_tier` is optional:
+`{"enabled": bool, "images": [{"image_digest", "profiles": [...]}]}`. Absent (the default, and
+what production has until the owner adds it) or disabled, every open-tier registration is
+refused. When absent it is left out of the signed bytes, so manifests signed before the field
+existed still verify. An open-tier image digest is self-reported: the list states which releases
+the owner expects and lets it withdraw one, nothing more.
+
 ## Miner registration and hotkey proof
 
 `POST /miner/v1/enclaves` takes `{"evidence", "miner_hotkey", "capacity", "hotkey_proof"?}`.
@@ -140,6 +156,12 @@ evidence (the nonce is the gateway-issued registration nonce), requires `hotkey`
 `miner_hotkey`, and decodes `hotkey` as an SS58 address with network prefix 42.
 
 The answer is `{"enclave_id", "status": "active", "verified_at", "replaced": [enclave_id, …]}`.
+
+**Open tier.** The hotkey proof is mandatory for `tee: "open"` on every network, dev included
+(`403 hotkey_proof_required`): with no quote it is the only thing binding the worker's keys to a
+miner. Enclave keys registered on one tier can't re-register on the other (`409 tier_changed`),
+and a challenge answer whose tier differs from the registration marks the enclave `stale`.
+Open-tier enclaves are not issued C2PA certificates (`403 tier_not_eligible`).
 
 ## Hardware registry
 
@@ -183,9 +205,21 @@ needs cleaning up. The history stays for audit.
   `enclave_ttl_s` while it still polls without valid evidence.
 - Validators apply their own window on top of this (VALIDATING.md, "Hardware dedupe").
 
-**Enclave feed.** `GET /validator/v1/enclaves` adds two fields to each enclave:
-`gpu_count` and `hardware_ids: [{"kind", "token", "first_seen", "last_seen"}]`. `hardware` is
-still published, but it is the worker's unverified self-report.
+**Open tier.** Open-tier evidence yields no identities and no `gpu_count`, so an open-tier
+enclave binds nothing, holds nothing, is never refused as `hardware_in_use`, and its capacity is
+not checked against GPUs. Its self-reported `hardware` is stored and published as it is for every
+enclave, and never used for dedupe.
+
+**Enclave feed.** `GET /validator/v1/enclaves` adds three fields to each enclave:
+`tier` (`"confidential"` or `"open"`), `gpu_count` and
+`hardware_ids: [{"kind", "token", "first_seen", "last_seen"}]`. `hardware` is still published,
+but it is the worker's unverified self-report.
+
+**Ledger feed.** Each `GET /validator/v1/ledger` row carries `privacy` (`"private"` or `"standard"`).
+
+**Routing.** Private jobs are created for, and handed to, confidential-tier enclaves only
+(`tier_serves(tier, "private")`). A private job that reaches an open-tier enclave anyway is failed
+with `enclave_unavailable` when that enclave pulls it, before its ciphertext is sent.
 
 Multi-process gateways serialize these checks with a per-process lock and, on Postgres,
 transaction-scoped advisory locks keyed by token.
@@ -241,6 +275,9 @@ integers and strings only. When absent the key is omitted from the body (never `
 signed message of a receipt without it is unchanged.
 
 **Audit request** (validator → gateway): `{"job_id", "step", "recipient_public_key": b64url(X25519), "include_leaves"}`.
+Accepted for any standard job (at most 3 per validator and 12 in total per job) and for a private
+job only when the requesting validator's account created it (`403 not_audit_owner` otherwise,
+also for unknown jobs).
 **Work item** (gateway → enclave): the same fields plus `"kind":"audit"`, `"audit_id"`, `"expires_at"`.
 
 **Opening.**
@@ -262,6 +299,13 @@ signature  = Ed25519 by the enclave signing key over
 An opening reveals leaves 0, `k-1` and `k` (all leaves when `include_leaves`), their inclusion
 proofs, and the latents at `k-1` and `k`. Verifiers take the tree size from the signed commitment,
 never from the opening.
+
+**Comparison.** `StepCommitment.hardware_class` names a class in the profile. A class with
+`comparison: "bitwise"` must reproduce the committed latent digest exactly; a class with
+`comparison: "tolerance"` (open-tier hardware) must stay within the calibrated relative update
+error, `‖x̂_k − x_k‖₂ / ‖x_k − x_{k−1}‖₂` (and optionally the same with max-abs), per tensor,
+worst tensor deciding (`kuno_protocol/tolerance.py`). Without a calibration entry the verdict is
+`unproven`.
 
 **Audit binding.** A sealed payload may carry `options["kuno_audit_key"] = hex(H("kuno/v1/audit-binding\n" | X25519 public key))`;
 the enclave then opens that job only to that key.

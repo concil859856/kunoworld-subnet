@@ -21,7 +21,7 @@ class WorkerConfig:
     gateway_url: str
     profiles: list[str]
     backend: str = "mock"  # mock | real
-    tee: str = "mock"  # mock | tdx
+    tee: str = "mock"  # mock | tdx | open (open tier: no TEE, standard jobs only, hotkey required)
     image_digest: str = "sha256:kuno-worker-dev"
     mock_quote_key_file: Path | None = None
     # How a TDX worker collects NVIDIA GPU evidence: auto | nvattest | nvml.

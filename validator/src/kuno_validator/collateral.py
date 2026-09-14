@@ -17,7 +17,11 @@ What is read (verified against finney metadata at spec_version 455, and against 
 position; only the owning coldkey can call `add_collateral`, so the owner's position is the one
 that counts.
 
-The requirement is `KUNO_MIN_COLLATERAL_PER_GPU` alpha per attested GPU. It is set in alpha,
+The requirement is `KUNO_MIN_COLLATERAL_PER_GPU` alpha per attested GPU, and
+`KUNO_MIN_COLLATERAL_PER_GPU_OPEN` alpha per open-tier GPU (default: twice the confidential amount;
+it may not be lower). Open-tier GPUs are not attested, so they are counted as the larger of what the
+enclave reports and what its capacity needs (open_tier.open_tier_gpus), and collateral carries the
+weight attestation carries for the confidential tier. It is set in alpha,
 not TAO, because that is what the chain locks. A TAO-equivalent requirement would need the
 pool's spot price, which anyone can move inside a block, so miners could be pushed under the
 line on purpose. The owner revisits the number when alpha's price moves a lot.
@@ -38,6 +42,8 @@ log = logging.getLogger("kuno.validator.collateral")
 
 RAO_PER_ALPHA = 10**9
 DEFAULT_MAX_STALE_S = 2 * 360 * 12.0  # two default tempos of 360 blocks at 12 s
+# Open-tier collateral per GPU relative to the confidential requirement, when not set explicitly.
+DEFAULT_OPEN_MULTIPLIER = 2
 NETWORK_ENDPOINTS = {
     "finney": "wss://entrypoint-finney.opentensor.ai:443",
     "archive": "wss://archive.chain.opentensor.ai:443",
@@ -135,31 +141,39 @@ class CollateralGate:
         netuid: int | None,
         min_per_gpu: int,
         max_stale_s: float = DEFAULT_MAX_STALE_S,
+        min_per_gpu_open: int | None = None,
     ):
-        if min_per_gpu < 0:
+        if min_per_gpu < 0 or (min_per_gpu_open or 0) < 0:
             raise ValueError("the collateral requirement cannot be negative")
+        open_minimum = DEFAULT_OPEN_MULTIPLIER * min_per_gpu if min_per_gpu_open is None else min_per_gpu_open
+        if open_minimum < min_per_gpu:
+            raise ValueError("KUNO_MIN_COLLATERAL_PER_GPU_OPEN cannot be below KUNO_MIN_COLLATERAL_PER_GPU: open-tier GPUs are not attested")
         self.reader, self.netuid = reader, netuid
         self.min_per_gpu = min_per_gpu
+        self.min_per_gpu_open = open_minimum
         self.max_stale_s = max_stale_s
         # hotkey -> (locked alpha base units, when it was read)
         self.view: dict[str, tuple[int, float]] = {}
 
     @property
     def enabled(self) -> bool:
-        return self.min_per_gpu > 0
+        return self.min_per_gpu > 0 or self.min_per_gpu_open > 0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str], netuid: int | None, network: str = "finney") -> CollateralGate | None:
-        """KUNO_MIN_COLLATERAL_PER_GPU (alpha; unset or 0 disables), KUNO_COLLATERAL_MAX_STALE_S,
-        KUNO_CHAIN_ENDPOINT (defaults to the --network's public endpoint)."""
+        """KUNO_MIN_COLLATERAL_PER_GPU (alpha; unset or 0 disables), KUNO_MIN_COLLATERAL_PER_GPU_OPEN (alpha per
+        open-tier GPU; default twice the former), KUNO_COLLATERAL_MAX_STALE_S, KUNO_CHAIN_ENDPOINT (defaults to the
+        --network's public endpoint). Both unset or 0 disables the gate."""
         text = (env.get("KUNO_MIN_COLLATERAL_PER_GPU") or "").strip()
         minimum = parse_alpha(text) if text else 0
-        if minimum == 0:
+        open_text = (env.get("KUNO_MIN_COLLATERAL_PER_GPU_OPEN") or "").strip()
+        open_minimum = parse_alpha(open_text) if open_text else None
+        if minimum == 0 and not open_minimum:
             return None
         reader = None
         if netuid is not None:
             reader = SubstrateCollateralReader(env.get("KUNO_CHAIN_ENDPOINT") or NETWORK_ENDPOINTS.get(network, network))
-        return cls(reader, netuid, minimum, float(env.get("KUNO_COLLATERAL_MAX_STALE_S") or DEFAULT_MAX_STALE_S))
+        return cls(reader, netuid, minimum, float(env.get("KUNO_COLLATERAL_MAX_STALE_S") or DEFAULT_MAX_STALE_S), open_minimum)
 
     def refresh(self, hotkeys: Sequence[str], now: float) -> str | None:
         """Reads every hotkey at once; returns why it couldn't, keeping the previous view."""
@@ -176,14 +190,17 @@ class CollateralGate:
             self.view[hotkey] = (max(int(amounts.get(hotkey, 0)), 0), now)
         return None
 
-    def penalties(self, gpus: Mapping[str, int], now: float) -> dict[str, list[str]]:
-        """`gpus`: attested GPUs per hotkey this round."""
-        if not self.enabled or not gpus:
+    def penalties(self, gpus: Mapping[str, int], now: float, open_gpus: Mapping[str, int] | None = None) -> dict[str, list[str]]:
+        """`gpus`: attested (confidential-tier) GPUs per hotkey this round; `open_gpus`: open-tier GPUs per hotkey."""
+        open_gpus = dict(open_gpus or {})
+        if not self.enabled or not (gpus or open_gpus):
             return {}
-        error = self.refresh(list(gpus), now)
+        hotkeys = sorted(set(gpus) | set(open_gpus))
+        error = self.refresh(hotkeys, now)
         penalties: dict[str, list[str]] = {}
-        for hotkey, count in sorted(gpus.items()):
-            required = self.min_per_gpu * max(count, 1)
+        for hotkey in hotkeys:
+            count, open_count = gpus.get(hotkey, 0), open_gpus.get(hotkey, 0)
+            required = (self.min_per_gpu * max(count, 1) if hotkey in gpus else 0) + self.min_per_gpu_open * open_count
             reading = self.view.get(hotkey)
             if reading is None or now - reading[1] > self.max_stale_s:
                 why = f"chain read failed: {error}" if error else "never read"
@@ -191,10 +208,13 @@ class CollateralGate:
                 continue
             locked = reading[0]
             if locked < required:
-                penalties[hotkey] = [
-                    f"collateral {format_alpha(locked)} alpha is below the {format_alpha(required)} alpha required "
-                    f"for {count} attested GPU(s) ({format_alpha(self.min_per_gpu)} per GPU)"
-                ]
+                if not open_count:
+                    basis = f"for {count} attested GPU(s) ({format_alpha(self.min_per_gpu)} per GPU)"
+                else:
+                    basis = f"for {open_count} open-tier GPU(s) ({format_alpha(self.min_per_gpu_open)} per GPU)"
+                    if hotkey in gpus:
+                        basis += f" and {count} attested GPU(s) ({format_alpha(self.min_per_gpu)} per GPU)"
+                penalties[hotkey] = [f"collateral {format_alpha(locked)} alpha is below the {format_alpha(required)} alpha required {basis}"]
         for hotkey in [h for h, (_, at) in self.view.items() if now - at > self.max_stale_s]:
             del self.view[hotkey]
         return penalties

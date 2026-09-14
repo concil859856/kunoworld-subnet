@@ -25,7 +25,16 @@ import secrets
 from pathlib import Path
 
 from . import c2pa_certs
-from .attestation import AllowedMeasurement, GoldenManifest, SignedManifest, mock_measurements, parse_manifest, sign_manifest
+from .attestation import (
+    AllowedMeasurement,
+    GoldenManifest,
+    OpenTierImage,
+    OpenTierPolicy,
+    SignedManifest,
+    mock_measurements,
+    parse_manifest,
+    sign_manifest,
+)
 from .canonical import b64d, b64e
 from .crypto import generate_signing_key, public_key_bytes, signing_key_bytes, signing_key_from_bytes
 from .hotkey import Sr25519Signer
@@ -62,6 +71,9 @@ def init(data_dir: Path, force: bool = False) -> dict[str, str]:
             )
         ],
         mock_quote_keys=[b64e(public_key_bytes(quote_key))],
+        # Dev networks let the dev image mine on the open tier too (KUNO_TEE=open). A production manifest has no
+        # open_tier block unless the owner adds one, and production refuses this manifest anyway (it trusts the mock TEE).
+        open_tier=OpenTierPolicy(enabled=True, images=[OpenTierImage(image_digest=DEV_IMAGE_DIGEST, profiles=list(load_profiles()))]),
     )
     # The bare file stays for readers that predate signed manifests.
     (data_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2))

@@ -7,7 +7,7 @@ import signal
 import threading
 import time
 
-from kuno_protocol.attestation import MockTEE, TdxTEE
+from kuno_protocol.attestation import MockTEE, OpenTEE, TdxTEE
 from kuno_protocol.canonical import b64d
 from kuno_protocol.crypto import signing_key_from_bytes
 
@@ -34,7 +34,40 @@ def build_tee(config: WorkerConfig):
             raise SystemExit("KUNO_MOCK_QUOTE_KEY_FILE is required for the mock TEE (run `kuno-devkit init`).")
         key = signing_key_from_bytes(b64d(config.mock_quote_key_file.read_text().strip()))
         return MockTEE(key, config.image_digest)
-    raise SystemExit(f"unknown TEE {config.tee!r}; use 'tdx' or 'mock'")
+    if config.tee == "open":
+        return OpenTEE()
+    raise SystemExit(f"unknown TEE {config.tee!r}; use 'tdx', 'open' or 'mock'")
+
+
+def check_hotkey(config: WorkerConfig, hotkey) -> None:
+    """An open-tier worker has no quote, so its hotkey proof is the only binding of its keys to a miner: no hotkey, no start."""
+    if config.tee == "open" and hotkey is None:
+        raise SystemExit(
+            "KUNO_TEE=open needs the miner's hotkey secret (KUNO_HOTKEY_SEED_FILE or KUNO_WALLET_NAME): "
+            "every open-tier registration must carry a hotkey proof"
+        )
+    if hotkey is None and config.tee == "tdx":
+        log.warning(
+            "no hotkey secret configured (KUNO_HOTKEY_SEED_FILE or KUNO_WALLET_NAME): "
+            "production gateways refuse registrations without a hotkey proof"
+        )
+
+
+def check_safety(config: WorkerConfig, gate) -> None:
+    """A production (TDX) worker refuses to start without a working prompt classifier and frame classifier.
+
+    Private content is judged only inside the enclave, so these checks are the whole safety story there.
+    Mock (dev) workers keep the permissive default; open-tier workers run the same gate, and the platform
+    also moderates standard content server-side.
+    """
+    if config.tee != "tdx":
+        return
+    from .safety import SafetyConfigError
+
+    errors = gate.startup_errors(required=True)
+    if errors:
+        raise SafetyConfigError("a TDX worker requires content safety classifiers: " + "; ".join(errors))
+    gate.require_classifier = True  # and fail closed on every job if one stops answering
 
 
 def main() -> None:
@@ -53,15 +86,11 @@ def main() -> None:
         hotkey = load_hotkey(config)
     except HotkeyConfigError as exc:
         raise SystemExit(f"hotkey: {exc}") from None
-    if hotkey is None and config.tee == "tdx":
-        log.warning(
-            "no hotkey secret configured (KUNO_HOTKEY_SEED_FILE or KUNO_WALLET_NAME): "
-            "production gateways refuse registrations without a hotkey proof"
-        )
+    check_hotkey(config, hotkey)
     try:
         from .safety import default_gate
 
-        default_gate()  # load any configured classifier now, not on the first job
+        check_safety(config, default_gate())  # load any configured classifier now, not on the first job
         worker = Worker(config, build_tee(config), build_backends(config.backend, config), hotkey=hotkey)
     except ValueError as exc:
         raise SystemExit(str(exc)) from None

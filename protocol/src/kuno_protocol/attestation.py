@@ -44,7 +44,8 @@ from .hardware import (
 )
 from .nvidia import GpuEvidenceBundle, GpuEvidenceCollector
 
-TeeKind = Literal["mock", "tdx"]
+# "open" is an open-tier miner with no TEE: it may only run standard (non-private) jobs.
+TeeKind = Literal["mock", "tdx", "open"]
 
 
 class AttestationUnavailable(RuntimeError):
@@ -111,6 +112,35 @@ class AllowedMeasurement(BaseModel):
     rtmr3: str
 
 
+class OpenTierImage(BaseModel):
+    """A worker image the owner allows on the open tier, and the profiles it may serve there."""
+
+    image_digest: str
+    profiles: list[str]
+
+
+class OpenTierPolicy(BaseModel):
+    """The owner's permission for miners without a TEE (PRIVACY_MODES.md, "Miner tiers").
+
+    Absent or disabled, every open-tier registration is refused: that is the production default.
+    An open-tier worker's image digest is self-reported, so `images` states which releases the
+    owner expects and lets it withdraw one; it proves nothing about what the miner really runs.
+    """
+
+    enabled: bool = False
+    images: list[OpenTierImage] = Field(default_factory=list)
+
+    def refusal(self, image_digest: str, profiles: list[str]) -> str | None:
+        if not self.enabled:
+            return "the manifest does not allow the open tier"
+        allowed = [image for image in self.images if image.image_digest == image_digest]
+        if not allowed:
+            return "image is not an approved open-tier image"
+        if not set(profiles) <= set(allowed[0].profiles):
+            return "open-tier image is not approved for all claimed profiles"
+        return None
+
+
 class GoldenManifest(BaseModel):
     """Published list of measurements the network accepts; the owner signs it as a SignedManifest."""
 
@@ -119,9 +149,18 @@ class GoldenManifest(BaseModel):
     allowed: list[AllowedMeasurement] = Field(default_factory=list)
     mock_quote_keys: list[str] = Field(default_factory=list)
     max_evidence_age_s: int = 3600
+    # Open-tier (no TEE) registrations; None refuses them all.
+    open_tier: OpenTierPolicy | None = None
 
     def trusts_mock(self) -> bool:
         return bool(self.mock_quote_keys) or any(a.platform == "mock" for a in self.allowed)
+
+    def signed_fields(self) -> dict:
+        """What the owner signs. `open_tier` is left out when unset, so manifests signed before it existed still verify."""
+        fields = self.model_dump(mode="json")
+        if fields.get("open_tier") is None:
+            fields.pop("open_tier", None)
+        return fields
 
 
 # ---------------------------------------------------------------- signed manifest
@@ -132,7 +171,7 @@ class ManifestError(ValueError):
 
 
 def manifest_message(manifest: GoldenManifest) -> bytes:
-    return b"kuno/v1/manifest\n" + canonical_json(manifest.model_dump(mode="json"))
+    return b"kuno/v1/manifest\n" + canonical_json(manifest.signed_fields())
 
 
 class SignedManifest(BaseModel):
@@ -295,6 +334,23 @@ class TdxTEE:
         return GpuEvidenceBundle(nonce=gpu_nonce.hex(), gpus=gpus).encode()
 
 
+class OpenTEE:
+    """No TEE at all: an open-tier miner (PRIVACY_MODES.md).
+
+    Its evidence carries no quote and no GPU evidence, so it proves nothing about the image,
+    the hardware or who can read memory. The registration's mandatory hotkey proof binds the
+    worker's keys to a miner, and step audits, collateral and admission probes do the rest.
+    """
+
+    kind: TeeKind = "open"
+
+    def quote(self, report_data: bytes) -> bytes:
+        return b""
+
+    def gpu_evidence(self, gpu_nonce: bytes) -> bytes | None:
+        return None
+
+
 # ---------------------------------------------------------------- TDX quote parsing
 
 _TDX_HEADER_LEN = 48
@@ -365,6 +421,8 @@ class Verdict:
     # filled only when the verdict is ok; gpu_count stays None when no verifier counted GPUs.
     hardware: list[HardwareIdentity] = field(default_factory=list)
     gpu_count: int | None = None
+    # kuno_protocol.tiers tier of the evidence ("confidential" or "open"); None when it could not be parsed.
+    tier: str | None = None
 
     def hardware_tokens(self, kind: str | None = None) -> set[str]:
         return {h.token for h in self.hardware if kind is None or h.kind == kind}
@@ -385,8 +443,16 @@ def verify_evidence(
     now: float | None = None,
     quote_verifier: QuoteVerifier | None = None,
     gpu_verifier: GpuVerifier | None = None,
+    allow_open: bool = False,
 ) -> Verdict:
-    """Everything a validator, gateway or client checks before trusting an enclave key."""
+    """Everything a validator, gateway or client checks before trusting an enclave key.
+
+    Open-tier evidence (`tee="open"`) proves no TEE, so it is refused unless the caller passes
+    `allow_open=True` *and* the manifest's `open_tier` policy allows the image. Gateways and
+    validators checking registrations pass it; a client about to seal a private job must not.
+    """
+    from .tiers import tier_for_tee  # tiers imports schemas, which imports this module
+
     now = time.time() if now is None else now
     reasons: list[str] = []
     try:
@@ -395,7 +461,7 @@ def verify_evidence(
         gpu = b64d(evidence.gpu_evidence) if evidence.gpu_evidence else None
     except ValueError:
         return Verdict(False, "", ["malformed evidence encoding"])
-    verdict = Verdict(False, enclave_id_for(hpke_pk, sign_pk))
+    verdict = Verdict(False, enclave_id_for(hpke_pk, sign_pk), tier=tier_for_tee(evidence.tee))
 
     if len(hpke_pk) != 32 or len(sign_pk) != 32:
         reasons.append("keys must be 32-byte X25519 / Ed25519 public keys")
@@ -403,6 +469,19 @@ def verify_evidence(
         reasons.append("nonce does not match the challenge")
     if now - evidence.created_at > manifest.max_evidence_age_s:
         reasons.append("evidence is older than the manifest allows")
+
+    if evidence.tee == "open":
+        if not allow_open:
+            reasons.append("open-tier evidence proves no TEE; this check accepts confidential-tier evidence only")
+        if quote:
+            reasons.append("open-tier evidence must not carry a quote")
+        if gpu is not None:
+            reasons.append("open-tier evidence must not carry GPU evidence")
+        refusal = (manifest.open_tier or OpenTierPolicy()).refusal(evidence.image_digest, evidence.profiles)
+        if refusal:
+            reasons.append(refusal)
+        # Nothing about the hardware is verified, so no identity is taken from it (the dict stays self-reported).
+        return _seal(verdict, reasons, [], None)
 
     measurements, report_data, platform = _quote_claims(evidence.tee, quote, manifest, quote_verifier, reasons)
     verdict.measurements = measurements
@@ -578,15 +657,20 @@ class AttestationPolicy:
         manifest: GoldenManifest,
         expected_nonce: bytes | None = None,
         now: float | None = None,
+        allow_open: bool = False,
     ) -> Verdict:
-        verdict = verify_evidence(evidence, manifest, expected_nonce, now, self.quote_verifier, self.gpu_verifier)
+        """`allow_open` as in `verify_evidence`. Production accepts open-tier evidence only when the caller
+        allows it and the owner-signed manifest's `open_tier` policy is enabled for the image."""
+        verdict = verify_evidence(
+            evidence, manifest, expected_nonce, now, self.quote_verifier, self.gpu_verifier, allow_open=allow_open
+        )
         if self.production:
             extra = []
-            if evidence.tee != "tdx":
+            if evidence.tee not in ("tdx", "open"):
                 extra.append(f"{evidence.tee} evidence is not accepted in production")
             if manifest.trusts_mock():
                 extra.append("the manifest trusts the simulated TEE, which production forbids")
-            if verdict.ok:
+            if verdict.ok and evidence.tee == "tdx":
                 # Production dedupes miners on hardware, so evidence that names no hardware can't register.
                 if not verdict.hardware_tokens("cpu_platform"):
                     extra.append("the quote verified but yielded no platform identity (PPID)")

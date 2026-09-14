@@ -603,6 +603,54 @@
             "dev": false
           },
           {
+            "id": "O1.rtx-4090-24gb.x1.int8",
+            "tier": "O1",
+            "gpu_sku": "NVIDIA GeForce RTX 4090 24GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false,
+            "comparison": "tolerance",
+            "precision": "int8-convrot",
+            "vram_gb": 24
+          },
+          {
+            "id": "O1.rtx-5090-32gb.x1.fp8-cast",
+            "tier": "O1",
+            "gpu_sku": "NVIDIA GeForce RTX 5090 32GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false,
+            "comparison": "tolerance",
+            "precision": "fp8-cast",
+            "vram_gb": 32
+          },
+          {
+            "id": "O1.rtx-pro-6000-bw-96gb.x1",
+            "tier": "O1",
+            "gpu_sku": "NVIDIA RTX PRO 6000 Blackwell 96GB (workstation or Server Edition without CC)",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false,
+            "comparison": "tolerance",
+            "precision": "bf16",
+            "vram_gb": 96
+          },
+          {
+            "id": "O1.h100-80gb.x1",
+            "tier": "O1",
+            "gpu_sku": "NVIDIA H100 80GB (CC off)",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false,
+            "comparison": "tolerance",
+            "precision": "bf16",
+            "vram_gb": 80
+          },
+          {
             "id": "dev-cpu",
             "tier": "dev",
             "gpu_sku": "none (toy denoiser on CPU)",
@@ -766,6 +814,30 @@
             "parallel": {},
             "interconnect": null,
             "dev": false
+          },
+          {
+            "id": "O1.rtx-pro-6000-bw-96gb.x1",
+            "tier": "O1",
+            "gpu_sku": "NVIDIA RTX PRO 6000 Blackwell 96GB (workstation or Server Edition without CC)",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false,
+            "comparison": "tolerance",
+            "precision": "bf16",
+            "vram_gb": 96
+          },
+          {
+            "id": "O1.h100-80gb.x1",
+            "tier": "O1",
+            "gpu_sku": "NVIDIA H100 80GB (CC off)",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false,
+            "comparison": "tolerance",
+            "precision": "bf16",
+            "vram_gb": 80
           },
           {
             "id": "dev-cpu",

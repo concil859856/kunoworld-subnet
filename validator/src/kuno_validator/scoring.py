@@ -1,11 +1,14 @@
 """Serving-mechanism scoring.
 
 score_m = Σ_family split_f × (VCU_m,f / Σ_miners VCU_f)     for miners that pass the gates
+VCU_m,f = Σ_jobs rate_tier × profile weight × requested seconds
 
   VCU        verified video compute units: the profile's per-second weight × the seconds
              the customer requested in the job's public parameters, for each receipt that
              survived `ledger.audit_ledger` (customer and canary jobs alike). The miner's
              own reported duration is only checked, never paid.
+  rate_t     the tier rate of the enclave that ran the job (open_tier.py): 1 for the confidential tier,
+             KUNO_OPEN_TIER_RATE (default 0.5) for the open tier; entries without a tier earn at 1
   split_f    the owner-signed switch's emission share for each family in use
   gates      a currently attested enclave; success rate ≥ min_success once a miner has
              at least min_samples finished jobs in the window; and no penalty in the
@@ -65,6 +68,7 @@ def compute_scores(
     min_samples: int = 20,
     penalties: Mapping[str, list[str]] | None = None,
     flags: Mapping[str, list[str]] | None = None,
+    tier_rates: Mapping[str, float] | None = None,
 ) -> dict[str, MinerScore]:
     """Scores an already-audited ledger. Pass raw gateway rows through `audit_ledger` first."""
     miners: dict[str, MinerScore] = {}
@@ -77,7 +81,8 @@ def compute_scores(
         if entry["status"] == "succeeded" and entry.get("receipt") and profile is not None:
             seconds = billable_seconds(entry)
             if seconds is not None:
-                miner.work[profile.family] = miner.work.get(profile.family, 0.0) + profile.vcu(seconds)
+                rate = float((tier_rates or {}).get(entry.get("tier") or "", 1.0))
+                miner.work[profile.family] = miner.work.get(profile.family, 0.0) + profile.vcu(seconds) * rate
             miner.succeeded += 1
         elif entry["status"] == "failed" and entry.get("error_code") in MINER_FAULT_CODES:
             miner.failed += 1

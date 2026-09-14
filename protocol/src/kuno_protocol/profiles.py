@@ -21,7 +21,7 @@ import math
 from enum import Enum
 from functools import lru_cache
 from importlib import resources
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
@@ -126,6 +126,13 @@ class HardwareClass(BaseModel):
     interconnect: str | None = None
     # Simulated classes exist for dev networks; production validators refuse them.
     dev: bool = False
+    # "bitwise": replayed steps must match exactly (one reproducibility domain, the confidential tier).
+    # "tolerance": within a calibrated distance (kuno_protocol.tolerance; open-tier hardware).
+    comparison: Literal["bitwise", "tolerance"] = "bitwise"
+    # Weight precision the class runs ("bf16", "fp8-cast", "int8"...); part of the class, since it changes the model.
+    precision: str | None = None
+    # VRAM per GPU on this class, for operators choosing hardware.
+    vram_gb: float | None = None
 
 
 class DeterminismSettings(BaseModel):

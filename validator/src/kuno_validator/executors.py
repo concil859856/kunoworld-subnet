@@ -16,6 +16,11 @@ against the transcript's post-shift sigmas before the result counts.
 
 H3's modular loop has no sigmas argument, so its replay skips the "denoiser" and "update"
 blocks for i < k-1, injects the committed latents at i = k-1, and stops after that update.
+
+Tolerance mode: `tolerance_classes` lists open-tier miner classes (profiles.json, `comparison:
+"tolerance"`) this executor also replays; the auditor then compares within the calibrated distance
+instead of bit for bit. A class that runs different weights (fp8-cast, int8) needs its own pinned
+digest in `model_digests` under "<profile_id>@<hardware_class>", and the loader must load that recipe.
 """
 
 from __future__ import annotations
@@ -50,13 +55,21 @@ class ReplayScheduleError(RuntimeError):
 class _DiffusersExecutor:
     runtime = ""
 
-    def __init__(self, loader: Callable[[ModelProfile], Any], hardware_class: str, model_digests: dict[str, str], device: str = "cuda"):
+    def __init__(
+        self,
+        loader: Callable[[ModelProfile], Any],
+        hardware_class: str,
+        model_digests: dict[str, str],
+        device: str = "cuda",
+        tolerance_classes: tuple[str, ...] | list[str] = (),
+    ):
         """`loader(profile)` returns the loaded pipeline (loaded after determinism is applied);
         `model_digests[profile_id]` is the pinned weights identity from the owner-signed manifest."""
         self.loader = loader
         self.hardware_class = hardware_class
         self.model_digests = model_digests
         self.device = device
+        self.tolerance_classes = tuple(tolerance_classes)
         self._pipelines: dict[str, Any] = {}
         self._pinned = False
 
@@ -70,7 +83,7 @@ class _DiffusersExecutor:
 
     def candidate_steps(self, commitment: StepCommitment, profile: ModelProfile) -> list[int]:
         verified = profile.verified
-        if verified is None or commitment.hardware_class != self.hardware_class:
+        if verified is None or not self.replays(commitment.hardware_class):
             return []
         steps, first = [], 0
         for stage, count in enumerate(verified.stage_steps):
@@ -79,13 +92,17 @@ class _DiffusersExecutor:
             first += count + 1
         return steps
 
+    def replays(self, hardware_class: str) -> bool:
+        return hardware_class == self.hardware_class or hardware_class in self.tolerance_classes
+
     def check_transcript(self, transcript: StepTranscript, canary: CanaryRecord, profile: ModelProfile) -> str | None:
         verified = profile.verified
-        if transcript.hardware_class != self.hardware_class:
+        if not self.replays(transcript.hardware_class):
             return None  # another class: this executor can't judge it, and candidate_steps is empty
         if [stage.steps for stage in transcript.stages] != verified.stage_steps:
             return f"transcript schedules {[s.steps for s in transcript.stages]} steps per stage, not {verified.stage_steps}"
-        if transcript.model_digest != self.model_digests.get(profile.id):
+        pinned = self.model_digests.get(f"{profile.id}@{transcript.hardware_class}") or self.model_digests.get(profile.id)
+        if transcript.model_digest != pinned:
             return "transcript model_digest is not the pinned weights"
         pins = verified.determinism.model_dump(mode="json")
         if any(transcript.determinism.get(key) != value for key, value in pins.items()):

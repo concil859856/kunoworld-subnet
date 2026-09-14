@@ -37,6 +37,12 @@ class JobState(str, Enum):
         return self in (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED)
 
 
+# A private job is encrypted end to end and runs only on confidential miners; a standard job is readable by
+# the platform and the GPU provider and may run on any miner. Kept out of GenerationParams on purpose: the
+# params are the encryption's associated data, and existing clients must keep producing the same bytes.
+PrivacyMode = Literal["private", "standard"]
+
+
 class GenerationParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -116,6 +122,7 @@ class JobStatus(BaseModel):
     # Machine-readable failure reason (e.g. safety_blocked, timeout); `error` is the human message.
     error_code: str | None = None
     error: str | None = None
+    privacy: PrivacyMode = "private"
 
 
 class MinerJob(BaseModel):
