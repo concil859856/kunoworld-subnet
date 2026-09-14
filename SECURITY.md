@@ -57,8 +57,11 @@ land.
     they largely decide the output's size class. Fixed duration presets keep that coarse.
   - the number of inputs, or timing: when jobs arrive, how long generation takes, the receipt's
     GPU-seconds and timestamps, and power draw.
-  - the length of the sealed request (prompt, seed, input manifest), which is not padded, so its
-    size tracks the prompt's length.
+  - which size bucket the sealed request (prompt, seed, input manifest, options) falls in. It is
+    padded to a power of two from 4 KiB
+    ([PROTOCOL.md](PROTOCOL.md#sealed-request-padding)), so every text-only request with a prompt
+    of up to about 4,000 ASCII characters is the same size. Requests sealed by clients that predate
+    padding still carry exact sizes.
   - version 1 blobs, which carry exact sizes and are still accepted from clients that predate
     padding.
   - `content_digest` in the public receipt, by design: anyone who already holds a video can
@@ -215,7 +218,6 @@ Not implemented yet:
 - the confidential VM image and its measured boot chain (only the worker container layer is
   built), and published golden measurements;
 - a chosen per-GPU collateral amount, and the enterprise tier;
-- padding of the sealed request (prompt and input manifest); only blobs are padded;
 - shipped classifier weights (frame models are chosen and their hashes pinned in
   `image/CVM.md`, but no image bakes them in yet), and any accuracy evaluation of them or of
   the content policy's word lists on real traffic;
@@ -231,7 +233,8 @@ What is in place and tested against a simulated TEE:
   (the chain read was checked read-only against finney);
 - validator receipt re-verification, the replay and canary penalties, and the switch rules;
 - blob size padding (format version 2) in both SDKs, the worker's output sealing and the gateway's
-  Standard-mode sealing, pinned by shared Python and JS vectors;
+  Standard-mode sealing, and power-of-two padding of the sealed request by every sender, both
+  pinned by shared Python and JS vectors;
 - the safety pipeline, with fake classifiers, including the shared content policy and the
   output check wired into the worker; the frame adapters also load and score real weights on
   CPU (benign clips only);

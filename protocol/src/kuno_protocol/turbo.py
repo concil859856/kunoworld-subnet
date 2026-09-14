@@ -14,6 +14,12 @@ the chain orders submissions. Validators read the spec and the commitments, fetc
 document, check it against the committed digest and the hotkey signature, then benchmark
 enclaves that attest exactly the submitted image.
 
+Base measurements: the spec pins the owner's measured CVM base (platform, MRTD, RTMR0–2). A candidate
+enclave must match one base exactly and may differ only in RTMR3, the application layer its submission
+names (`BaseMeasurements`, `TurboSpec.candidate_problems`). On a KunoWorld CVM the worker image sits on
+its own dm-verity disk measured into RTMR3 only (image/CVM.md), so every worker image built for one OS
+release and VM shape shares MRTD and RTMR0–2.
+
 Signing:
   spec        Ed25519 (owner key) over "kuno/v1/turbo-spec\\n" | canonical_json(TurboSpec)
   submission  sr25519 (miner hotkey) over "kuno/v1/turbo-submission\\n" | canonical_json(TurboSubmission)
@@ -30,7 +36,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -56,6 +62,9 @@ _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 _VARIANT = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,63}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX96 = re.compile(r"^[0-9a-f]{96}$")
+# The registers a candidate must share exactly with one of the spec's bases, and the one it brings itself.
+BASE_REGISTERS = ("mrtd", "rtmr0", "rtmr1", "rtmr2")
+CANDIDATE_REGISTER = "rtmr3"
 
 
 class TurboError(ValueError):
@@ -66,9 +75,17 @@ class TurboError(ValueError):
 
 
 class BaseMeasurements(BaseModel):
-    """The owner's measured CVM base (firmware, VM shape, kernel, initrd). Only RTMR3, the
-    application layer, comes from a submission, so every candidate boots the same audited base
-    with its egress policy and cannot, for example, send hidden prompts anywhere but the gateway."""
+    """The owner's measured CVM base: the TDVF firmware (MRTD), the VM shape (RTMR0), the kernel
+    (RTMR1), and the command line and initrd, which pin the root filesystem with the guest agent and
+    its egress policy (RTMR2).
+
+    The rule: a candidate enclave must attest this platform and exactly these MRTD and RTMR0–2, and
+    may differ only in RTMR3, the application layer its submission names. On a KunoWorld CVM, RTMR3
+    alone records the worker image disk's dm-verity root hash, the worker image digest and the weights
+    roots; the worker image is not in the root filesystem, so every worker image built for one OS
+    release and VM shape boots under the same MRTD and RTMR0–2 (image/CVM.md). Every candidate thus
+    boots the same audited base and cannot, for example, send hidden prompts anywhere but the gateway.
+    A new OS release, OVMF, QEMU version or shape is a new base."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -77,6 +94,26 @@ class BaseMeasurements(BaseModel):
     rtmr0: str
     rtmr1: str
     rtmr2: str
+
+    @field_validator(*BASE_REGISTERS)
+    @classmethod
+    def _register(cls, value: str) -> str:
+        # Compared byte for byte with quote fields, which are lowercase hex.
+        if not _HEX96.match(value):
+            raise ValueError("base registers are SHA-384 values: 96 lowercase hex characters")
+        return value
+
+    @classmethod
+    def of(cls, measurement: AllowedMeasurement) -> BaseMeasurements:
+        """The base a measured image boots: its platform, MRTD and RTMR0–2 (e.g. the incumbent's manifest entry)."""
+        return cls(platform=measurement.platform, **{k: getattr(measurement, k) for k in BASE_REGISTERS})
+
+    def differences(self, platform: str, registers: Mapping[str, object]) -> list[str]:
+        """What keeps an enclave measured as `registers` off this base: "platform", then each of MRTD and
+        RTMR0–2 that is not exactly equal. RTMR3 is never compared: it is the candidate's own."""
+        return (["platform"] if platform != self.platform else []) + [
+            k for k in BASE_REGISTERS if registers.get(k) != getattr(self, k)
+        ]
 
 
 class QualityFloor(BaseModel):
@@ -274,12 +311,40 @@ class TurboSpec(BaseModel):
     def ended_windows(self, now: float) -> list[EvalWindow]:
         return [w for w in self.windows if w.ends_at <= now]
 
+    def base_for(self, platform: str, registers: Mapping[str, object]) -> BaseMeasurements | None:
+        """The base an enclave measured as `registers` boots, or None when it matches none of them exactly."""
+        return next((base for base in self.base_measurements if not base.differences(platform, registers)), None)
+
+    def candidate_problems(self, submission: TurboSubmission, platform: str, registers: Mapping[str, object]) -> list[str]:
+        """Why an enclave measured as `registers` (MRTD, RTMR0–3 as lowercase hex) is not a candidate for
+        `submission`; empty when it is.
+
+        The rule, which `candidate_manifest` encodes for attestation: the platform the submission names,
+        MRTD and RTMR0–2 exactly equal to one of the spec's bases, and RTMR3 exactly the submitted one.
+        Nothing else may differ from the base.
+        """
+        problems = []
+        if platform != submission.platform:
+            problems.append(f"the enclave attests {platform}, the submission names {submission.platform}")
+        bases = [base for base in self.base_measurements if base.platform == platform]
+        if not bases:
+            problems.append(f"the spec has no {platform} base")
+        elif self.base_for(platform, registers) is None:
+            closest = min((base.differences(platform, registers) for base in bases), key=len)
+            verb = "differs" if len(closest) == 1 else "differ"
+            problems.append(f"{', '.join(closest)} {verb} from the spec's base: a candidate may differ from its base only in rtmr3")
+        if registers.get(CANDIDATE_REGISTER) != submission.rtmr3:
+            problems.append("rtmr3 is not the submitted application layer")
+        return problems
+
     def candidate_manifest(self, submission: TurboSubmission, production: GoldenManifest) -> GoldenManifest:
         """The only measurements a candidate enclave for `submission` may attest: the owner's
         base layers plus the submitted application layer, for the target profile only.
 
-        Simulated-TEE keys and evidence age come from the production manifest, so a candidate is
-        held to exactly the attestation rules serving enclaves are.
+        Each entry is one base's platform, MRTD and RTMR0–2 with the submission's RTMR3, so verifying
+        evidence against it enforces the rule `candidate_problems` states. Simulated-TEE keys and
+        evidence age come from the production manifest, so a candidate is held to exactly the
+        attestation rules serving enclaves are.
         """
         allowed = [
             AllowedMeasurement(
@@ -290,7 +355,7 @@ class TurboSpec(BaseModel):
                 rtmr0=base.rtmr0,
                 rtmr1=base.rtmr1,
                 rtmr2=base.rtmr2,
-                rtmr3=submission.rtmr3,
+                rtmr3=submission.rtmr3,  # the only register a candidate brings
             )
             for base in self.base_measurements
             if base.platform == submission.platform

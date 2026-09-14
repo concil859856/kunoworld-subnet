@@ -26,7 +26,10 @@ while read -r first second third; do
   case "$first" in
     ''|'#'*) continue ;;
     link)
-      [ -n "$second" ] && [ -n "$third" ] || { echo "bad link line in $list" >&2; exit 1; }
+      if [ -z "$second" ] || [ -z "$third" ]; then
+        echo "bad link line in $list" >&2
+        exit 1
+      fi
       mkdir -p "$work/$(dirname "$second")"
       ln -sfn "$third" "$work/$second"
       ;;

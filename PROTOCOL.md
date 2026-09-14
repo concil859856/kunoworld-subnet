@@ -19,13 +19,63 @@ RFC 9180 base mode: `DHKEM(X25519, HKDF-SHA256)`, `HKDF-SHA256`, `ChaCha20-Poly1
 | `info` | `kuno/v1/job` |
 | input key | `Export("kuno/v1/input-key", 32)` |
 | output key | `Export("kuno/v1/output-key", 32)` |
-| plaintext | UTF-8 JSON of `SealedPayload` (prompt, negative prompt, seed, input manifest, options); unlike the AAD it need not be canonical |
+| plaintext | the sealed request: UTF-8 JSON of `SealedPayload` (prompt, negative prompt, seed, input manifest, options), padded as below; unlike the AAD the JSON need not be canonical |
 | AAD | `canonical_json({"v":1,"job_id":…,"enclave_id":…,"params":GenerationParams,"inputs":[blob ids]})` |
 
 The client generates the job id (lowercase UUIDv4). Because the public `GenerationParams`
 (the only fields the gateway uses to price and route), the job id, the enclave id and the
 input blob ids are all AAD, any change made in transit makes decryption fail. Each sender
 context seals exactly one message.
+
+### Sealed request padding
+
+A ciphertext is its plaintext plus a 16-byte tag, so an unpadded request would show the gateway, and anyone
+watching, how long the prompt is. Senders pad the plaintext:
+
+| form | plaintext | status |
+|---|---|---|
+| 1 | the JSON | still opened by every worker; no longer written |
+| 2 | `0x02 \| length:u32be \| JSON \| 0x00 …`, exactly `bucket(5 + length)` bytes long | written by every sender: both SDKs (the web app seals through the JS SDK), the gateway's Standard-mode sealing, validator benchmark jobs, and anything else sealed with `kuno_protocol.sealed_payload.seal_payload` or `padPayload` |
+
+```
+bucket(n) = max(4096, 2^⌈log2 n⌉)          for n ≤ 262144 (256 KiB); a larger request is refused
+```
+
+A form 1 plaintext is a JSON object, so its first byte is `{` or JSON whitespace (0x20, 0x09, 0x0A, 0x0D). 0x02 never
+starts one, so the form needs no marker outside the encryption. The HPKE suite, `info`, the exported keys, the AAD,
+`GenerationParams` and the JSON itself are unchanged, and so are the bytes of the `job_aad` vector.
+
+A receiver authenticates the ciphertext first. It then refuses the request (`bad_payload` at the worker) if the first
+byte is anything else, an empty plaintext included, or, for form 2, unless `5 + length ≤ len(plaintext) ≤ 262144`,
+`len(plaintext) = bucket(5 + length)` exactly, and every byte after the JSON is zero. So a sender can't leak a length
+by padding differently. A sender refuses more than 262,139 bytes of JSON before it seals anything
+(`request_too_large`).
+
+| JSON bytes | Plaintext | Ciphertext bytes |
+|---|---|---|
+| 0 – 4,091 | 4 KiB | 4,112 |
+| 4,092 – 8,187 | 8 KiB | 8,208 |
+| 8,188 – 16,379 | 16 KiB | 16,400 |
+| 16,380 – 32,763 | 32 KiB | 32,784 |
+| 32,764 – 65,531 | 64 KiB | 65,552 |
+| 65,532 – 131,067 | 128 KiB | 131,088 |
+| 131,068 – 262,139 | 256 KiB | 262,160 |
+| more | refused | |
+
+**Why powers of two, not PADMÉ.** Blobs use PADMÉ because they are megabytes, where rounding up to a power of two
+could double a video. A request is a few kilobytes: 79 bytes of JSON with an empty prompt, 7,079 with a
+7,000-character ASCII prompt (the longest any model takes), and about 200 more per input reference. At that size
+PADMÉ's buckets are 32 to 128 bytes wide, which would still give a prompt's length away to within a sentence. Powers
+of two from a 4 KiB floor leave seven sizes (under 3 bits), make every text-only request with a prompt of up to about
+4,000 ASCII characters the same size, and cost at most a few kilobytes per job. The 256 KiB ceiling is far above any
+real request (7,000 four-byte characters in both the prompt and the negative prompt make 56 KB of JSON), and its
+base64 (349,547 characters) fits the gateway's 1 MiB JSON body limit.
+
+**Rollout.** A worker from before padding can't parse form 2 and fails the job as `bad_payload`, so workers are
+upgraded before senders. The shared vectors carry `sealed_payload`: HPKE ciphertexts sealed to a fixed recipient
+with a fixed ephemeral key, so both languages reproduce them (two padded requests and one form 1 request, with their
+exported keys), the bucket table, padded plaintexts at bucket edges, and framings that authenticate but must be
+refused.
 
 ## Blobs (inputs and output video)
 
@@ -238,9 +288,9 @@ validators first.
 
 ## Miner registration and hotkey proof
 
-`POST /miner/v1/enclaves` takes `{"evidence", "miner_hotkey", "capacity", "hotkey_proof"?}`.
+`POST /miner/v1/enclaves` takes `{"evidence", "miner_hotkey", "capacity", "hotkey_proof"?, "envelope"?}`.
 `hotkey_proof` is optional on the wire so older workers still register; production gateways
-require it. It is
+require it. `envelope` is described under [Serving envelope](#serving-envelope). The hotkey proof is
 
 ```
 {"v": 1, "crypto": "sr25519", "hotkey": ss58, "nonce": hex, "enclave_id": hex, "signing_public_key": b64url, "signature": b64url}
@@ -265,6 +315,38 @@ The answer is `{"enclave_id", "status": "active", "verified_at", "replaced": [en
 miner. Enclave keys registered on one tier can't re-register on the other (`409 tier_changed`),
 and a challenge answer whose tier differs from the registration marks the enclave `stale`.
 Open-tier enclaves are not issued C2PA certificates (`403 tier_not_eligible`).
+
+### Serving envelope
+
+A worker whose card can't fit every request of a profile (the RTX 4090 and 5090 classes, MINING.md §6)
+registers what it can fit. `envelope` maps profile id → resolution → aspect ratio → fps (a decimal
+string) → the longest `duration_s` served:
+
+```
+{"ltx-2.5-fast": {"1080p": {"16:9": {"24": 16, "25": 16, "48": 7, "50": 7}, "1:1": {…}, …}, "720p": {…}}}
+```
+
+A (resolution, aspect ratio, fps) left out is not served at any duration. A profile left out, and a
+registration without `envelope`, serves the profile's full limits. Workers send only the profiles their
+hardware restricts, so an unrestricted worker's registration is unchanged. A job fits when
+`duration_s ≤ envelope[profile_id][resolution][aspect_ratio][fps]`. That is a lookup on the public
+`GenerationParams`, with no model maths, and it matches the worker's memory admission exactly: at a
+fixed size and frame rate, LTX's latent tokens only grow with duration. The reference is
+`kuno_protocol.envelope`, and the worker derives its envelope from its memory plan
+(`kuno_worker.backends.quantized.envelope_for_plan`).
+
+The gateway:
+
+| Step | Rule |
+|---|---|
+| Registration | Refuses an envelope naming a profile the evidence doesn't attest, a size or fps the profile doesn't have, or a duration that isn't a number ≥ the profile's minimum (`422 invalid_envelope`). Durations above the profile's own limit are capped. The envelope is stored on the enclave, replaced at every registration, and published as `envelope` in `/validator/v1/enclaves` and `/v1/route`. |
+| `GET /v1/route` | Optional `resolution`, `aspect_ratio`, `fps` and `duration_s` list only enclaves with room for some request matching the fields given; an omitted field matches any value. The SDKs send the request's fields and, after filling in defaults, skip a listed enclave whose `envelope` doesn't fit. When enclaves serve the profile but none has room: `503 no_capacity` with `max_duration_s`, the longest available at that size and frame rate. The fallback choice and capacity counts stay per profile. |
+| Standard jobs | Routed only to enclaves whose envelope fits the params (`503 no_capacity` with `max_duration_s` otherwise). |
+| Admission | A job, private or standard, for an enclave whose envelope doesn't fit it is refused before anything is charged: `409 envelope_exceeded`, with `max_duration_s` (null when that size and frame rate aren't served). |
+| Failure codes | A worker fails a job its hardware can't fit with `capacity_refused`. Inside the enclave's envelope (or, without one, inside the profile's limits) the gateway records `internal_error`, a miner fault; outside it the code stays `capacity_refused`, which validators don't count against the miner. Both are refunded. |
+
+Gateways from before envelopes ignore the field, and they record `capacity_refused` as sent. So
+upgrade gateways before workers.
 
 ## Hardware registry
 

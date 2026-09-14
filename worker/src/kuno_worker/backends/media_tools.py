@@ -10,6 +10,11 @@ class BackendError(Exception):
     """The model runtime failed. Messages must never include request content."""
 
 
+class CapacityRefused(BackendError):
+    """This hardware class cannot fit the request; the message says what it can serve. The worker reports it as
+    `capacity_refused` (kuno_protocol.envelope.CAPACITY_REFUSED), not `internal_error`."""
+
+
 def ffmpeg_exe() -> str:
     found = shutil.which("ffmpeg")
     if found:

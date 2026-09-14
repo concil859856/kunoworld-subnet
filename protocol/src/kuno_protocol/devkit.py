@@ -12,6 +12,9 @@ Writes into the data directory:
   c2pa_ca_chain.pem     the intermediate then the root certificate, for the gateway
   dev.env               environment variables for gateway, worker, validator, SDK
 
+Pricing from GPU benchmarks (kuno-bench results; see rate_derivation.py). Prints a proposal, writes nothing unless asked:
+  kuno-devkit derive-rates bench-h200.json --gpu-price h200=3.20 --utilization 0.6 --margin 1.25 [--write-proposal rates.json]
+
 Production C2PA hierarchy, run offline by the subnet owner (see subnet/PROVENANCE.md):
   kuno-devkit c2pa-root --out-key root.key --out-cert root.pem
   kuno-devkit c2pa-intermediate --root-key root.key --root-cert root.pem --out-key issuing.key --out-chain chain.pem
@@ -150,7 +153,7 @@ def c2pa_intermediate(
     return cert
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="kuno-devkit", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     init_cmd = sub.add_parser("init", help="create dev keys, manifest and env file")
@@ -182,7 +185,22 @@ def main() -> None:
     weights_cmd.add_argument("--profile", required=True)
     weights_cmd.add_argument("--hardware-class", help="omit for the bf16 recipe a profile runs without a class")
     weights_cmd.add_argument("--models-dir", type=Path, required=True)
-    args = parser.parse_args()
+    derive_cmd = sub.add_parser(
+        "derive-rates", help="fit VCU weights and miner rates from kuno-bench results (rate_derivation.py); writes only with --write-proposal"
+    )
+    derive_cmd.add_argument("bench", nargs="+", type=Path, help="kuno-bench results JSON files, one per machine")
+    derive_cmd.add_argument("--gpu-price", action="append", required=True, metavar="GPU=USD_PER_HOUR", help="e.g. h200=3.20; one per GPU model")
+    derive_cmd.add_argument("--anchor-gpu", default="h200", help="1 VCU = one second of this GPU's cost (default h200, as profiles.json)")
+    derive_cmd.add_argument("--utilization", type=float, default=0.6, help="share of the hour a miner's GPUs earn (default 0.6)")
+    derive_cmd.add_argument("--margin", type=float, default=1.25, help="miner margin over cost at that utilization (default 1.25)")
+    derive_cmd.add_argument("--cc-overhead", type=float, default=0.0, help="cost share confidential computing adds, e.g. 0.05 (default 0)")
+    derive_cmd.add_argument("--open-tier-share", type=float, help="open-tier rate as a share of the confidential rate (default: rate_card.py's)")
+    derive_cmd.add_argument("--capacity-share", type=float, default=0.75, help="gpu_hour_usd as a share of the cheapest benchmarked GPU (default 0.75)")
+    derive_cmd.add_argument("--min-customer-multiple", type=float, default=1.15, help="customer price must be at least this × miner pay")
+    derive_cmd.add_argument("--allow-simulated", action="store_true", help="accept kuno-bench --backend mock results")
+    derive_cmd.add_argument("--write-proposal", type=Path, help="write the proposal JSON here (nothing is written otherwise)")
+    derive_cmd.add_argument("--json", action="store_true", help="print the proposal JSON instead of the diff")
+    args = parser.parse_args(argv)
     if args.command == "init":
         env = init(args.data, args.force)
         print(f"Wrote {args.data / 'dev.env'}")
@@ -201,6 +219,29 @@ def main() -> None:
         print(f"Gateway: KUNO_C2PA_CA_KEY={args.out_key.resolve()} KUNO_C2PA_CA_CHAIN={args.out_chain.resolve()}")
     elif args.command == "weights-digest":
         print(json.dumps(weights_digest_report(args.profile, args.hardware_class, args.models_dir), indent=2))
+    elif args.command == "derive-rates":
+        derive_rates(args)
+
+
+def derive_rates(args: argparse.Namespace) -> None:
+    """Prints the proposal's diff and margin check (or its JSON); writes the proposal only to --write-proposal."""
+    from .rate_derivation import RateDerivationError, Settings, derive, load_bench, parse_gpu_prices, render
+
+    try:
+        optional = {"open_tier_share": args.open_tier_share} if args.open_tier_share is not None else {}
+        settings = Settings(
+            gpu_prices=parse_gpu_prices(args.gpu_price), anchor_gpu=args.anchor_gpu, utilization=args.utilization, margin=args.margin,
+            cc_overhead=args.cc_overhead, capacity_share=args.capacity_share, min_customer_multiple=args.min_customer_multiple,
+            allow_simulated=args.allow_simulated, **optional,
+        )
+        proposal = derive([(str(path), load_bench(path)) for path in args.bench], settings)
+    except RateDerivationError as exc:
+        raise SystemExit(f"derive-rates: {exc}") from None
+    print(json.dumps(proposal, indent=2) if args.json else render(proposal))
+    if args.write_proposal:
+        args.write_proposal.write_text(json.dumps(proposal, indent=2) + "\n")
+        if not args.json:
+            print(f"\nWrote {args.write_proposal}")
 
 
 def weights_digest_report(profile_id: str, hardware_class: str | None, models_dir: Path) -> dict:

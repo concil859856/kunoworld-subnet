@@ -317,6 +317,62 @@ def test_a_candidate_manifest_admits_exactly_the_submitted_image_for_the_target_
     assert "not approved for all claimed profiles" in verify_evidence(wider, manifest, nonce).reasons[0]
 
 
+# ---------------------------------------------------------------- the base-measurement rule
+
+
+def test_a_candidate_matches_its_base_exactly_and_differs_only_in_rtmr3():
+    spec, _ = make_spec()
+    signed = submission(signer(), "sha256:candidate-a")
+    registers = {**BASE, "rtmr3": signed.submission.rtmr3}
+    assert spec.candidate_problems(signed.submission, "mock", registers) == []
+    assert spec.base_for("mock", registers) == base_layers()
+    assert base_layers().differences("mock", {**BASE, "rtmr3": "00" * 48}) == []  # RTMR3 is never part of the base
+
+    for register in ("mrtd", "rtmr0", "rtmr1", "rtmr2"):
+        moved = {**registers, register: "ab" * 48}
+        assert spec.base_for("mock", moved) is None
+        assert spec.candidate_problems(signed.submission, "mock", moved) == [
+            f"{register} differs from the spec's base: a candidate may differ from its base only in rtmr3"
+        ]
+    two = {**registers, "rtmr1": "ab" * 48, "rtmr2": "ab" * 48}
+    assert spec.candidate_problems(signed.submission, "mock", two)[0].startswith("rtmr1, rtmr2 differ from the spec's base")
+    assert spec.candidate_problems(signed.submission, "mock", {**registers, "rtmr3": "00" * 48}) == ["rtmr3 is not the submitted application layer"]
+    assert spec.candidate_problems(signed.submission, "tdx", registers) == [
+        "the enclave attests tdx, the submission names mock", "the spec has no tdx base"
+    ]
+
+    # A second base (another shape) admits its own candidates; each candidate manifest entry is a base plus RTMR3.
+    other = BaseMeasurements(platform="mock", **{k: "cd" * 48 for k in ("mrtd", "rtmr0", "rtmr1", "rtmr2")})
+    wider, _ = make_spec(base_measurements=[base_layers(), other])
+    entries = wider.candidate_manifest(signed.submission, GoldenManifest()).allowed
+    assert [BaseMeasurements.of(entry) for entry in entries] == [base_layers(), other]
+    for entry in entries:
+        assert entry.rtmr3 == signed.submission.rtmr3
+        assert wider.candidate_problems(signed.submission, entry.platform, entry.model_dump()) == []
+
+    with pytest.raises(ValueError, match="96 lowercase hex"):
+        BaseMeasurements(platform="mock", **{**{k: BASE[k] for k in ("mrtd", "rtmr0", "rtmr1")}, "rtmr2": BASE["rtmr2"].upper()})
+
+
+def test_an_enclave_on_another_base_is_refused_even_with_the_submitted_rtmr3():
+    quote_key = generate_signing_key()
+    production = GoldenManifest(mock_quote_keys=[b64e(public_key_bytes(quote_key))])
+    image = "sha256:candidate-a"
+    signed = submission(signer(), image)
+    nonce = secrets.token_bytes(32)
+    _, hpke = generate_hpke_keypair()
+    evidence = build_evidence(MockTEE(quote_key, image), nonce, hpke, public_key_bytes(generate_signing_key()), image, ["ltx-2.5-fast"])
+
+    same, _ = make_spec()
+    assert verify_evidence(evidence, same.candidate_manifest(signed.submission, production), nonce).ok
+    # The owner's base booted another root filesystem (another OS release): only RTMR2 differs, and that is enough.
+    moved, _ = make_spec(base_measurements=[base_layers().model_copy(update={"rtmr2": "cd" * 48})])
+    assert not verify_evidence(evidence, moved.candidate_manifest(signed.submission, production), nonce).ok
+    assert moved.candidate_problems(signed.submission, "mock", mock_measurements(image)) == [
+        "rtmr2 differs from the spec's base: a candidate may differ from its base only in rtmr3"
+    ]
+
+
 # ---------------------------------------------------------------- adoption
 
 

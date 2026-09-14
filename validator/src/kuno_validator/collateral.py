@@ -33,6 +33,7 @@ hotkey never read, the hotkey gets zero weight.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
@@ -82,16 +83,58 @@ def _value(result: Any) -> Any:
     return getattr(result, "value", result)
 
 
+class BittensorRpcSubstrate:
+    """The blocking substrate-interface calls this package makes, over bittensor >= 11's own RPC client.
+
+    bittensor 11 dropped async-substrate-interface, so this is what `kuno-validator[chain]` can read the chain with.
+    Every call blocks on a private event loop: use it from synchronous code, not inside a running loop.
+    """
+
+    def __init__(self, url: str, rpc_class: Any):
+        self._loop = asyncio.new_event_loop()
+        self._rpc = rpc_class(url)
+        try:
+            self._run(self._rpc.connect())
+        except BaseException:
+            self._loop.close()
+            raise
+
+    def _run(self, coroutine: Any) -> Any:
+        return self._loop.run_until_complete(coroutine)
+
+    def get_chain_finalised_head(self) -> str:
+        return self._run(self._rpc.raw.get_chain_finalised_head())
+
+    def query(self, module: str, storage_function: str, params: list | None = None, block_hash: str | None = None) -> Any:
+        return self._run(self._rpc.query(module, storage_function, params or [], block_hash=block_hash))
+
+    def rpc_request(self, method: str, params: list | None = None) -> dict:
+        """Wrapped as {"result": ...}, the shape substrate-interface returns."""
+        return {"result": self._run(self._rpc.raw.rpc_request(method, params or []))}
+
+    def close(self) -> None:
+        if self._loop.is_closed():
+            return
+        try:
+            self._run(self._rpc.close())
+        finally:
+            self._loop.close()
+
+
 def _default_substrate(url: str) -> Any:
     try:
         from substrateinterface import SubstrateInterface  # substrate-interface
     except ImportError:
         try:
-            from async_substrate_interface.sync_substrate import SubstrateInterface  # what bittensor >= 9 ships
+            from async_substrate_interface.sync_substrate import SubstrateInterface  # what bittensor 9 and 10 ship
         except ImportError:
-            raise CollateralUnavailable(
-                "reading miner collateral needs substrate-interface or kuno-validator[chain]"
-            ) from None
+            try:
+                from bittensor import RpcSubstrate  # bittensor >= 11 (kuno-validator[chain]) ships its own client
+            except ImportError:
+                raise CollateralUnavailable(
+                    "reading miner collateral needs substrate-interface or kuno-validator[chain]"
+                ) from None
+            return BittensorRpcSubstrate(url, RpcSubstrate)
     return SubstrateInterface(url=url, ss58_format=42)
 
 

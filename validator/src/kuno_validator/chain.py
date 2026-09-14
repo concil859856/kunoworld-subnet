@@ -14,8 +14,10 @@ The SDK picks plain or timelocked commit-reveal submission itself, per mechanism
 Supported SDKs:
   bittensor 10.x  Subtensor.set_weights(wallet, netuid, uids, weights, mechid=0, ...) and
                   Subtensor.get_all_commitments / get_commitment_metadata
-  bittensor 11.x  bt.set_weights(netuid, {uid: w}, wallet=, hotkey=, mechid=, network=) and
-                  Subtensor().subnets.commitments(netuid)
+  bittensor 11.x  bt.set_weights(netuid, {uid: w}, wallet=, hotkey=, mechid=, network=),
+                  Subtensor().subnets.metagraph(netuid).hotkeys and Subtensor().subnets.commitments(netuid)
+                  ({hotkey: NeuronCommitment} in 11.1.0). The 11.1.0 paths were run against a spec-458 localnet
+                  (scripts/localnet/).
 The API has changed between major releases, so run `kuno-validator once --netuid <n> --dry-run`
 against your wallet before trusting a live run: it resolves hotkeys to UIDs and prints the
 vector it would submit without touching the chain. An SDK that cannot address a mechanism id
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from kuno_protocol.turbo import OnChainCommitment
@@ -59,6 +62,8 @@ def registered_hotkeys(subtensor: Any, netuid: int) -> list[str]:
     subnets = getattr(subtensor, "subnets", None)
     if subnets is not None and callable(getattr(subnets, "metagraph", None)):
         graph = subnets.metagraph(netuid)
+        if graph is None:  # bittensor 11.1 answers None for a netuid that doesn't exist
+            raise RuntimeError(f"netuid {netuid} does not exist on this chain")
         hotkeys = graph.get("hotkeys") if isinstance(graph, dict) else getattr(graph, "hotkeys", None)
         if hotkeys is not None:
             return [str(hotkey) for hotkey in hotkeys]
@@ -94,9 +99,12 @@ def set_weights(
     *,
     mechid: int = SERVING_MECHID,
     dry_run: bool = False,
+    wallet_path: str | None = None,
     bt: Any = None,
 ) -> dict[str, Any]:
-    """Submits one mechanism's weights. Returns what happened; `bt` is injectable for tests."""
+    """Submits one mechanism's weights. Returns what happened; `bt` is injectable for tests.
+
+    `wallet_path` is the wallet directory; unset, the SDK's default (~/.bittensor/wallets) applies."""
     if not isinstance(mechid, int) or not 0 <= mechid <= MAX_MECHID:
         raise ValueError(f"mechanism id must be an integer in 0..{MAX_MECHID}, not {mechid!r}")
     if not weights:
@@ -123,8 +131,9 @@ def set_weights(
 
     legacy = getattr(subtensor, "set_weights", None)
     if callable(legacy):
+        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey_name, **({"path": wallet_path} if wallet_path else {})}
         kwargs: dict[str, Any] = {
-            "wallet": bt.Wallet(name=wallet_name, hotkey=hotkey_name),
+            "wallet": bt.Wallet(**wallet_kwargs),
             "netuid": netuid,
             "uids": uids,
             "weights": values,
@@ -137,11 +146,14 @@ def set_weights(
             return {"submitted": False, "reason": f"the installed bittensor cannot set weights for mechanism {mechid}", **outcome}
         result = legacy(**kwargs)
     elif callable(getattr(bt, "set_weights", None)):
-        # bittensor 11: one blocking call that raises ChainError on failure.
+        # bittensor 11: one blocking call that raises ChainError on failure. A wallet *name* always resolves under
+        # ~/.bittensor/wallets, so a wallet kept elsewhere goes in as a Wallet object (which carries its hotkey).
+        wallet: Any = wallet_name
+        hotkey: str | None = hotkey_name
+        if wallet_path:
+            wallet, hotkey = bt.Wallet(name=wallet_name, hotkey=hotkey_name, path=wallet_path), None
         try:
-            result = bt.set_weights(
-                netuid, dict(zip(uids, values)), wallet=wallet_name, hotkey=hotkey_name, mechid=mechid, network=network
-            )
+            result = bt.set_weights(netuid, dict(zip(uids, values)), wallet=wallet, hotkey=hotkey, mechid=mechid, network=network)
         except Exception as exc:  # the SDK's ChainError, or a connection failure
             log.error("setting mechanism %d weights failed: %s", mechid, exc)
             return {"submitted": False, "reason": f"chain rejected the weights: {exc}", **outcome}
@@ -175,6 +187,18 @@ def decode_commitment_info(info: Any) -> str:
     return "".join(parts)
 
 
+def _commitment_row(row: Any) -> tuple[Any, Any, Any, str | None]:
+    """(hotkey, uid, block, visible text) of one bittensor 11 commitment.
+
+    bittensor 11.1.0 returns `{hotkey: NeuronCommitment}`, whose `value` is the readable text and whose `is_revealed`
+    is False while a timelocked payload is still sealed (verified against a spec-458 localnet). Rows that are plain
+    dicts ({"hotkey", "uid", "block", "commitment"}) come from earlier 11.x builds."""
+    if isinstance(row, Mapping):
+        return row.get("hotkey"), row.get("uid"), row.get("block"), row.get("commitment")
+    text = getattr(row, "value", None) if getattr(row, "is_revealed", True) else None
+    return getattr(row, "hotkey", None), getattr(row, "uid", None), getattr(row, "block", None), text
+
+
 def read_commitments(netuid: int, network: str, *, bt: Any = None) -> list[OnChainCommitment]:
     """Every registered hotkey's current plaintext commitment on the subnet, with its block."""
     if bt is None:
@@ -183,12 +207,14 @@ def read_commitments(netuid: int, network: str, *, bt: Any = None) -> list[OnCha
     subtensor = bt.Subtensor(network=network)
     subnets = getattr(subtensor, "subnets", None)
     if subnets is not None and callable(getattr(subnets, "commitments", None)):
+        rows = subnets.commitments(netuid)
         found = []
-        for row in subnets.commitments(netuid):
+        for row in rows.values() if isinstance(rows, Mapping) else rows:
+            hotkey, uid, block, text = _commitment_row(row)
             # Deregistered hotkeys (uid None) and still-sealed timelocked payloads cannot compete.
-            if row.get("commitment") is None or row.get("uid") is None:
+            if text is None or uid is None:
                 continue
-            found.append(OnChainCommitment(str(row["hotkey"]), int(row["block"]), str(row["commitment"]), int(row["uid"])))
+            found.append(OnChainCommitment(str(hotkey), int(block), str(text), int(uid)))
         return found
     if callable(getattr(subtensor, "get_all_commitments", None)):
         uids = {hotkey: uid for uid, hotkey in enumerate(registered_hotkeys(subtensor, netuid))}

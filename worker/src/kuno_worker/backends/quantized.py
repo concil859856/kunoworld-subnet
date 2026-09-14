@@ -44,12 +44,14 @@ NOT RUN ON A GPU. Everything above the torch section is plain data and tested wi
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from kuno_protocol.envelope import EnvelopeTable, profile_max_duration
 from kuno_protocol.precision import (
     ComponentPrecision,
     PrecisionError,
@@ -62,7 +64,7 @@ from kuno_protocol.precision import (
 )
 from kuno_protocol.profiles import HardwareClass, ModelProfile, ltx_num_frames
 
-from .media_tools import BackendError
+from .media_tools import CapacityRefused
 
 log = logging.getLogger("kuno.worker.quantized")
 
@@ -75,10 +77,8 @@ HOST_RAM_MARGIN_GIB = 8.0
 GPU_MEMORY_TOLERANCE_GIB = 1.0
 # Below this share of parameters in the storage dtype, a recipe did not apply.
 MIN_QUANTIZED_FRACTION = 0.5
-
-
-class CapacityRefused(BackendError):
-    """This hardware class cannot fit the request; the message says what it can serve."""
+# CapacityRefused is defined with BackendError (media_tools), so the worker loop needn't import this module; importing
+# it from here still works.
 
 
 @dataclass(frozen=True)
@@ -250,14 +250,35 @@ def plan_for_class(profile: ModelProfile, hardware_class: str | None, *, host_ra
     return plan_memory(profile, recipe, hardware, host_ram_gib=host_ram_gib, mode=mode)
 
 
-def _longest_fitting(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int) -> float | None:
+def longest_duration(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int) -> float | None:
+    """The longest duration on the profile's grid (min_duration_s + k × duration_step_s, up to its limit at this fps) whose
+    latent tokens fit the plan; None when not even the shortest does. Tokens only grow with duration at a fixed size and
+    frame rate, so every shorter duration fits too."""
     lim = profile.limits
-    duration = lim.max_duration_s
-    while duration >= lim.min_duration_s:
+    cap = profile_max_duration(profile, fps)
+    steps = math.floor((cap - lim.min_duration_s) / lim.duration_step_s + 1e-9)
+    for k in range(steps, -1, -1):
+        duration = round(lim.min_duration_s + k * lim.duration_step_s, 6)
         if latent_tokens(width, height, _render_frames(profile, duration, fps)) <= plan.max_tokens:
             return duration
-        duration -= lim.duration_step_s
     return None
+
+
+def _longest_fitting(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int) -> float | None:
+    return longest_duration(plan, profile, width, height, fps)
+
+
+def envelope_for_plan(plan: MemoryPlan, profile: ModelProfile) -> EnvelopeTable:
+    """The serving envelope this plan advertises (kuno_protocol.envelope): resolution -> aspect ratio -> fps -> the longest
+    duration `admit` accepts. A size and frame rate nothing fits is left out."""
+    table: EnvelopeTable = {}
+    for resolution, ratios in profile.limits.sizes.items():
+        for aspect, (width, height) in ratios.items():
+            for fps in profile.limits.fps:
+                longest = longest_duration(plan, profile, width, height, fps)
+                if longest is not None:
+                    table.setdefault(resolution, {}).setdefault(aspect, {})[fps] = longest
+    return table
 
 
 def admit(plan: MemoryPlan, profile: ModelProfile, call: dict[str, Any], width: int, height: int, fps: int) -> int:

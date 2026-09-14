@@ -51,6 +51,7 @@ from kuno_protocol.nvidia import GpuEvidenceBundle
 from kuno_protocol.profiles import Mode, ModelProfile, ParamError, load_profiles
 from kuno_protocol.receipts import Receipt, verify_receipt
 from kuno_protocol.schemas import GenerationParams, SealedPayload, job_aad, output_label
+from kuno_protocol.sealed_payload import seal_payload
 from kuno_protocol.turbo import (
     AcceptedSubmission,
     EvalPrompt,
@@ -469,7 +470,7 @@ class GatewayBenchmarks:
         """Seals exactly like the client SDK and posts a pinned benchmark job. Returns (job id, output key, time)."""
         job_id = str(uuid.uuid4())
         session = SenderSession(b64d(enclave["hpke_public_key"]))
-        ciphertext = session.seal(payload.model_dump_json().encode(), job_aad(job_id, enclave["enclave_id"], params, []))
+        ciphertext = seal_payload(session, payload, job_aad(job_id, enclave["enclave_id"], params, []))  # padded, like the SDKs
         body = {
             "job_id": job_id,
             "params": params.model_dump(mode="json"),

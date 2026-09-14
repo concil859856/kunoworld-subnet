@@ -18,7 +18,7 @@ from cryptography.x509.oid import NameOID
 
 from kuno_protocol.crypto import public_key_bytes
 
-from .provenance import ProvenanceError
+from .provenance import ProvenanceError, parse_tsa_urls
 
 GATEWAY, DEV, PROVISIONAL = "gateway", "dev", "provisional"
 
@@ -56,10 +56,31 @@ class EnclaveCertificate:
 class CertifiedSigner:
     def __init__(self, signing_key: ed25519.Ed25519PrivateKey, tsa_url: str | None = None):
         self.signing_key = signing_key
-        self.configured_tsa_url = tsa_url
-        self.tsa_url = tsa_url
+        # The operator's own TSAs (KUNO_PROVENANCE_TSA_URL: one URL, or several separated by commas, in order) replace
+        # the gateway's suggestions.
+        self.configured_tsa_urls = parse_tsa_urls(tsa_url)
+        # The TSAs signing tries, in order (provenance.sign_with_tsa_failover).
+        self.tsa_urls: list[str] = list(self.configured_tsa_urls)
         self._certificate: EnclaveCertificate | None = None
         self._lock = threading.Lock()
+
+    @property
+    def configured_tsa_url(self) -> str | None:
+        return self.configured_tsa_urls[0] if self.configured_tsa_urls else None
+
+    @property
+    def tsa_url(self) -> str | None:
+        """The first TSA signing tries."""
+        return self.tsa_urls[0] if self.tsa_urls else None
+
+    @tsa_url.setter
+    def tsa_url(self, value: str | None) -> None:
+        self.tsa_urls = parse_tsa_urls(value)
+
+    def effective_tsa_urls(self, suggested=None) -> list[str]:
+        """The TSAs this signer uses given the gateway's suggestion: its `tsa_urls` list, or an older gateway's single
+        `tsa_url`. The operator's setting wins."""
+        return list(self.configured_tsa_urls) or parse_tsa_urls(suggested)
 
     @property
     def public_key(self) -> bytes:
@@ -69,11 +90,11 @@ class CertifiedSigner:
     def certificate(self) -> EnclaveCertificate | None:
         return self._certificate
 
-    def install(self, certificate: EnclaveCertificate | None, tsa_url: str | None = None) -> None:
+    def install(self, certificate: EnclaveCertificate | None, tsa_urls=None) -> None:
+        """`tsa_urls`: the gateway's suggestion, a list or one URL. An operator's own TSA setting wins over it."""
         with self._lock:
             self._certificate = certificate
-            # An operator's own TSA setting wins over the one the gateway suggests.
-            self.tsa_url = self.configured_tsa_url or tsa_url
+            self.tsa_urls = self.effective_tsa_urls(tsa_urls)
 
     @property
     def certificate_chain_pem(self) -> str:

@@ -19,15 +19,53 @@ wallet = ["bittensor-wallet>=4.1"]
 # (Freepik/nsfw_image_detector needs timm; CLIP for apparent minors) for the safety gate.
 # Weights are never downloaded: point KUNO_SAFETY_MODEL_PATH, KUNO_SAFETY_FRAME_MODEL_PATH and
 # KUNO_SAFETY_MINOR_MODEL_PATH at directories baked into the image.
-# Install the CPU build of torch in the image (e.g. from the PyTorch CPU wheel index).
-safety = ["transformers>=4.51", "torch>=2.4", "timm>=1.0.15"]
+# On Linux, torch resolves to the `gpu` extra's CUDA 12.8 build (uv keeps one torch per platform); it runs on CPU too.
+# torchvision is listed so it comes from the same index: timm imports it, and PyPI's torchvision is built for another
+# CUDA major version, which torchvision refuses at import.
+safety = ["transformers>=4.51", "torch>=2.4", "torchvision>=0.19", "timm>=1.0.15"]
 # C2PA manifests embedded in delivered MP4s (Content Authenticity Initiative SDK, ~15 MB wheel).
 provenance = ["c2pa-python>=0.37.10"]
+# The model runtimes behind KUNO_BACKEND=real (backends/runtimes.py, backends/quantized.py) and kuno-bench. On Linux,
+# torch, torchaudio and torchao come from PyTorch's CUDA 12.8 index ([tool.uv.sources] below); installs with neither
+# this extra nor `safety` never pull torch. Each lower bound is what the code needs:
+#   torch 2.7            the first release for Blackwell (sm_120, CUDA 12.8+); quantized.check_device refuses older
+#   torchaudio 2.7       diffusers' MiniMax H3 audio references resample with it; the build matching torch
+#   torchao 0.15.0       Int8WeightOnlyConfig(version=2), the int8-wo recipe (torchao 0.16 removed the string names)
+#   diffusers 0.40.0     the first release with LTX-2.5 (LTX2Pipeline, LTX2ConditionPipeline) and MiniMax H3's modular pipeline
+#   transformers 5.10.0  diffusers 0.40's LTX-2 pipeline imports Gemma4UnifiedForConditionalGeneration, added in 5.10.0
+#   accelerate 1.1.0     transformers' minimum; diffusers' enable_model_cpu_offload needs accelerate
+#   av 14                PyAV: LTX-2 retake and audio inputs and H3 video references (diffusers sets no minimum)
+#   pillow 10            runtimes.py opens condition and reference images
+# With `safety` as well, both extras share this torch: uv keeps one torch per platform.
+gpu = [
+    "torch>=2.7",
+    "torchaudio>=2.7",
+    "torchao>=0.15.0",
+    "diffusers>=0.40.0",
+    "transformers>=5.10.0",
+    "accelerate>=1.1.0",
+    "av>=14",
+    "pillow>=10",
+]
 
 [project.scripts]
 kuno-worker = "kuno_worker.main:main"
 kuno-plan = "kuno_worker.plan:main"
 kuno-preflight = "kuno_worker.preflight:main"
+kuno-bench = "kuno_worker.bench:main"
+
+[tool.uv.sources]
+# CUDA 12.8 builds for the RTX 5090 and the other Blackwell cards. PyTorch's cu128 index carries torch up to 2.11.0
+# and torchao up to 0.17.0 (checked 2026-09-14); a newer CUDA index needs a newer driver on every miner.
+torch = { index = "pytorch-cu128", extra = "gpu", marker = "sys_platform == 'linux'" }
+torchaudio = { index = "pytorch-cu128", extra = "gpu", marker = "sys_platform == 'linux'" }
+torchao = { index = "pytorch-cu128", extra = "gpu", marker = "sys_platform == 'linux'" }
+torchvision = { index = "pytorch-cu128", extra = "safety", marker = "sys_platform == 'linux'" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

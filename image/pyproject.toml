@@ -1,13 +1,17 @@
 # Pins the exact Python environment baked into the worker image. Not a workspace member:
 # it locks on its own so the image build needs only this repository.
+# `gpu` is the model runtime for KUNO_BACKEND=real: CUDA 12.8 torch, torchaudio and torchao from PyTorch's index
+# (worker/pyproject.toml), diffusers, transformers, accelerate and PyAV.
 [project]
 name = "kuno-worker-image"
 version = "0.1.0"
 requires-python = "==3.12.*"
-dependencies = ["kuno-worker[nvidia]", "kuno-protocol"]
+dependencies = ["kuno-worker[nvidia,gpu]", "kuno-protocol"]
 
 [tool.uv]
 package = false
+# The image is linux/amd64 (image/build.sh); torchao's CUDA wheel is x86-64 only.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [tool.uv.sources]
 kuno-protocol = { path = "../protocol", editable = false }

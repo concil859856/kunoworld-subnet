@@ -79,10 +79,15 @@ class GatewayClient:
         capacity: int,
         hotkey_proof: HotkeyProof | None = None,
         turbo_submission: dict | None = None,
+        envelope: dict | None = None,
     ) -> dict:
         body = {"evidence": evidence.model_dump(mode="json"), "miner_hotkey": miner_hotkey, "capacity": capacity}
         if hotkey_proof is not None:
             body["hotkey_proof"] = hotkey_proof.model_dump(mode="json")
+        if envelope is not None:
+            # The profiles this hardware cannot serve in full (kuno_protocol.envelope). Gateways from before envelopes
+            # ignore the field.
+            body["envelope"] = envelope
         if turbo_submission is not None:
             # A Turbo candidate registers against its submission's measurements and earns for its hotkey.
             return self._send("POST", "/turbo/v1/enclaves", self._json({"registration": body, "submission": turbo_submission})).json()

@@ -4,7 +4,10 @@
 
     image/cvm/plan-host.py --shape c2.b200-180gb.x1 [--shapes image/cvm/shapes.json] [--release out/cvm/a]
         [--gpu <PCI address>...] [--host-cpus 224] [--host-memory 2048G] [--reserve-cpus 8] [--reserve-memory 64G]
-        [--no-numa] [--sysfs /sys] [--json] [-- <launch-td.sh arguments for every TD: --weights, --env, ...>]
+        [--image <prefix>] [--no-numa] [--sysfs /sys] [--json] [-- <launch-td.sh arguments for every TD: --weights, --env, ...>]
+
+`--image` passes a worker image disk (pack-image.sh output) to every launch-td.sh command instead of the release's own
+worker.*: a Turbo candidate on the owner's release. It is one more verity volume in the same slot, so RTMR0 is unchanged.
 
 A whole-server shape (`c8.*`: Protected PCIe on HGX H200, multi-GPU passthrough CC on HGX B200 and B300) gets one
 launch-td.sh command with every GPU and, for Protected PCIe, every NVSwitch (vendor 0x10de, class 0x0680). The
@@ -303,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shape", required=True, help="a single-GPU shape id")
     parser.add_argument("--shapes", type=Path, default=here / "shapes.json")
     parser.add_argument("--release", default="out/cvm/a", help="release directory each launch-td.sh command boots")
+    parser.add_argument("--image", help="worker image disk prefix (pack-image.sh) instead of the release's worker.*")
     parser.add_argument("--gpu", action="append", default=[], help="plan only this PCI address (repeatable; default: every NVIDIA GPU)")
     parser.add_argument("--host-cpus", type=int, help="instead of the online CPUs sysfs lists")
     parser.add_argument("--host-memory", help="instead of the memory sysfs lists, e.g. 2048G")
@@ -312,6 +316,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sysfs", type=Path, default=Path("/sys"))
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    if args.image:
+        extra = ["--image", args.image, *extra]
     measure = _measure()
     try:
         shape = measure.load_shape(f"{args.shapes}:{args.shape}")

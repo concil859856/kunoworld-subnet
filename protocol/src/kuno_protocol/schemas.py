@@ -145,12 +145,18 @@ class MinerRegistration(BaseModel):
 
     `hotkey_proof` is optional so older workers still parse; a production gateway requires it
     and checks it with `verify_hotkey_proof` against the verified evidence.
+
+    `envelope` is the serving envelope (kuno_protocol.envelope): profile id -> resolution -> aspect
+    ratio -> fps -> the longest duration_s this hardware serves. Only profiles the hardware cannot
+    serve in full are listed; None (older workers, and hardware that holds every profile) serves the
+    profiles' full limits. Gateways from before it ignore the field.
     """
 
     evidence: AttestationEvidence
     miner_hotkey: str | None = None
     capacity: int = Field(default=1, ge=1, le=64)
     hotkey_proof: HotkeyProof | None = None
+    envelope: dict[str, dict[str, dict[str, dict[int, float]]]] | None = None
 
 
 class RouteResponse(BaseModel):

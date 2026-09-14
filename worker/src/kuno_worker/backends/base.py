@@ -86,6 +86,14 @@ class Backend(ABC):
     def warm(self, profile: ModelProfile) -> None:
         """Load weights ahead of the first job. TEE model loads are slow; do it once."""
 
+    def serving_envelope(self, profile: ModelProfile) -> dict[str, dict[str, dict[int, float]]]:
+        """The longest duration this backend serves at each resolution, aspect ratio and fps of `profile`
+        (kuno_protocol.envelope). A backend whose hardware holds the whole profile serves its full limits;
+        one that plans memory against a smaller card (backends/quantized.py) overrides this."""
+        from kuno_protocol.envelope import full_table
+
+        return full_table(profile)
+
     def verified_enabled(self, profile: ModelProfile) -> bool:
         return (
             profile.verified is not None

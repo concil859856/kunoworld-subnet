@@ -119,6 +119,35 @@ uv run kuno-plan h3-reference reference_to_video --duration 8
 Compare that with the model's own documentation, and run it by hand once. If our command
 is wrong, you find out in minutes rather than after a shift of failed jobs.
 
+## 2b. Benchmark a machine
+
+Measure a rented box, without a TEE, through the same backends jobs use:
+
+```bash
+uv sync --extra gpu        # CUDA 12.8 torch, diffusers, transformers, torchao
+uv run kuno-bench --models-dir /models/ltx-2.5 --profiles ltx-2.5-fast,ltx-2.5-pro \
+    --repeats 2 --time-budget 3h --out bench-h200.json
+```
+
+For each profile it records:
+- cold and warm load time;
+- seconds per denoising step;
+- wall time at each resolution's minimum, 5 s and maximum duration, at 24 fps and at 48/50 fps where allowed;
+- peak GPU memory and host RAM.
+
+It also records the GPU model, count, driver and confidential-computing mode.
+
+How it runs:
+- Prompts and seeds are fixed, and outputs are discarded.
+- `--time-budget` skips the slowest cells instead of overrunning.
+- The JSON is rewritten after every profile, and a summary table prints at the end.
+- Without `--profiles` it tries every profile `kuno-preflight --no-tee` says fits.
+- H3 runs against the SGLang servers above, so its load time is not measured.
+
+The subnet owner turns bench files from several machines into VCU weights and rates with
+`kuno-devkit derive-rates bench-*.json --gpu-price h200=3.20 …`. It prints a proposal and writes nothing
+unless you pass `--write-proposal`.
+
 ## 3. First run on a dev network
 
 A rented GPU box usually has no TDX, so run the real models with a simulated TEE against
@@ -293,8 +322,9 @@ from an open-tier enclave as fraud (zero weight).
 | `O1.h100-80gb.x1` | H100 80 GB, CC off | bf16 | `ltx-2.5-fast`, `ltx-2.5-pro` | as above; the profiles' 80 GB minimum |
 
 Pin `KUNO_PROFILES` and `KUNO_VERIFIED_HARDWARE_CLASS` to your class. A 24–32 GB card that fails
-long or high-resolution jobs counts those failures against its success rate, so the worker refuses
-what its class cannot fit before it touches the GPU (below).
+long or high-resolution jobs counts those failures against its success rate, so the worker advertises
+what its class can fit, the gateway routes only that, and the worker refuses anything else before it
+touches the GPU (below).
 
 ### What each consumer card can serve
 
@@ -342,27 +372,52 @@ Before loading, the worker checks each of these and refuses with the reason:
   Blackwell.
 - **Host RAM fits the offload mode.**
 
-A job the plan cannot fit fails at once with `CapacityRefused`, naming the longest duration the class
-serves at that size and frame rate.
+**Serving envelope.** At start-up the worker turns its memory plan into a *serving envelope*: for each
+resolution, aspect ratio and frame rate, the longest duration the plan fits. It is the same rule the
+refusal below uses, so the two always agree. Every registration carries the envelope of each profile
+your class can't serve in full ([PROTOCOL.md](PROTOCOL.md#serving-envelope)), for example on a 5090:
 
-The GPU image needs diffusers ≥ 0.40.0 (the first release with LTX-2.5), torch ≥ 2.7 (CUDA 12.8+ for
-the 5090), transformers ≥ 4.51, and, for int8, torchao ≥ 0.15.0. torchao 0.16 removed the string names
-such as `"int8wo"`, so the recipes use its config classes. None of these is a dependency of kuno-worker.
+```json
+{"ltx-2.5-fast": {"1080p": {"16:9": {"24": 20, "50": 10}, "21:9": {"24": 18, "50": 8}}, "720p": {"...": {}}}}
+```
+
+The gateway sends you only jobs inside it. It picks standard jobs' workers by their parameters.
+Private clients get a filtered `/v1/route`, and the gateway refuses to admit a private job sealed to
+you that doesn't fit (`409 envelope_exceeded`). A card with the whole bf16 pipeline (80 GB and up)
+advertises nothing, which means its profiles' full limits.
+
+**What a refusal costs.** A job the plan cannot fit fails at once with `capacity_refused`, before its
+inputs are downloaded or decrypted, naming the longest duration the class serves at that size and
+frame rate. The customer is refunded either way.
+- **Outside your envelope** (the gateway shouldn't have routed it to you, for example a job queued
+  before you re-registered): it stays `capacity_refused`, which validators don't count against you.
+- **Inside your envelope**: the gateway records it as `internal_error`, a miner fault that lowers your
+  success rate, exactly like an out-of-memory crash inside it. Otherwise a miner could refuse every
+  job for free. The envelope comes from your class's estimated memory figures, so if your card runs
+  out of memory inside it, measure it (below) and report the fit before relying on it.
+
+The worker's `gpu` extra (`uv sync --extra gpu`, and the worker image) installs the runtime:
+- **torch ≥ 2.7**, built for CUDA 12.8 from PyTorch's cu128 index, which the 5090 needs.
+- **diffusers ≥ 0.40.0**, the first release with LTX-2.5.
+- **transformers ≥ 5.10.0**. diffusers 0.40's LTX-2 pipeline imports Gemma 4 classes added in that release.
+- **torchao ≥ 0.15.0**, for int8. torchao 0.16 removed the string names such as `"int8wo"`, so the recipes use its config classes.
 
 Measure your card before relying on it; the owner does the same before calibrating a class:
 
 ```bash
-uv run python subnet/worker/scripts/benchmark_ltx_quantized.py --models-dir /models/ltx-2.5 \
+uv run kuno-bench --models-dir /models/ltx-2.5 --profiles ltx-2.5-fast \
     --hardware-class O1.rtx-5090-32gb.x1.fp8-cast --model-digest <digest> \
-    --requests 720p:16:9:5,720p:16:9:10,1080p:16:9:5 --out bench.jsonl
+    --cells 720p:16:9:5,720p:16:9:10,1080p:16:9:5 --out bench.json
 ```
 
 It records:
 - load time and seconds per step;
-- peak VRAM against the estimate;
+- peak VRAM against the estimate (`estimate_gib`);
 - refusals and out-of-memory failures;
 - whether outputs repeat, with `--check-determinism`;
-- a memory fit to publish in place of the estimates.
+- a memory fit (`memory_fit`) to publish in place of the estimates.
+
+The older `worker/scripts/benchmark_ltx_quantized.py` command still works; it forwards to `kuno-bench`.
 
 Sources:
 - Lightricks model repos and file notes: [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5),
@@ -466,9 +521,14 @@ miner can then serve. Full rules: [TURBO.md](TURBO.md).
 
 To compete:
 
-1. Build your pipeline as a worker image on the owner's published CVM base (the spec pins the
-   base measurements; only your application layer, RTMR3, may differ) and record its image
-   digest and RTMR3.
+1. Build your pipeline as a worker image on the owner's published CVM base. The spec pins the
+   base measurements: MRTD and RTMR0–2 must match exactly, and only RTMR3 may differ.
+   - Pack the image onto its own verity disk with `image/cvm/pack-image.sh`, which writes its root
+     hash and digest.
+   - Compute RTMR3 with `image/cvm/expected_rtmr3.py <image disk root> <image digest> <weights roots…>`.
+   - Boot the base release with `image/cvm/launch-td.sh … --image <disk prefix>`.
+
+   Record the image digest and RTMR3 ([image/CVM.md](image/CVM.md), [TURBO.md](TURBO.md) "Base measurements").
 2. Describe it in `pipeline.json` (runtime, steps, precision, techniques, extra weight hashes, a
    reproducible source URL), then sign it with your hotkey:
    `uv run kuno-turbo submit --hotkey-seed-file hotkey.seed --spec spec.signed.json --image-digest sha256:... --rtmr3 <hex> --platform tdx --variant ltx-2.5-fast+myopt.1 --pipeline pipeline.json --location https://you.example/turbo.json --out turbo.json`

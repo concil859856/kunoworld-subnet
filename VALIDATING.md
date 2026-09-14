@@ -37,6 +37,10 @@ kuno-validator run --interval 4320 --netuid <netuid> \
   --wallet-name <name> --wallet-hotkey <hotkey> --canary ltx-2.5-fast --standard-canary ltx-2.5-fast
 ```
 
+`--wallet-path <dir>` points at a wallet directory other than `~/.bittensor/wallets` (default
+`$BT_WALLET_PATH` when set). `--network local` resolves through `BT_CHAIN_ENDPOINT` (default
+`ws://127.0.0.1:9944`); `scripts/localnet/` runs a whole subnet against such a chain.
+
 `--canary` sends private (end-to-end encrypted) canaries, which only confidential-tier miners
 can receive. `--standard-canary` sends standard-mode canaries through `POST /v1/standard/videos`;
 those can land on open-tier miners too, and they are the admission probes (see [Open tier](#open-tier)).
@@ -255,9 +259,10 @@ requirement get zero weight.
 then `SubtensorModule.MinerCollateral(netuid, hotkey, coldkey).locked` gives the amount in
 alpha base units (1 alpha = 1e9). These storage items were checked against live finney
 metadata (runtime spec_version 455) and against bittensor 11.1.0's own collateral reader. The
-reader uses `substrate-interface` when installed, otherwise the `async-substrate-interface`
-that `kuno-validator[chain]` brings. Only the owning coldkey can add collateral, so the owner's
-position is the one that counts.
+reader uses `substrate-interface` when installed, otherwise the RPC client of the bittensor 11
+that `kuno-validator[chain]` brings (or the `async-substrate-interface` of bittensor 9 and 10).
+The bittensor 11.1.0 path was also run against a spec-458 localnet (`scripts/localnet/`). Only
+the owning coldkey can add collateral, so the owner's position is the one that counts.
 
 **Why alpha, not TAO.**
 - The chain locks alpha.

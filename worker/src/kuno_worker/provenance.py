@@ -45,6 +45,22 @@ issuing CA, which signs a short-lived leaf only for a freshly attested enclave's
 mock-TEE worker uses it only when the gateway has no CA. Readers report such a file as
 `Valid` with the status `signingCredential.untrusted`: integrity and key possession, not
 identity. The KunoWorld root is not on the C2PA Trust List yet.
+
+Timestamps and failover
+-----------------------
+The manifest is timestamped by an RFC 3161 timestamp authority so it outlives the short
+certificate. The gateway lists its TSAs in order of preference (`tsa_urls`, with `tsa_url` its
+first for older workers); an operator's `KUNO_PROVENANCE_TSA_URL`, one URL or a comma-separated
+list, replaces that list. The C2PA SDK sends the timestamp request itself, so failover wraps
+the whole signing step (`sign_with_tsa_failover`):
+
+* TSAs are tried in order, each within `TSA_TIMEOUT_S` (plus `TSA_TIMEOUT_S_PER_MIB` for hashing
+  the video). The SDK has no timeout of its own to set, so an attempt runs on its own thread; one
+  that never returns is left behind on a daemon thread.
+* A TSA that failed is remembered for `TSA_COOLDOWN_S` (`TsaBreaker`) and tried after the others,
+  so the next videos don't wait on it. It is moved to the back, never skipped.
+* When every TSA fails, signing fails and the job fails: a video is never shipped with a manifest
+  that would stop validating when its certificate expires.
 """
 
 from __future__ import annotations
@@ -52,6 +68,11 @@ from __future__ import annotations
 import datetime
 import io
 import json
+import logging
+import re
+import threading
+import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -71,9 +92,33 @@ PROVENANCE_CONTEXT = b"kuno/v1/provenance\n"
 DOCUMENT_SIGNING_EKU = ObjectIdentifier("1.3.6.1.5.5.7.3.36")
 UNTRUSTED_CREDENTIAL = "signingCredential.untrusted"
 
+# Timestamp authority failover (module docstring, "Timestamps and failover").
+TSA_TIMEOUT_S = 10.0
+TSA_TIMEOUT_S_PER_MIB = 0.05
+TSA_COOLDOWN_S = 120.0
+
+log = logging.getLogger("kuno.provenance")
+
 
 class ProvenanceError(Exception):
     """Provenance could not be embedded or read."""
+
+
+def parse_tsa_urls(value: str | Iterable[str] | None) -> list[str]:
+    """TSA URLs in order, without repeats, from None, one URL, a comma- or space-separated string, or a list. Entries
+    that aren't http(s) URLs are dropped: the C2PA SDK refuses them."""
+    if value is None:
+        return []
+    items = re.split(r"[\s,]+", value) if isinstance(value, str) else [v for v in value if isinstance(v, str)]
+    urls = []
+    for item in (item.strip() for item in items):
+        if not item:
+            continue
+        if not item.lower().startswith(("http://", "https://")):
+            log.warning("ignoring timestamp authority %r: not an http(s) URL", item)
+            continue
+        urls.append(item)
+    return list(dict.fromkeys(urls))
 
 
 @dataclass
@@ -82,11 +127,99 @@ class ProvenanceSigner:
 
     signing_key: Ed25519PrivateKey
     certificate_chain_pem: str
+    # One TSA URL, or several separated by commas, tried in order.
     tsa_url: str | None = None
 
     @property
     def public_key(self) -> bytes:
         return public_key_bytes(self.signing_key)
+
+    @property
+    def tsa_urls(self) -> list[str]:
+        return parse_tsa_urls(self.tsa_url)
+
+
+class TsaBreaker:
+    """Remembers for `cooldown_s` which timestamp authorities just failed, so the next videos try the others first. A
+    failed TSA moves to the back of the order and is never skipped: when all have failed lately, they are tried oldest
+    failure first."""
+
+    def __init__(self, cooldown_s: float = TSA_COOLDOWN_S, clock: Callable[[], float] = time.monotonic):
+        self.cooldown_s, self.clock = cooldown_s, clock
+        self._failed: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def order(self, urls: list[str]) -> list[str]:
+        now = self.clock()
+        with self._lock:
+            for url, failed_at in list(self._failed.items()):
+                if now - failed_at >= self.cooldown_s:
+                    del self._failed[url]
+            failed = dict(self._failed)
+        healthy = [url for url in urls if url not in failed]
+        return healthy + sorted((url for url in urls if url in failed), key=failed.__getitem__)
+
+    def record_failure(self, url: str) -> None:
+        with self._lock:
+            self._failed[url] = self.clock()
+
+    def record_success(self, url: str) -> None:
+        with self._lock:
+            self._failed.pop(url, None)
+
+
+TSA_BREAKER = TsaBreaker()
+
+
+class _NoAnswer(Exception):
+    pass
+
+
+def _within(fn: Callable[[], bytes], timeout_s: float) -> bytes:
+    """Runs `fn` on its own thread and waits at most `timeout_s` for it. The C2PA SDK makes the timestamp request itself
+    and has no timeout to set, so an attempt still waiting on a TSA is left behind on a daemon thread."""
+    outcome: dict[str, Any] = {}
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            outcome["value"] = fn()
+        except BaseException as exc:  # handed to the waiting caller
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="c2pa-sign", daemon=True).start()
+    if not done.wait(timeout_s):
+        raise _NoAnswer()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
+def sign_with_tsa_failover(
+    attempt: Callable[[str | None], bytes], urls: list[str], *, timeout_s: float = TSA_TIMEOUT_S, breaker: TsaBreaker | None = None,
+) -> bytes:
+    """`attempt(tsa_url)` signs once with that TSA. Tries the TSAs in order, recently failed ones last, each within
+    `timeout_s`, until one signs. With no TSA it signs once without a timestamp (development only: real-TEE workers
+    refuse a certificate without one). Raises ProvenanceError when every TSA fails."""
+    breaker = breaker or TSA_BREAKER
+    if not urls:
+        return attempt(None)
+    failures: list[str] = []
+    for url in breaker.order(urls):
+        try:
+            signed = _within(lambda url=url: attempt(url), timeout_s)
+        except _NoAnswer:
+            failures.append(f"{url}: no answer within {timeout_s:.0f}s")
+        except Exception as exc:
+            failures.append(f"{url}: {type(exc).__name__}")
+        else:
+            breaker.record_success(url)
+            return signed
+        breaker.record_failure(url)
+        log.warning("C2PA signing with timestamp authority %s failed", failures[-1])
+    raise ProvenanceError("C2PA signing failed with every timestamp authority (" + "; ".join(failures) + ")")
 
 
 def _c2pa():
@@ -169,22 +302,34 @@ def manifest_definition(claims: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------- embed and read
 
 
-def embed_provenance(mp4_bytes: bytes, receipt: ReceiptBody | Receipt, signer: ProvenanceSigner) -> bytes:
-    """Returns the MP4 with a signed C2PA manifest. `receipt` is the draft body (see module docs)."""
+def embed_provenance(
+    mp4_bytes: bytes, receipt: ReceiptBody | Receipt, signer: ProvenanceSigner, *, breaker: TsaBreaker | None = None,
+) -> bytes:
+    """Returns the MP4 with a signed C2PA manifest. `receipt` is the draft body (see module docs). Fails over between
+    the signer's timestamp authorities (`sign_with_tsa_failover`)."""
     c2pa = _c2pa()
     claims = provenance_claims(mp4_bytes, receipt, signer)
-    destination = io.BytesIO()
-    try:
+    definition = manifest_definition(claims)
+    # Read once, before any TSA is tried: a missing or expired certificate is not a TSA failure.
+    chain = signer.certificate_chain_pem
+    urls = list(getattr(signer, "tsa_urls", None) or [])
+
+    def attempt(tsa_url: str | None) -> bytes:
+        destination = io.BytesIO()
         c2pa_signer = c2pa.Signer.from_callback(
-            lambda data: signer.signing_key.sign(bytes(data)), c2pa.C2paSigningAlg.ED25519, signer.certificate_chain_pem, signer.tsa_url
+            lambda data: signer.signing_key.sign(bytes(data)), c2pa.C2paSigningAlg.ED25519, chain, tsa_url
         )
-        with c2pa.Builder(manifest_definition(claims)) as builder:
+        with c2pa.Builder(definition) as builder:
             builder.sign(c2pa_signer, "video/mp4", io.BytesIO(mp4_bytes), destination)
+        return destination.getvalue()
+
+    timeout_s = TSA_TIMEOUT_S + TSA_TIMEOUT_S_PER_MIB * len(mp4_bytes) / (1 << 20)
+    try:
+        return sign_with_tsa_failover(attempt, urls, timeout_s=timeout_s, breaker=breaker)
     except ProvenanceError:
         raise
     except Exception as exc:
         raise ProvenanceError(f"C2PA signing failed ({type(exc).__name__})") from None
-    return destination.getvalue()
 
 
 @dataclass

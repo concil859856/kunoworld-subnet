@@ -6,8 +6,10 @@
 # image/uv.lock (hashes included), no bytecode compiled at build time, timestamps clamped to
 # SOURCE_DATE_EPOCH. Nothing is downloaded when the container runs.
 #
-# This is the worker layer only. Model runtimes (torch/diffusers for `real`, SGLang for H3)
-# and NVIDIA's nvattest are added in a derived image; see image/CVM.md.
+# The worker and its Python model runtime for `real` (kuno-worker[gpu]: CUDA 12.8 torch, torchaudio
+# and torchao, diffusers, transformers, accelerate, PyAV; several GB of CUDA wheels). The CUDA
+# libraries come as wheels; the NVIDIA driver comes from the VM. SGLang for H3 and NVIDIA's
+# nvattest are added in a derived image; see image/CVM.md.
 
 ARG PYTHON_IMAGE=python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.19@sha256:b46b03ddfcfbf8f547af7e9eaefdf8a39c8cebcba7c98858d3162bd28cf536f6

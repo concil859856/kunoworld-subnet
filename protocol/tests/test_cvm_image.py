@@ -32,6 +32,8 @@ SUBNET = Path(__file__).resolve().parents[2]
 CVM = SUBNET / "image" / "cvm"
 WORKFLOW = SUBNET / ".github" / "workflows" / "cvm-reproducibility.yml"
 EPOCH = "1788220800"
+IMAGE_ROOT = "9b" * 32  # a worker image disk's dm-verity root hash (pack-image.sh)
+IMAGE_DIGEST = "sha256:" + "ab" * 32
 
 pytestmark = pytest.mark.skipif(not (CVM / "measure.py").exists(), reason="image/ is not part of this checkout")
 
@@ -195,8 +197,9 @@ def test_measure_computes_every_register_and_takes_rtmr0_from_an_agreeing_dstack
     out = image_dir / "m.json"
     shape = f"{CVM / 'shapes.json'}:c2.h200-141gb.x1"
     roots = ["cd" * 32, "0a" * 32]
-    digest = "sha256:" + "ef" * 32
-    args = [str(image_dir / "metadata.json"), "--shape", shape, "--image-digest", digest, "--weights-root", roots[0], "--weights-root", roots[1]]
+    digest, image_root = "sha256:" + "ef" * 32, IMAGE_ROOT
+    args = [str(image_dir / "metadata.json"), "--shape", shape, "--image-root", image_root, "--image-digest", digest,
+            "--weights-root", roots[0], "--weights-root", roots[1]]
     assert measure.main(args + ["--out", str(out)]) == 0
     result = json.loads(out.read_text())
     registers = result["registers"]
@@ -206,8 +209,12 @@ def test_measure_computes_every_register_and_takes_rtmr0_from_an_agreeing_dstack
     cmdline = json.loads((image_dir / "metadata.json").read_text())["cmdline"]
     assert registers["rtmr2"] == measure.measure_log(measure.rtmr2_log(cmdline, initrd)).hex()
     rtmr3 = load("expected_rtmr3")
-    assert registers["rtmr3"] == rtmr3.replay(rtmr3.events(digest, *reversed(roots)))
-    assert result["inputs"]["weights_roots"] == sorted(roots)
+    assert registers["rtmr3"] == rtmr3.replay(rtmr3.rtmr3_events(image_root, digest, *reversed(roots)))
+    assert result["logs"]["rtmr3"] == [e.hex() for e in rtmr3.rtmr3_events(image_root, digest, *roots)]
+    assert (result["inputs"]["weights_roots"], result["inputs"]["image_root"]) == (sorted(roots), image_root)
+    # A worker image digest without its image disk's root hash is an RTMR3 kuno-app never produces.
+    assert measure.main([a for a in args if a not in ("--image-root", image_root)] + ["--out", str(tmp_path / "no-root.json")]) == 1
+    assert not (tmp_path / "no-root.json").exists()
 
     acpi = {"loader": "11" * 48, "rsdp": "22" * 48, "tables": "33" * 48}
     (tmp_path / "acpi.json").write_text(json.dumps(acpi))
@@ -238,18 +245,20 @@ def test_measure_computes_every_register_and_takes_rtmr0_from_an_agreeing_dstack
 def test_rtmr3_weights_events_are_ordered_and_the_guest_agent_replays_the_same_value():
     rtmr3 = load("expected_rtmr3")
     digest, roots = "sha256:" + "12" * 32, ["ff" * 32, "01" * 32]
-    assert rtmr3.events(digest, *roots) == rtmr3.events(digest, *reversed(roots))
-    assert len(rtmr3.events(digest)) == 1
+    assert rtmr3.rtmr3_events(IMAGE_ROOT, digest, *roots) == rtmr3.rtmr3_events(IMAGE_ROOT, digest, *reversed(roots))
+    assert len(rtmr3.rtmr3_events(IMAGE_ROOT, digest)) == 2
     with pytest.raises(ValueError, match="listed twice"):
-        rtmr3.events(digest, roots[0], roots[0])
+        rtmr3.rtmr3_events(IMAGE_ROOT, digest, roots[0], roots[0])
     with pytest.raises(ValueError):
-        rtmr3.events("sha256:" + "AB" * 32)
+        rtmr3.rtmr3_events(IMAGE_ROOT, "sha256:" + "AB" * 32)
+    with pytest.raises(ValueError, match="image disk"):
+        rtmr3.rtmr3_events(digest, *roots)  # the order before the image disk: refused, not silently re-measured
     agent = CVM / "rootfs" / "usr" / "lib" / "kuno" / "kuno-app"
     if shutil.which("basenc") is None or shutil.which("bash") is None:
         pytest.skip("the agent's shell replay needs bash and coreutils basenc")
-    for args in ([digest], [digest, *roots]):
+    for args in ([IMAGE_ROOT, digest], [IMAGE_ROOT, digest, *roots]):
         out = subprocess.run(["bash", str(agent), "--expected-rtmr3", *args], capture_output=True, text=True, check=True)
-        assert out.stdout.strip() == rtmr3.replay(rtmr3.events(*args))
+        assert out.stdout.strip() == rtmr3.expected_rtmr3(*args)
 
 
 # ------------------------------------------------------------------ deterministic packing
@@ -378,10 +387,12 @@ def test_every_shape_is_the_vm_of_one_confidential_class_in_each_profile_it_serv
 
 
 def measurement_document(**overrides) -> dict:
+    """What measure.py writes: RTMR3 is the replay of the image disk, the image and (no) weights."""
+    registers = {k: hashlib.sha384(k.encode()).hexdigest() for k in ("mrtd", "rtmr0", "rtmr1", "rtmr2")}
     document = {
         "shape": "c2.h200-141gb.x1",
-        "registers": {k: hashlib.sha384(k.encode()).hexdigest() for k in ("mrtd", "rtmr0", "rtmr1", "rtmr2", "rtmr3")},
-        "inputs": {"image_digest": "sha256:" + "ab" * 32},
+        "registers": registers | {"rtmr3": load("expected_rtmr3").expected_rtmr3(IMAGE_ROOT, IMAGE_DIGEST)},
+        "inputs": {"image_digest": IMAGE_DIGEST, "image_root": IMAGE_ROOT, "weights_roots": []},
         "tool": {"dstack_mr": {"revision": "x", "agreed": ["mrtd", "rtmr1", "rtmr2"]}},
         "build": {"unpinned": False},
     }
@@ -389,16 +400,17 @@ def measurement_document(**overrides) -> dict:
     return document
 
 
-def test_a_manifest_entry_is_built_signed_offline_and_accepted_by_the_production_policy(publish, tmp_path):
+def test_a_manifest_entry_is_built_signed_offline_and_accepted_by_the_production_policy(publish, tmp_path, capsys):
     env = devkit.init(tmp_path / "dev")
     measurements = tmp_path / "m.json"
     measurements.write_text(json.dumps(measurement_document()))
     manifest = tmp_path / "manifest.json"
     args = ["entry", "--measurements", str(measurements), "--shapes", str(CVM / "shapes.json"), "--issued-at", EPOCH, "--out", str(manifest)]
     assert publish.main(args + ["--model-digest", "ltx-2.5-fast@C2.h200-141gb.x1=" + "c" * 64]) == 0
+    assert f"c2.h200-141gb.x1: image {IMAGE_DIGEST} on image disk {IMAGE_ROOT}" in capsys.readouterr().out
     parsed = GoldenManifest.model_validate_json(manifest.read_text())
     entry = parsed.allowed[0]
-    assert (entry.platform, entry.image_digest, entry.rtmr3) == ("tdx", "sha256:" + "ab" * 32, measurement_document()["registers"]["rtmr3"])
+    assert (entry.platform, entry.image_digest, entry.rtmr3) == ("tdx", IMAGE_DIGEST, measurement_document()["registers"]["rtmr3"])
     assert entry.profiles == ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k"] and not parsed.trusts_mock()
     assert parsed.model_digest_for("ltx-2.5-fast", "C2.h200-141gb.x1") == "c" * 64
 
@@ -418,18 +430,27 @@ def test_a_manifest_entry_is_built_signed_offline_and_accepted_by_the_production
 
 
 @pytest.mark.parametrize(
-    ("overrides", "dev_ok"),
+    ("change", "dev_ok"),
     [
-        ({"registers": {"mrtd": "00" * 48, "rtmr0": None, "rtmr1": "00" * 48, "rtmr2": "00" * 48, "rtmr3": "00" * 48}}, False),
-        ({"build": {"unpinned": True}}, True),
-        ({"tool": {}}, True),
-        ({"build": None}, True),
-        ({"inputs": {"image_digest": "latest"}}, False),
+        (lambda d: d["registers"].update(rtmr0=None), False),
+        (lambda d: d.update(build={"unpinned": True}), True),
+        (lambda d: d.update(tool={}), True),
+        (lambda d: d.update(build=None), True),
+        (lambda d: d["inputs"].update(image_digest="latest"), False),
+        # Measured without the worker image disk (the image inside the root filesystem): no TD extends that RTMR3.
+        (lambda d: d["inputs"].pop("image_root"), False),
+        # RTMR3 is not the replay of the inputs the document names.
+        (lambda d: d["inputs"].update(image_root="0f" * 32), False),
+        (lambda d: d["inputs"].update(weights_roots=["cd" * 32]), False),
+        (lambda d: d["inputs"].update(weights_roots=["not a root"]), False),
     ],
+    ids=["no-rtmr0", "unpinned", "unchecked", "no-build", "bad-digest", "no-image-disk", "other-image-disk", "other-weights", "bad-weights"],
 )
-def test_incomplete_unpinned_or_unchecked_measurements_are_refused(publish, tmp_path, overrides, dev_ok):
+def test_incomplete_unpinned_or_unchecked_measurements_are_refused(publish, tmp_path, change, dev_ok):
     measurements = tmp_path / "m.json"
-    measurements.write_text(json.dumps(measurement_document(**overrides)))
+    document = measurement_document()
+    change(document)
+    measurements.write_text(json.dumps(document))
     args = ["entry", "--measurements", str(measurements), "--profiles", "ltx-2.5-fast", "--out", str(tmp_path / "out.json")]
     assert publish.main(args) == 1
     assert publish.main(args + ["--dev"]) == (0 if dev_ok else 1)
@@ -461,11 +482,13 @@ BASH = shutil.which("bash") or "bash"
 
 
 def launch_release(tmp_path: Path) -> tuple[Path, Path, str]:
-    """A release directory and an appended-layout weights prefix holding just what launch-td.sh checks."""
+    """A release directory (with its worker image disk) and an appended-layout weights prefix holding just what launch-td.sh checks."""
     release = tmp_path / "release"
     release.mkdir()
     for name in ("ovmf.fd", "bzImage", "initramfs.cpio.gz", "rootfs.img.verity"):
         (release / name).write_bytes(b"x")
+    for suffix, content in (("img.verity", "x"), ("roothash", IMAGE_ROOT + "\n"), ("size", "4096\n"), ("digest", IMAGE_DIGEST + "\n")):
+        (release / f"worker.{suffix}").write_text(content)
     cmdline = "console=ttyS0 panic=1 kuno.rootfs_hash=" + "ab" * 32 + " kuno.rootfs_size=4096"
     (release / "metadata.json").write_text(json.dumps({"cmdline": cmdline}))
     prefix = tmp_path / "weights" / "ltx-2.5"
@@ -485,17 +508,24 @@ def test_the_launch_command_has_exactly_the_devices_the_rtmr0_model_assumes(tmp_
     out = subprocess.run(base + ["--gpu", "0000:17:00.0", "--weights", f"ltx-2.5={prefix}"], capture_output=True, text=True, check=True).stdout
     args = shlex.split(out)
     devices = [args[i + 1] for i, arg in enumerate(args) if arg == "-device"]
-    # dstack-vmm's order: root disk, data disk, verity volumes, NIC, vsock, then each GPU behind a root port.
+    drives = [args[i + 1] for i, arg in enumerate(args) if arg == "-drive"]
+    # dstack-vmm's order: root disk, data disk, verity volumes (the worker image disk, then the weights), NIC, vsock,
+    # then each GPU behind a root port. The shape's num_verity_volumes is 2.
     kinds = [d.split(",")[0] for d in devices]
-    assert kinds == ["virtio-blk-pci", "virtio-blk-pci", "virtio-blk-pci", "virtio-net-pci", "vhost-vsock-pci", "pcie-root-port", "vfio-pci"]
-    assert "serial=kuno-w-ltx-2.5" in devices[2] and "host=0000:17:00.0" in devices[6]
+    assert kinds == ["virtio-blk-pci"] * 4 + ["virtio-net-pci", "vhost-vsock-pci", "pcie-root-port", "vfio-pci"]
+    assert devices[2] == "virtio-blk-pci,drive=vol0,serial=kuno-image" and devices[3] == "virtio-blk-pci,drive=vol1,serial=kuno-w-ltx-2.5"
+    assert drives[2] == f"file={release}/worker.img.verity,if=none,id=vol0,format=raw,readonly=on" and "host=0000:17:00.0" in devices[7]
     assert (args[args.index("-smp") + 1], args[args.index("-m") + 1]) == ("24", f"{224 * 1024}M")
     assert "q35-pcihost.pci-hole64-size=0x80000000000" in args  # the shape's 8 TiB hole, as dstack-mr is told
     assert "confidential-guest-support=tdx" in args[args.index("-machine") + 1]
     assert args[-2:] == ["-append", cmdline]
-    assert (release / "launch-c2.h200-141gb.x1" / "weights.txt").read_text() == f"ltx-2.5 {'cd' * 32} 8192\n"
+    state = release / "launch-c2.h200-141gb.x1"
+    assert (state / "weights.txt").read_text() == f"ltx-2.5 {'cd' * 32} 8192\n"
+    assert (state / "image.txt").read_text() == f"{IMAGE_ROOT} 4096 {IMAGE_DIGEST}\n" and f"name=opt/kuno/image,file={state}/image.txt" in args
     refused = subprocess.run(base + ["--weights", f"ltx-2.5={prefix}"], capture_output=True, text=True)
     assert refused.returncode != 0 and "needs 1 GPU(s)" in refused.stderr
+    refused = subprocess.run(base + ["--gpu", "0000:17:00.0"], capture_output=True, text=True)
+    assert refused.returncode != 0 and "attaches 2 verity volume(s), the worker image disk and 1 weights disk(s); got 0" in refused.stderr
 
 
 # ------------------------------------------------------------------ several TDs on one server

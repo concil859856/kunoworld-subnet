@@ -33,14 +33,17 @@ def test_sign_manifest_command_produces_an_owner_verifiable_manifest(tmp_path):
 
 
 @pytest.mark.skipif(not SCRIPT.exists(), reason="image/ is not part of this checkout")
-def test_rtmr3_replays_the_image_and_weights_events():
+def test_rtmr3_replays_the_image_disk_image_and_weights_events():
     module = rtmr3_module()
-    digest, root = "sha256:" + "ab" * 32, "CD" * 32
-    events = module.events(digest, root)
-    expected = hashlib.sha384(bytes(48) + hashlib.sha384(b"kuno/v1/rtmr3/image\n" + digest.encode()).digest()).digest()
-    expected = hashlib.sha384(expected + hashlib.sha384(b"kuno/v1/rtmr3/weights\n" + root.lower().encode()).digest()).digest()
-    assert module.replay(events) == expected.hex()
-    assert module.replay(module.events("sha256:" + "ac" * 32, root)) != expected.hex()
+    image_root, digest, root = "EF" * 32, "sha256:" + "ab" * 32, "CD" * 32
+    events = module.rtmr3_events(image_root, digest, root)
+    expected = bytes(48)
+    for label, value in ((b"image-disk", image_root.lower()), (b"image", digest), (b"weights", root.lower())):
+        expected = hashlib.sha384(expected + hashlib.sha384(b"kuno/v1/rtmr3/" + label + b"\n" + value.encode()).digest()).digest()
+    assert module.replay(events) == module.expected_rtmr3(image_root, digest, root) == expected.hex()
+    # The image disk is the first event: another disk or another image changes RTMR3.
+    assert module.replay(module.rtmr3_events("AB" * 32, digest, root)) != expected.hex()
+    assert module.replay(module.rtmr3_events(image_root, "sha256:" + "ac" * 32, root)) != expected.hex()
     with pytest.raises(ValueError):
         module.events("latest", root)
     with pytest.raises(ValueError):

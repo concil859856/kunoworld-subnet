@@ -157,6 +157,16 @@ class LtxResidentBackend(Backend):
             self._plans[profile.id] = plan_for_class(profile, self.hardware_class, host_ram_gib=ram, mode=self.offload)
         return self._plans[profile.id]
 
+    def serving_envelope(self, profile: ModelProfile):
+        """What the gateway may route here: the profile's limits, or on a class with a memory plan, the longest
+        duration the plan fits at each size and frame rate (the same rule `admit` refuses by)."""
+        plan = self.memory_plan(profile)
+        if plan is None:
+            return super().serving_envelope(profile)
+        from .quantized import envelope_for_plan
+
+        return envelope_for_plan(plan, profile)
+
     def admit(self, task: GenerationTask, call: dict[str, Any]) -> None:
         """Refuses, before any GPU work, a request larger than this class's memory plan allows."""
         plan = self.memory_plan(task.profile)

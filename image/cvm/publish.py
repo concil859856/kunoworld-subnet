@@ -16,7 +16,11 @@
         --measurements c2.h200-141gb.x1.json
 
 An entry is an `AllowedMeasurement` (platform "tdx", the worker image digest RTMR3 binds, the
-profiles the shape serves, MRTD and RTMR0–3). A shape that names its `gpu_mode` (spt, ppcie or mpt)
+profiles the shape serves, MRTD and RTMR0–3). The measurements must name the worker image disk's root
+hash (`inputs.image_root`) and their RTMR3 must be the replay of that root, the image digest and the
+weights roots (expected_rtmr3.py): kuno-app extends exactly those events, so any other RTMR3 is one no
+TD produces. The manifest schema has no field for the image disk, which RTMR3 already pins; `entry`
+prints it next to each entry. A shape that names its `gpu_mode` (spt, ppcie or mpt)
 also gets the GPU fields every enclave's evidence must then show: that mode, `gpus_per_enclave` (the
 shape's profiles' common `gpus_per_worker`, which kuno-app's KUNO_GPU_GROUPS sizes worker groups to)
 and `nvswitches_per_enclave` (the shape's `num_nvswitches`: every worker in a Protected PCIe VM attests
@@ -29,6 +33,7 @@ stays with `kuno-devkit sign-manifest` on an offline machine.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
@@ -56,17 +61,39 @@ class PublishError(ValueError):
     pass
 
 
+def _rtmr3():
+    """expected_rtmr3.py, loaded by path (image/cvm is not a package)."""
+    spec = importlib.util.spec_from_file_location("kuno_cvm_publish_expected_rtmr3", Path(__file__).with_name("expected_rtmr3.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_measurements(path: Path, *, dev: bool = False) -> dict:
     document = json.loads(Path(path).read_text())
     registers = document.get("registers") or {}
     missing = [k for k in REGISTERS if not isinstance(registers.get(k), str) or not HEX96.match(registers[k])]
     if missing:
         raise PublishError(
-            f"{path}: {', '.join(missing)} not computed (RTMR0 needs dstack-mr or replayed ACPI digests, RTMR3 the image digest)"
+            f"{path}: {', '.join(missing)} not computed (RTMR0 needs dstack-mr or replayed ACPI digests, "
+            "RTMR3 the image disk's root hash and the image digest)"
         )
-    image_digest = (document.get("inputs") or {}).get("image_digest")
+    inputs = document.get("inputs") or {}
+    image_digest = inputs.get("image_digest")
     if not isinstance(image_digest, str) or not IMAGE_DIGEST.match(image_digest):
         raise PublishError(f"{path}: inputs.image_digest must be sha256:<64 hex>")
+    image_root = inputs.get("image_root")
+    if not isinstance(image_root, str) or not HEX64.match(image_root):
+        raise PublishError(
+            f"{path}: inputs.image_root must be the worker image disk's dm-verity root hash (64 lowercase hex), "
+            "RTMR3's first event: measure it with measure.py --image-root"
+        )
+    try:
+        replayed = _rtmr3().expected_rtmr3(image_root, image_digest, *(inputs.get("weights_roots") or []))
+    except (TypeError, ValueError) as exc:
+        raise PublishError(f"{path}: {exc}") from None
+    if replayed != registers["rtmr3"]:
+        raise PublishError(f"{path}: rtmr3 is not the replay of its image disk, image and weights events (expected_rtmr3.py)")
     if not dev:
         build = document.get("build")
         if not isinstance(build, dict):
@@ -247,6 +274,10 @@ def main(argv: list[str] | None = None) -> int:
             manifest = build_manifest(base, entries, parse_model_digests(args.model_digest), issued_at=args.issued_at, dev=args.dev)
             args.out.write_text(manifest.model_dump_json(indent=2) + "\n")
             print(f"Wrote {args.out}: {len(manifest.allowed)} allowed measurement(s); sign it offline with kuno-devkit sign-manifest")
+            for document in documents:
+                inputs = document["inputs"]
+                print(f"  {document.get('shape')}: image {inputs['image_digest']} on image disk {inputs['image_root']}, "
+                      f"{len(inputs.get('weights_roots') or [])} weights image(s), rtmr3 {document['registers']['rtmr3']}")
         elif args.command == "verify":
             documents = [load_measurements(p, dev=True) for p in args.measurements]
             manifest = verify_published(args.manifest.read_text(), b64d(args.owner_public_key), documents)

@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# Packs a root filesystem tree into a squashfs image followed by its dm-verity hash tree.
+# Packs a filesystem tree into a squashfs image followed by its dm-verity hash tree.
 #
-#   image/cvm/pack-rootfs.sh <tree> <out-dir>
+#   image/cvm/pack-rootfs.sh <tree> <out-dir> [name]
 #
-# Writes <out-dir>/rootfs.img.verity (squashfs data, then the hash tree), rootfs.roothash (the
-# sha256 root hash that goes on the measured kernel command line) and rootfs.size (bytes of data:
-# the --hash-offset the initrd passes to veritysetup). The same tree and SOURCE_DATE_EPOCH give the
+# Writes <out-dir>/<name>.img.verity (squashfs data, then the hash tree), <name>.roothash (the sha256 root
+# hash) and <name>.size (bytes of data: the --hash-offset veritysetup needs). <name> defaults to rootfs, the
+# root filesystem, whose root hash goes on the measured kernel command line for the initrd. pack-image.sh packs
+# the worker image disk with the same recipe under the name worker. The same tree and SOURCE_DATE_EPOCH give the
 # same bytes on any machine with the same squashfs-tools and cryptsetup (both pinned by the mkosi
 # tools tree in inputs.lock.json). Recipe after dstack's os/mkosi/scripts/make-release-artifacts.sh
 # (Apache-2.0): a name-sorted tar stream with clamped metadata makes mksquashfs independent of the
 # worker count; a fixed salt and UUID make the hash tree reproducible.
 set -euo pipefail
 
-tree="${1:?usage: pack-rootfs.sh <tree> <out-dir>}"
-out="${2:?usage: pack-rootfs.sh <tree> <out-dir>}"
+tree="${1:?usage: pack-rootfs.sh <tree> <out-dir> [name]}"
+out="${2:?usage: pack-rootfs.sh <tree> <out-dir> [name]}"
+name="${3:-rootfs}"
 : "${SOURCE_DATE_EPOCH:?set SOURCE_DATE_EPOCH (inputs.lock.json source_date_epoch)}"
 export TZ=UTC LC_ALL=C
 
+[[ "$name" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || { echo "name $name must be 1-32 of [a-z0-9-], starting with a letter" >&2; exit 1; }
 jobs="${KUNO_PACK_JOBS:-$(nproc)}"
 comp="${KUNO_SQUASHFS_COMP:-zstd}"
 mode="${KUNO_SQUASHFS_INPUT:-}"
@@ -30,8 +33,8 @@ if [ -z "$mode" ]; then
 fi
 
 mkdir -p "$out"
-data="$out/rootfs.img.verity"
-rm -f "$data" "$out/rootfs.roothash" "$out/rootfs.size" "$out/rootfs.verity.txt"
+data="$out/$name.img.verity"
+rm -f "$data" "$out/$name.roothash" "$out/$name.size" "$out/$name.verity.txt"
 
 case "$mode" in
   tar)
@@ -60,12 +63,12 @@ fi
 salt=$(printf '%064d' 0)
 veritysetup format "$data" "$data" --hash-offset="$size" --data-blocks=$((size / 4096)) \
   --hash sha256 --data-block-size 4096 --hash-block-size 4096 \
-  --salt "$salt" --uuid 00000000-0000-0000-0000-000000000000 > "$out/rootfs.verity.txt"
-root=$(awk '/^Root hash:/ {print $3}' "$out/rootfs.verity.txt")
+  --salt "$salt" --uuid 00000000-0000-0000-0000-000000000000 > "$out/$name.verity.txt"
+root=$(awk '/^Root hash:/ {print $3}' "$out/$name.verity.txt")
 [ ${#root} -eq 64 ] || { echo "veritysetup printed no root hash" >&2; exit 1; }
 veritysetup verify "$data" "$data" "$root" --hash-offset="$size" >&2
 
-printf '%s\n' "$root" > "$out/rootfs.roothash"
-printf '%s\n' "$size" > "$out/rootfs.size"
-echo "rootfs: $mode input, $comp, $size data bytes" >&2
+printf '%s\n' "$root" > "$out/$name.roothash"
+printf '%s\n' "$size" > "$out/$name.size"
+echo "$name: $mode input, $comp, $size data bytes" >&2
 printf '%s\n' "$root"

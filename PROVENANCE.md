@@ -144,13 +144,14 @@ C2PA judges certificate validity at the time of a trusted RFC 3161 timestamp whe
 We verified this with c2pa-python 0.37.10: a manifest without a timestamp reads `Invalid` with `signingCredential.expired` once its leaf expires. The spec calls this state `claimSignature.outsideValidity`. With 24-hour certificates, every untimestamped video therefore stops validating a day after it was made.
 
 To avoid that:
-- **Gateway:** set `KUNO_C2PA_TSA_URL`. It is returned to workers with each certificate.
-- **Worker:** `KUNO_PROVENANCE_TSA_URL` overrides the gateway's suggestion.
+- **Gateway:** set `KUNO_C2PA_TSA_URLS`, in order of preference (`KUNO_C2PA_TSA_URL` still works for one). The list is returned to workers with each certificate as `tsa_urls`, with `tsa_url` its first for older workers.
+- **Worker:** `KUNO_PROVENANCE_TSA_URL` (one URL, or several separated by commas) replaces the gateway's list.
+- **Failover.** A worker tries the TSAs in order, each within a short timeout, and tries one that just failed last for two minutes. When every TSA fails, the job fails (`kuno_worker/provenance.py`).
 - **Which TSA.** Use one on the C2PA TSA Trust List [TRUST-PEM]. Validators ignore a timestamp whose chain doesn't reach that list (`timeStamp.untrusted`) [SPEC §15.8], which is as good as no timestamp once the certificate expires.
   - Probed on 2026-09-14 against the list: `http://ts-c2pa.ssl.com/ecc` and `http://ts-c2pa.ssl.com/rsa` chain to listed SSL.com C2PA roots.
   - The familiar code-signing TSAs don't: `timestamp.digicert.com`, `timestamp.sectigo.com`, GlobalSign, Entrust and FreeTSA.
   - Details, recommendations and `kuno-gateway check-tsa`: `platform/gateway/C2PA_CA.md`, "Timestamps".
-- **Enforced.** A production gateway running the CA refuses to start without `KUNO_C2PA_TSA_URL`, and real-TEE workers refuse a certificate that comes without one.
+- **Enforced.** A production gateway running the CA refuses to start without a TSA, and real-TEE workers refuse a certificate that comes without one.
 - **Privacy.** The TSA sees only a hash of the COSE signature and the time of the request, never content.
 - **Development.** No TSA is configured on dev networks.
 

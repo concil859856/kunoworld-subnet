@@ -2,13 +2,15 @@
 # Prints (or runs) the QEMU command that boots one published shape of a KunoWorld CVM release as a TD.
 #
 #   image/cvm/launch-td.sh <release dir> <shape id> --gpu <PCI address>... [--nvswitch <PCI address>...]
-#       --weights <name>=<image prefix>... [--instance <n>] [--numa-node <n>|auto] [--env worker.env]
-#       [--hotkey-seed hotkey.seed] [--qgs-port 4050] [--qemu qemu-system-x86_64] [--run]
+#       --weights <name>=<image prefix>... [--image <prefix>] [--instance <n>] [--numa-node <n>|auto]
+#       [--env worker.env] [--hotkey-seed hotkey.seed] [--qgs-port 4050] [--qemu qemu-system-x86_64] [--run]
 #
-#   <release dir>    build.sh output: ovmf.fd, bzImage, initramfs.cpio.gz, rootfs.img.verity, metadata.json
+#   <release dir>    build.sh output: ovmf.fd, bzImage, initramfs.cpio.gz, rootfs.img.verity, metadata.json, worker.*
 #   --nvswitch       an NVSwitch of a Protected PCIe shape (exactly its num_nvswitches), bound to vfio-pci
 #   --weights        weights-verity.sh output prefix, built with KUNO_WEIGHTS_LAYOUT=appended
 #                    (<prefix>.img, <prefix>.roothash, <prefix>.size); <name> becomes /models/<name>
+#   --image          the worker image disk, pack-image.sh output (<prefix>.img.verity, .roothash, .size, .digest);
+#                    default <release dir>/worker. A Turbo candidate boots the owner's release with its own.
 #   --env            KEY=VALUE lines for the worker (kuno-app keeps only its allowlist)
 #   --instance       the n-th TD on this host (0-99): guest CID 3+n, state in launch-<shape>.<n>
 #                    (without it: CID 3, launch-<shape>); plan-host.py gives one per GPU
@@ -17,12 +19,15 @@
 #
 # RTMR0 measures the ACPI tables QEMU builds from the devices it exposes. The pinned dstack-mr models
 # dstack-vmm's command line (Dstack-TEE/dstack dstack/vmm/src/app/qemu.rs), so this emits the same
-# devices in the same order: the verity root disk, a data disk, one virtio disk per weights image
-# (num_verity_volumes), one NIC, a vsock device, then each GPU behind its own pcie-root-port on iommufd, then
-# each NVSwitch the same way with the port numbers continuing (dstack-vmm configure_gpus: gpus, then bridges;
-# dstack-mr counts num_gpus + num_nvswitches root ports on pcie.0 without hugepages).
-# Anything else (a second NIC, a TPM, a shared folder, hugepages, memory hotplug) changes RTMR0 and the
-# TD will not match the manifest. NOT RUN ON A TDX HOST: confirm the first boot with publish.py compare-quote.
+# devices in the same order: the verity root disk, a data disk, then the read-only verity volumes after the data
+# disk and before networking (configure_volumes): the worker image disk first, then one virtio disk per weights
+# image, together num_verity_volumes; one NIC, a vsock device, then each GPU behind its own pcie-root-port on
+# iommufd, then each NVSwitch the same way with the port numbers continuing (dstack-vmm configure_gpus: gpus, then
+# bridges; dstack-mr counts num_gpus + num_nvswitches root ports on pcie.0 without hugepages).
+# The ACPI model counts volumes and does not see which file, serial or root hash each carries, so every worker
+# image boots under the same RTMR0. Anything else (a second NIC, a TPM, a shared folder, hugepages, memory
+# hotplug) changes RTMR0 and the TD will not match the manifest. NOT RUN ON A TDX HOST: confirm the first boot
+# with publish.py compare-quote.
 #
 # Several TDs on one host (CVM.md, "Several TDs on one server") differ only in what RTMR0 does not cover:
 # - The vsock guest CID. QEMU 9.1 puts it in the device's virtio config space and the VHOST_VSOCK_SET_GUEST_CID
@@ -34,7 +39,7 @@
 #   (check numastat -p <qemu pid>).
 set -euo pipefail
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 [ $# -ge 2 ] || usage
 release="$(cd "$1" && pwd)"
 shape="$2"
@@ -47,12 +52,14 @@ env_file=""
 seed_file=""
 instance=""
 numa_node=""
+image_prefix=""
 declare -a gpus=() nvswitches=() weights=() wrapper=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --gpu) gpus+=("${2:?--gpu needs a PCI address}"); shift 2 ;;
     --nvswitch) nvswitches+=("${2:?--nvswitch needs a PCI address}"); shift 2 ;;
     --weights) weights+=("${2:?--weights needs name=prefix}"); shift 2 ;;
+    --image) image_prefix="${2:?--image needs a pack-image.sh output prefix}"; shift 2 ;;
     --instance) instance="${2:?--instance needs a number}"; shift 2 ;;
     --numa-node) numa_node="${2:?--numa-node needs a node number or auto}"; shift 2 ;;
     --env) env_file="${2:?}"; shift 2 ;;
@@ -63,6 +70,7 @@ while [ $# -gt 0 ]; do
     *) usage ;;
   esac
 done
+image_prefix="${image_prefix:-$release/worker}"
 
 cid=3  # 0-2 are reserved; the host, where the QGS listens, is 2
 state="$release/launch-$shape"
@@ -101,17 +109,23 @@ cpus="${fields[0]}"; memory_mib="${fields[1]}"; num_gpus="${fields[2]}"; num_nvs
 num_nics="${fields[4]}"; num_volumes="${fields[5]}"; hugepages="${fields[6]}"; hotplug_off="${fields[7]}"; hole64="${fields[8]}"
 
 [ "${#gpus[@]}" -eq "$num_gpus" ] || { echo "$shape needs $num_gpus GPU(s); got ${#gpus[@]}" >&2; exit 1; }
-[ "${#weights[@]}" -eq "$num_volumes" ] || { echo "$shape attaches $num_volumes weights disk(s); got ${#weights[@]}" >&2; exit 1; }
+[ "$num_volumes" -ge 1 ] || { echo "$shape declares no verity volume, but the worker image disk is one" >&2; exit 1; }
+[ "$((${#weights[@]} + 1))" -eq "$num_volumes" ] \
+  || { echo "$shape attaches $num_volumes verity volume(s), the worker image disk and $((num_volumes - 1)) weights disk(s); got ${#weights[@]} weights disk(s)" >&2; exit 1; }
 [ "$num_nics" -eq 1 ] || { echo "launch-td.sh emits exactly one NIC; $shape declares $num_nics" >&2; exit 1; }
 [ "${#nvswitches[@]}" -eq "$num_nvswitches" ] || { echo "$shape needs $num_nvswitches NVSwitch(es); got ${#nvswitches[@]}" >&2; exit 1; }
 [ "$hugepages" -eq 0 ] || { echo "hugepages change the QEMU NUMA layout; not supported by this launcher" >&2; exit 1; }
 for file in ovmf.fd bzImage initramfs.cpio.gz rootfs.img.verity metadata.json; do
   [ -f "$release/$file" ] || { echo "$release has no $file" >&2; exit 1; }
 done
+for suffix in img.verity roothash size digest; do
+  [ -f "$image_prefix.$suffix" ] || { echo "$image_prefix.$suffix is missing: pack the worker image disk with pack-image.sh" >&2; exit 1; }
+done
 cmdline="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["cmdline"])' "$release/metadata.json")"
 
 mkdir -p "$state"
 [ -f "$state/data.img" ] || truncate -s 64M "$state/data.img"  # present because dstack-vmm always attaches one; kuno-app never mounts it
+printf '%s %s %s\n' "$(cat "$image_prefix.roothash")" "$(cat "$image_prefix.size")" "$(cat "$image_prefix.digest")" > "$state/image.txt"
 : > "$state/weights.txt"
 
 args=(-accel kvm -cpu host -nographic -nodefaults
@@ -121,7 +135,8 @@ args=(-accel kvm -cpu host -nographic -nodefaults
 [ "$hole64" -gt 0 ] && args+=(-global "q35-pcihost.pci-hole64-size=$(printf '0x%x' "$hole64")")
 args+=(-drive "file=$release/rootfs.img.verity,if=none,id=hd0,format=raw,readonly=on" -device "virtio-blk-pci,drive=hd0")
 args+=(-drive "file=$state/data.img,if=none,id=hd1,format=raw" -device "virtio-blk-pci,drive=hd1")
-index=0
+args+=(-drive "file=$image_prefix.img.verity,if=none,id=vol0,format=raw,readonly=on" -device "virtio-blk-pci,drive=vol0,serial=kuno-image")
+index=1
 for spec in "${weights[@]}"; do
   name="${spec%%=*}"; prefix="${spec#*=}"
   [[ "$name" =~ ^[a-z0-9][a-z0-9.-]{0,12}$ ]] || { echo "weights name $name must be 1-13 of [a-z0-9.-]" >&2; exit 1; }
@@ -145,6 +160,7 @@ if [ "$num_gpus" -gt 0 ]; then
   done
 fi
 args+=(-smp "$cpus" -m "${memory_mib}M")
+args+=(-fw_cfg "name=opt/kuno/image,file=$state/image.txt")
 args+=(-fw_cfg "name=opt/kuno/weights,file=$state/weights.txt")
 [ -n "$env_file" ] && args+=(-fw_cfg "name=opt/kuno/env,file=$env_file")
 [ -n "$seed_file" ] && args+=(-fw_cfg "name=opt/kuno/hotkey.seed,file=$seed_file")

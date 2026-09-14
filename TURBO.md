@@ -16,7 +16,7 @@ for faster distilled pipelines whose winner is adopted network-wide).
 
 1. **The owner signs a `TurboSpec`** (`protocol/src/kuno_protocol/turbo.py`). It fixes:
    - the target profile (e.g. `ltx-2.5-fast`) and the reference profile the quality floor is measured against;
-   - the owner's measured CVM base layers (MRTD, RTMR0-2);
+   - the owner's measured CVM base layers (MRTD, RTMR0-2): one OS release on one VM shape ("Base measurements" below);
    - the hardware class and GPU limit;
    - the quality floor and the speed metric;
    - the sampling rule, the reward curve, the adoption rule;
@@ -47,16 +47,56 @@ for faster distilled pipelines whose winner is adopted network-wide).
    with its own golden reference, pinned in the owner-signed manifest. The target profile stays
    untouched.
 
+## Base measurements
+
+A spec's `base_measurements` are the owner's measured CVM base: MRTD (firmware), RTMR0 (VM shape), RTMR1
+(kernel) and RTMR2 (command line and initrd, which pin the root filesystem with the guest agent and its egress
+policy). The rule, stated in `BaseMeasurements` and `TurboSpec.candidate_problems`:
+
+> A candidate enclave must attest the platform its submission names and match one base's MRTD and RTMR0-2
+> exactly. It may differ from that base only in RTMR3, which must equal the submission's `rtmr3`.
+
+`candidate_manifest` encodes the same rule for attestation. Each entry is one base plus the submission's
+RTMR3, and verifying evidence compares all five registers exactly.
+
+A candidate can meet the rule because a KunoWorld CVM keeps the worker image out of everything MRTD and RTMR0-2
+cover (`image/CVM.md`, "The measured chain"). The image sits on its own dm-verity disk, and `kuno-app` extends
+RTMR3 with, in this order:
+
+1. the image disk's dm-verity root hash;
+2. the worker image digest;
+3. each weights image's dm-verity root hash, ascending.
+
+The image disk is always the first verity volume, and RTMR0's ACPI tables count volumes without seeing what they
+hold. So on one OS release and VM shape, every worker image boots under the same MRTD and RTMR0-2. A base stops
+matching when the owner changes the OS release (kernel, initrd, root filesystem, `kuno-app`), the OVMF build,
+the QEMU version or the shape. Candidates on the new base need a new spec. Nothing has booted on TDX yet, so
+this equality is shown on the measurement tooling, not on quotes (`image/CVM.md`, "What is unproven").
+
+To build a candidate on the owner's release (`build.sh` output, with its `measurements/<shape>.json`):
+
+```bash
+KUNO_IMAGE_OCI_OUT=worker.oci.tar image/build.sh --check        # or your own reproducible OCI archive
+image/cvm/pack-image.sh worker.oci.tar protocol/src/kuno_protocol/profiles.json candidate/worker
+python3 image/cvm/expected_rtmr3.py "$(cat candidate/worker.roothash)" "$(cat candidate/worker.digest)" <weights root>...
+image/cvm/launch-td.sh <release> <shape> --image candidate/worker --gpu … --weights … --env worker.env --run
+```
+
+The submission's `image_digest` is `candidate/worker.digest`, and its `rtmr3` is the value `expected_rtmr3.py`
+prints. `plan-host.py --image candidate/worker` does the same on a multi-GPU server.
+
 ## Competing
 
 See [MINING.md](MINING.md#turbo-track-mechanism-1-make-a-pipeline-faster) for the commands. In
-short: build the image on the published base, write `pipeline.json`, run `kuno-turbo submit`, host
-the document, run `kuno-turbo commit`, and register an enclave running exactly that image.
+short: build the image and pack its image disk for the published base ("Base measurements"), write
+`pipeline.json`, run `kuno-turbo submit`, host the document, run `kuno-turbo commit`, and register an
+enclave running exactly that image.
 
 Rules worth knowing before you spend GPU hours:
 
-- **Your enclave must attest exactly the committed image**, claim exactly the target profile and
-  use no more GPUs than the spec allows. Anything else is unattested and scores zero.
+- **Your enclave must attest exactly the committed image**, boot the owner's base unchanged (MRTD and
+  RTMR0-2 exactly one base's), claim exactly the target profile and use no more GPUs than the spec
+  allows. Anything else is unattested and scores zero.
 - **One entry per hotkey.** A commitment is per hotkey, and a new one replaces the old one and its
   block, so you lose tie priority.
 - **No copying.** An image digest or RTMR3 already committed by an earlier block is refused.
@@ -124,7 +164,7 @@ nothing.
 | Faster by cutting quality | Quality floor on every window, absolute and relative to the reference profile |
 | Bigger hardware | `hardware_class`, `max_gpus`, and `gpu_s_per_output_s` using the attested GPU count |
 | Copying or Sybil entries | Image and RTMR3 uniqueness by commit block; displacement margin; tie priority to the earlier block; commit-reveal weights on chain (per mechanism) |
-| Leaking hidden prompts | Candidates boot the owner's measured base (fixed MRTD and RTMR0-2), whose egress policy only reaches the gateway; the output is sealed to the validator's key |
+| Leaking hidden prompts | Candidates boot the owner's measured base (MRTD and RTMR0-2 exactly equal), whose egress policy only reaches the gateway; what a candidate brings (image disk, image, weights) is measured into RTMR3 alone; the output is sealed to the validator's key |
 | Validator weight copying | Rankings move every window as fresh prompts are revealed; commit-reveal is on |
 | Gateway favouritism | Specs and receipts are signed by keys the gateway does not hold. Validators challenge enclaves themselves and verify every receipt. A gateway that hides an enclave causes a gap (zero), never a win |
 

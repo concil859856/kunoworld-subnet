@@ -37,7 +37,7 @@ def publish():
 
 @pytest.fixture(scope="module")
 def table(tmp_path_factory) -> Path:
-    """What build.sh writes to /usr/share/kuno/gpus-per-worker."""
+    """What pack-image.sh writes to gpus-per-worker on the worker image disk."""
     path = tmp_path_factory.mktemp("rootfs") / "gpus-per-worker"
     path.write_text("".join(f"{p.id} {p.gpus_per_worker}\n" for p in load_profiles().values()))
     return path
@@ -78,6 +78,8 @@ def test_a_layout_that_does_not_fit_the_vm_or_its_profiles_stops_the_agent(table
 def test_the_agent_gives_each_worker_its_own_gpus_and_supervises_them():
     text = AGENT.read_text()
     assert "KUNO_GPU_GROUPS" in text.split("readonly ALLOWED_ENV=", 1)[1].split("\n", 1)[0]
+    # The table groups are sized by comes from the measured image disk, not the root filesystem.
+    assert 'readonly GPUS_PER_WORKER="$IMAGE_MOUNT/gpus-per-worker"' in text and "/usr/share/kuno" not in text
     assert '--device "nvidia.com/gpu=$gpu"' in text and "--device nvidia.com/gpu=all" in text  # groups, and the default
     assert 'wait -n "${pids[@]}"' in text and "stop_workers" in text
     # Protected PCIe: ready state cleared, NVIDIA's verifier run, and the result read back rather than trusted.
@@ -94,10 +96,15 @@ def test_the_agent_gives_each_worker_its_own_gpus_and_supervises_them():
 
 
 def measurements(shape: str) -> dict:
+    spec = importlib.util.spec_from_file_location("kuno_cvm_expected_rtmr3_gpu_groups", CVM / "expected_rtmr3.py")
+    rtmr3 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rtmr3)
+    image_root, image_digest = "9b" * 32, "sha256:" + "ab" * 32
     return {
         "shape": shape,
-        "registers": {k: hashlib.sha384(k.encode()).hexdigest() for k in ("mrtd", "rtmr0", "rtmr1", "rtmr2", "rtmr3")},
-        "inputs": {"image_digest": "sha256:" + "ab" * 32},
+        "registers": {k: hashlib.sha384(k.encode()).hexdigest() for k in ("mrtd", "rtmr0", "rtmr1", "rtmr2")}
+        | {"rtmr3": rtmr3.expected_rtmr3(image_root, image_digest)},
+        "inputs": {"image_digest": image_digest, "image_root": image_root, "weights_roots": []},
         "tool": {"dstack_mr": {"revision": "x", "agreed": ["mrtd", "rtmr1", "rtmr2"]}},
         "build": {"unpinned": False},
     }

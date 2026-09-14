@@ -11,13 +11,14 @@ an operator runs on a TDX host to prove the measured chain matches.
   - they reproduce dstack-mr's golden vectors;
   - they reproduce dstack 0.5.5's published baseline;
   - they reproduce the MRTD published for dstack's 0.6.0-rc4 firmware.
-- RTMR3, the same in Python and in the guest agent's shell.
-- Deterministic packing of the root filesystem with dm-verity, the initrd, and the weights images.
+- RTMR3 and its event order, the same in Python and in the guest agent's shell.
+- That two worker images give the same MRTD and RTMR0–2 and different RTMR3, on the port's formulas.
+- Deterministic packing of the root filesystem with dm-verity, the worker image disk, the initrd, and the weights images.
 - Golden manifest entries: built, signed with `kuno-devkit sign-manifest`, and parsed under the production policy.
 
 **Written, never run**
 - The mkosi build (kernel, NVIDIA driver).
-- The guest agent that extends RTMR3.
+- The guest agent that extends RTMR3 and opens the worker image disk.
 - RTMR0 from dstack-mr on our images.
 - The TD launch command, and running several TDs on one server (`plan-host.py`).
 - The CI job.
@@ -44,14 +45,32 @@ Three things come from dstack (Apache-2.0):
 | Register | Covers (direct boot, QEMU + dstack's OVMF) | Expected value from |
 |---|---|---|
 | MRTD | TDVF firmware pages. The TDX module hashes a 128-byte `MEM.PAGE.ADD` record per page, and for measured sections an `MR.EXTEND` record plus the data for every 256-byte chunk. QEMU 8.x adds pages in two passes, 9.0+ in one. | `measure.py`, which dstack-mr must match |
-| RTMR0 | TD HOB (memory size), CFV, Secure Boot variables, separator, then QEMU's ACPI loader, RSDP and tables, then BootOrder and Boot0000. The ACPI tables depend on vCPUs, memory, GPUs, NVSwitches, NICs, verity volumes, hotplug, PCI hole and QEMU version. | dstack-mr. `measure.py --acpi-hashes` gives the same value from ACPI digests replayed from a real TD's event log. |
+| RTMR0 | TD HOB (memory size), CFV, Secure Boot variables, separator, then QEMU's ACPI loader, RSDP and tables, then BootOrder and Boot0000. The ACPI tables depend on vCPUs, memory, GPUs, NVSwitches, NICs, the number of verity volumes (the worker image disk plus the weights disks), hotplug, PCI hole and QEMU version. | dstack-mr. `measure.py --acpi-hashes` gives the same value from ACPI digests replayed from a real TD's event log. |
 | RTMR1 | Authenticode SHA-384 of the kernel, then the EFI boot-services events. dstack's OVMF zeroes the loader-written setup-header fields before measuring, and `build.sh` ships them zeroed, so this is the hash of the file on every QEMU version. | `measure.py`, dstack-mr |
-| RTMR2 | The kernel command line (UTF-16LE, with OVMF's ` initrd=initrd` suffix), then the initrd. The command line carries the root filesystem's dm-verity root hash, so RTMR2 pins every byte of the OS, the worker image archive included. | `measure.py`, dstack-mr |
-| RTMR3 | Extended in the guest by `kuno-app` before any customer data: the worker image digest, then each weights image's dm-verity root hash in ascending order. | `expected_rtmr3.py`; `kuno-app --expected-rtmr3` gives the same value inside the guest |
+| RTMR2 | The kernel command line (UTF-16LE, with OVMF's ` initrd=initrd` suffix), then the initrd. The command line carries the root filesystem's dm-verity root hash, so RTMR2 pins every byte of the OS. The worker image is not in the root filesystem. | `measure.py`, dstack-mr |
+| RTMR3 | Extended in the guest by `kuno-app` before any customer data and before it opens any disk: the worker image disk's dm-verity root hash, then the worker image digest, then each weights image's dm-verity root hash in ascending order. | `expected_rtmr3.py`; `kuno-app --expected-rtmr3` gives the same value inside the guest |
+
+The RTMR3 events, in this order and no others (`expected_rtmr3.py`, `kuno-app --rtmr3-events`):
+
+```
+event 1     SHA-384("kuno/v1/rtmr3/image-disk\n" | <image disk root hash, 64 lowercase hex>)
+event 2     SHA-384("kuno/v1/rtmr3/image\n"      | <image digest, sha256:<64 lowercase hex>>)
+event 2+i   SHA-384("kuno/v1/rtmr3/weights\n"    | <weights root hash i, 64 lowercase hex>)   ascending, each once
+RTMR3       SHA-384(… SHA-384(SHA-384(0^48 | event 1) | event 2) … | event 2+n)
+```
 
 RTMR3 is written through Linux ≥ 6.16's sysfs ABI: a 48-byte write to
-`/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384` extends it. `kuno-app` refuses to start if
-RTMR3 is non-zero before its first event, or differs from the replay after its last.
+`/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384` extends it. `kuno-app` refuses to start if:
+- RTMR3 is non-zero before its first event, or differs from the replay after its last;
+- the image disk does not open with dm-verity under the measured root hash;
+- the archive on it does not name exactly the measured image digest, or its manifest or config does not hash
+  to its digest;
+- the image podman loaded does not have that config's digest as its id.
+
+**What a release changes.** A worker release changes the image disk and so RTMR3 only. MRTD, RTMR0, RTMR1 and
+RTMR2 depend on OVMF, the QEMU version, the shape and the OS release (kernel, initrd, root filesystem with
+`kuno-app`), so every worker image built for one OS release and shape shares them. This is what Turbo's base
+measurements rely on (`TURBO.md`, "Base measurements").
 
 ## 1. Worker container (built here)
 
@@ -62,11 +81,11 @@ image/build.sh --check     # two clean builds, same digest, prints KUNO_IMAGE_DI
 
 Base images are pinned by digest in `image/worker.Dockerfile`; Python packages come from
 `image/uv.lock` with hashes; the container runs as uid 10001 and fetches nothing at runtime.
-It holds the worker only. The model runtime (torch and diffusers for `KUNO_BACKEND=real`,
-SGLang for H3) and NVIDIA's `nvattest` must be added in a derived image, pinned the same way;
-the worker does not yet declare versions for them, so that layer does not exist.
-`KUNO_IMAGE_OCI_OUT=<path>` makes `build.sh` keep the OCI archive, which the CVM build puts into the
-measured root filesystem.
+It holds the worker and its Python model runtime for `KUNO_BACKEND=real` (`kuno-worker[gpu]`: CUDA 12.8
+torch, diffusers, transformers, torchao). SGLang for H3 and NVIDIA's `nvattest` must be added in a
+derived image, pinned the same way; that layer does not exist yet.
+`KUNO_IMAGE_OCI_OUT=<path>` makes `build.sh` keep the OCI archive, which the CVM build packs onto the
+worker image disk (§3).
 
 ### Safety classifier weights (pinned here, not yet in an image)
 
@@ -155,12 +174,13 @@ because dm-verity already guarantees the content. The layout without `KUNO_WEIGH
 | `build.sh` | The whole build (below). `--check` builds twice and compares every byte; `--pins` lists unpinned inputs. |
 | `mkosi/mkosi.conf`, `mkosi.build`, `mkosi.postinst.chroot`, `kernel/kuno.config`, `nvidia.files` | The root filesystem: systemd, podman, cryptsetup, busybox. The build script compiles the kernel and the NVIDIA open modules. Postinst masks every unit that could extend an RTMR or offer a login (no getty, no ssh). |
 | `pack-rootfs.sh` | Squashfs from a name-sorted tar with clamped metadata, then dm-verity appended (fixed salt and UUID). |
+| `pack-image.sh` | The worker image disk: the OCI archive made canonical (only the manifest, config and layer blobs, each checked against its digest; a fixed `index.json`; names in order, root-owned, fixed modes, mtime 0) and the catalog's `gpus-per-worker` table, packed by `pack-rootfs.sh` with times at 0. Writes `worker.img.verity`, `.roothash`, `.size` and `.digest`. |
 | `mkinitrd.sh`, `initrd.files`, `initrd/init` | The initrd: busybox and veritysetup with the libraries listed, nothing else. It opens the root filesystem with the root hash from the measured command line, then `switch_root`. |
-| `rootfs/usr/lib/kuno/kuno-app`, `kuno-app.service`, `nvidia-persistenced.service`, `rootfs/etc/fstab` | Guest agent: RTMR3, weights, the GPUs' ready state (after NVIDIA's PPCIe verifier in Protected PCIe mode), and one worker container per GPU group (`KUNO_GPU_GROUPS`, §6). In-memory `/var` and `/tmp`. |
+| `rootfs/usr/lib/kuno/kuno-app`, `kuno-app.service`, `nvidia-persistenced.service`, `rootfs/etc/fstab` | Guest agent: RTMR3, the worker image disk, weights, the GPUs' ready state (after NVIDIA's PPCIe verifier in Protected PCIe mode), and one worker container per GPU group (`KUNO_GPU_GROUPS`, §6). In-memory `/var` and `/tmp`. |
 | `measure.py` | Expected MRTD and RTMR0–3 per shape. |
 | `publish.py` | `entry`, `verify` and `compare-quote`. |
-| `launch-td.sh` | The QEMU command for a shape. `--instance` and `--numa-node` run several TDs on one server (§6). |
-| `plan-host.py` | One `launch-td.sh` command per GPU of a multi-GPU server for a single-GPU shape, or one command for a whole-server `c8.*` shape, after checking the host (§6). |
+| `launch-td.sh` | The QEMU command for a shape. `--image` boots another worker image disk (a Turbo candidate). `--instance` and `--numa-node` run several TDs on one server (§6). |
+| `plan-host.py` | One `launch-td.sh` command per GPU of a multi-GPU server for a single-GPU shape, or one command for a whole-server `c8.*` shape, after checking the host (§6). `--image` goes into every command. |
 
 Pinned inputs:
 
@@ -190,13 +210,20 @@ sudo image/cvm/build.sh --out out/cvm --weights weights.json --check    # writes
 `build.sh` steps:
 1. Hash-check the inputs.
 2. Build the worker image twice, via `image/build.sh --check`.
-3. Build the mkosi root filesystem tree and kernel, then add the worker OCI archive to the tree.
-4. `pack-rootfs.sh` and `mkinitrd.sh`.
-5. Normalize the kernel's setup header.
-6. Write the command line, `metadata.json` (dstack-mr compatible), `build.json`, a copy of `shapes.json` and `sha256sum.txt`.
-7. `measure.py` per shape, with dstack-mr for RTMR0 and a cross-check of MRTD, RTMR1 and RTMR2.
+3. `pack-image.sh`: the worker image disk, `worker.img.verity`, with its root hash, data size and image digest.
+   The build stops unless the disk holds the digest step 2 built.
+4. Build the mkosi root filesystem tree and kernel. Nothing of the worker release goes into the tree, and the
+   command line names only the root filesystem.
+5. `pack-rootfs.sh` and `mkinitrd.sh`.
+6. Normalize the kernel's setup header.
+7. Write the command line, `metadata.json` (dstack-mr compatible), `build.json` (with `worker_image_digest` and
+   `worker_image_disk`: file, root hash, size), a copy of `shapes.json` and `sha256sum.txt`, which covers the image
+   disk and its `.roothash`, `.size` and `.digest` files.
+8. `measure.py` per shape with `--image-root` and `--image-digest`, with dstack-mr for RTMR0 and a cross-check of
+   MRTD, RTMR1 and RTMR2.
 
-Nothing written names the build machine, its paths or the time. A null pin stops the build unless
+Nothing written names the build machine, its paths or the time. `--check` builds everything twice, the image
+disk included, with different job counts, and requires identical bytes. A null pin stops the build unless
 `KUNO_CVM_ALLOW_UNPINNED=1`, and then `build.json` says `unpinned`, which `publish.py` refuses.
 
 **CI.** `.github/workflows/cvm-reproducibility.yml` runs the build on two runners, with different
@@ -218,8 +245,11 @@ uv run python subnet/image/cvm/publish.py verify --manifest manifest.signed.json
 
 `entry` adds an `AllowedMeasurement`: `platform: "tdx"`, the worker image digest RTMR3 records, the
 shape's profiles, and the five registers. It also adds `model_digests` entries (`PROTOCOL.md`, "Golden
-manifest"). It refuses:
+manifest"). The manifest has no field for the image disk: RTMR3 pins its root hash, and `entry` prints it
+beside each entry. It refuses:
 - incomplete registers;
+- measurements without the image disk's root hash (`inputs.image_root`), or whose RTMR3 is not the replay of
+  their image disk, image digest and weights roots;
 - an unpinned build;
 - measurements not cross-checked with dstack-mr;
 - a base manifest that trusts the simulated TEE.
@@ -242,10 +272,12 @@ checks it lists the measurements.
 1. **Same bytes.** Rebuild the release with `build.sh --check` (or download it), then compare:
    `sha256sum -c sha256sum.txt` must pass, and your `sha256sum.txt` and `measurements/<shape>.json` must equal
    the published ones.
-2. **Weights.** Build the weights image with `KUNO_WEIGHTS_LAYOUT=appended`. Optionally
-   `veritysetup verify <img> <img> <root> --hash-offset=<size>` on the host. The root must equal the one in
-   the manifest's RTMR3 (`expected_rtmr3.py <image digest> <root>`).
-3. **Boot**, with exactly the shape's devices:
+2. **Disks.** Build the weights image with `KUNO_WEIGHTS_LAYOUT=appended`. Optionally
+   `veritysetup verify <img> <img> <root> --hash-offset=<size>` on the host, for the weights image and for
+   `worker.img.verity` (root `worker.roothash`, offset `worker.size`). The roots must replay to the manifest's
+   RTMR3: `expected_rtmr3.py $(cat out/cvm/a/worker.roothash) $(cat out/cvm/a/worker.digest) <weights root>`.
+3. **Boot**, with exactly the shape's devices. The release's `worker.*` is the image disk unless `--image` names
+   another:
    ```bash
    image/cvm/launch-td.sh out/cvm/a c2.h200-141gb.x1 --gpu 0000:17:00.0 \
        --weights ltx-2.5=out/weights/ltx-2.5 --env worker.env --hotkey-seed hotkey.seed --run
@@ -268,14 +300,17 @@ checks it lists the measurements.
      `/sys/firmware/acpi/tables/data/CCEL`, and run `dstack-mr diagnose --vm-config vm.json --image-dir out/cvm/a --actual-event-log events.json`,
      which names the first divergent event.
    - RTMR1: the setup-header normalization.
-   - RTMR2: the command line or the initrd.
-   - RTMR3: the worker image, the weights roots, or something else extending RTMR3.
+   - RTMR2: the command line or the initrd (the OS release; never the worker image).
+   - RTMR3: the image disk, the worker image digest, the weights roots, or something else extending RTMR3.
+     `/run/kuno/rtmr3-events.log` lists the events the agent extended.
 6. **Negative checks.** Each must fail:
    - Flip one byte of `rootfs.img.verity`: the initrd's veritysetup, or the first read, fails and the TD panics.
    - Change one command-line token: RTMR2 changes.
    - Flip one byte of a weights image: reads fail.
-   - Pass another root hash: RTMR3 changes and the manifest check fails.
-   - Rebuild with another worker image: RTMR2 and RTMR3 change.
+   - Flip one byte of `worker.img.verity`: `kuno-app` stops when a read of the archive fails.
+   - Pass another root hash, for a weights image or the image disk: RTMR3 changes and the manifest check fails.
+   - Edit the image digest in `launch-<shape>/image.txt`: RTMR3 changes, and `kuno-app` refuses the disk's image.
+   - Boot another worker image with `--image`: only RTMR3 changes (`compare-quote` reports `rtmr3` alone).
    - Add a NIC: RTMR0 changes.
    - Boot with `debug=on`: `compare-quote` reports debug, and the verifier refuses.
 
@@ -321,8 +356,8 @@ Append `--run` to boot. The TDs differ only where RTMR0 does not look:
   - dstack-vmm gives every VM its own CID from a pool, under one measurement.
 
   All TDs reach the QGS on host CID 2, and `kuno-app` does not use vsock. Keep other VMs on the host (dstack-vmm's pool starts at 1000) off CIDs 3 + n.
-- **State directory `launch-<shape>.<n>`**, holding the data disk, the weights list and the serial log. The weights
-  images are attached read-only, so the TDs can share one copy.
+- **State directory `launch-<shape>.<n>`**, holding the data disk, the image and weights lists and the serial log.
+  The image disk and the weights images are attached read-only, so the TDs can share one copy.
 - **Host NUMA node.** `--numa-node N` runs QEMU under `numactl --cpunodebind=N --membind=N`, which keeps vCPUs and
   guest memory, bounce buffers included, next to the GPU. `plan-host.py` passes each GPU's node; `--numa-node auto`
   reads the first GPU's. No `-numa` option is added, so the guest still sees one flat node.
@@ -401,7 +436,7 @@ KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7
 - **Devices.** Each container gets its group's CDI devices, `nvidia.com/gpu=<index>`, and in Protected PCIe mode
   the NVSwitch device nodes and the root filesystem's NSCQ library.
 - **Layout checks.** `kuno-app` refuses overlapping groups, missing indices, and a group whose size isn't every
-  listed profile's `gpus_per_worker`. The table it checks against is measured with the root filesystem.
+  listed profile's `gpus_per_worker`. The table it checks against is on the worker image disk, measured into RTMR3.
 - **Supervision.** If one worker exits, `kuno-app` stops the other and fails, and systemd restarts both.
 - **H3 runtime ports.** The workers share the host network namespace, so worker *i* gets
   `KUNO_H3_FL2VA_URL=http://127.0.0.1:30010+10i` and `KUNO_H3_REF2VA_URL=…:30011+10i`. Its runtime servers must
@@ -448,7 +483,20 @@ places BARs bottom-up from there. Confirm both from the first TD's event log (`m
 - **RTMR0 on our images.** dstack-mr's ACPI model follows dstack-vmm's QEMU command line: a root disk,
   a data disk, volumes, NICs, vsock, and GPUs behind root ports. `launch-td.sh` copies that layout and
   adds fw_cfg entries, which should not appear in ACPI. That the TD's RTMR0 equals dstack-mr's value is
-  untested.
+  untested. Every shape now counts two verity volumes (the image disk and one weights disk), so RTMR0 differs
+  from any earlier computation; no measurements were published.
+- **The worker image disk.**
+  - That RTMR0 does not depend on which file, `serial=` or root hash a verity volume carries, only on how many
+    there are. Read in dstack-mr's `qemu-acpi` topology (it takes `num_verity_volumes`) and dstack-vmm's
+    `configure_volumes`, never checked against a TD's event log. It is what keeps RTMR0 shared across worker
+    images.
+  - `/dev/disk/by-id/virtio-kuno-image` appearing from the virtio serial, and mounting the squashfs read-only.
+  - `podman load` from the archive on that mount, and the loaded image's id being its config digest.
+  - `tar -xOf` seeking through a multi-gigabyte archive instead of reading it.
+  - That buildx's OCI archive (`image/build.sh`) has an `index.json` naming exactly the image manifest, which
+    `pack-image.sh` requires. `image/build.sh` reads `manifests[0]`, but no archive was built here.
+  - `pack-image.sh`'s archive bytes come from python3's `tarfile`, which the mkosi tools tree does not pin.
+    Two builders with different Python versions have not been compared.
 - **The mkosi build.**
   - mkosi 26 flags (`--include`, `--source-date-epoch`) and package names.
   - The NVIDIA `.run` layout and `nvidia.files`.
@@ -459,7 +507,7 @@ places BARs bottom-up from there. Confirm both from the first TD's event log (`m
   writable RTMRs.
 - **`kuno-app` on TDX.**
   - The RTMR3 sysfs write.
-  - fw_cfg paths.
+  - fw_cfg paths, `opt/kuno/image` included.
   - podman with the NVIDIA CDI spec, and CDI's per-GPU names (`nvidia.com/gpu=<index>`) matching `nvidia-smi`'s indices.
   - `nvidia-smi conf-compute -srs 1`, and reading Protected PCIe from `nvidia-smi conf-compute -mgm`.
   - Creating configfs-tsm reports as uid 0 with no capabilities inside the container.
@@ -476,9 +524,10 @@ places BARs bottom-up from there. Confirm both from the first TD's event log (`m
   - 192 vCPUs in one TD.
 - **OVMF is a dstack release candidate.** Rebuild it from `edk2_revision` with dstack's patches, or move to
   a stable release, before mainnet.
-- **Turbo.** `TURBO.md`'s base measurements assume only RTMR3 differs between candidates. With the worker
-  image inside the root filesystem, every worker release changes RTMR2 too. A Turbo base needs the image
-  on its own verity disk, measured into RTMR3 only. `kuno-app`'s event order allows it; it is not built.
+- **Turbo bases across OS releases.** A base holds for one OS release, OVMF, QEMU version and shape. Any change
+  to the kernel, initrd, root filesystem or `kuno-app` is a new RTMR2, and so a new Turbo spec. That
+  MRTD and RTMR0–2 really are equal for two worker images on one release is shown on this port's formulas
+  and dstack-mr's model, not on two booted TDs.
 - **Several TDs on one server.**
   - That the vsock CID leaves RTMR0 unchanged. This was read in source only.
   - That `numactl --membind` places TD private memory on the node.

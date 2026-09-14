@@ -38,6 +38,11 @@ def main() -> None:
     parser.add_argument("--netuid", type=int, help="set weights on this subnet (requires the chain extra)")
     parser.add_argument("--wallet-name", default="default")
     parser.add_argument("--wallet-hotkey", default="default")
+    parser.add_argument(
+        "--wallet-path",
+        default=os.environ.get("BT_WALLET_PATH") or None,
+        help="wallet directory (default: $BT_WALLET_PATH, else the SDK's ~/.bittensor/wallets)",
+    )
     parser.add_argument("--network", default="finney")
     parser.add_argument("--dry-run", action="store_true", help="resolve hotkeys to UIDs and print the vector without submitting")
     parser.add_argument(
@@ -128,7 +133,8 @@ def main() -> None:
             from .chain import set_weights
 
             outcome = set_weights(
-                weights, args.netuid, args.wallet_name, args.wallet_hotkey, args.network, dry_run=args.dry_run, mechid=0
+                weights, args.netuid, args.wallet_name, args.wallet_hotkey, args.network,
+                dry_run=args.dry_run, mechid=0, wallet_path=args.wallet_path,
             )
             print(json.dumps(outcome, indent=2, default=str))
         if args.command == "once":
@@ -154,7 +160,8 @@ def _turbo_round(turbo, latest: dict, args) -> None:
     weights = turbo.step(latest.get("serving"))
     print(json.dumps({"mechanism": turbo.mechid, "weights": weights}, indent=2))
     outcome = set_weights(
-        weights, args.netuid, args.wallet_name, args.wallet_hotkey, args.network, dry_run=args.dry_run, mechid=turbo.mechid
+        weights, args.netuid, args.wallet_name, args.wallet_hotkey, args.network,
+        dry_run=args.dry_run, mechid=turbo.mechid, wallet_path=args.wallet_path,
     )
     print(json.dumps(outcome, indent=2, default=str))
 

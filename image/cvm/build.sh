@@ -7,14 +7,18 @@
 #   image/cvm/build.sh --pins                                         list unpinned inputs and exit
 #
 # Steps: verified inputs (fetch-inputs.sh) -> worker image as a reproducible OCI archive (image/build.sh)
-# -> mkosi root filesystem tree with the kernel, NVIDIA driver and that archive -> squashfs + dm-verity
+# -> the worker image disk: that archive made canonical, plus the catalog's GPU counts per worker, as squashfs +
+# dm-verity (pack-image.sh) -> mkosi root filesystem tree with the kernel and NVIDIA driver -> squashfs + dm-verity
 # (pack-rootfs.sh) -> initrd (mkinitrd.sh) -> kernel setup header normalized for dstack's OVMF ->
 # metadata.json (dstack-mr compatible), sha256sum.txt, build.json -> measure.py per shape.
 #
-# Outputs in --out: ovmf.fd, bzImage, initramfs.cpio.gz, rootfs.img.verity, metadata.json,
-# sha256sum.txt, build.json, shapes.json, measurements/<shape>.json. Nothing in them names the build machine, its
-# paths or the time. `--weights` maps shape ids to the dm-verity root hashes of the weights images
-# that shape mounts ({"c2.h200-141gb.x1": ["<64 hex>"]}); RTMR3 records them.
+# The worker image is not in the root filesystem: kuno-app measures its disk into RTMR3 only, so MRTD and RTMR0-2
+# depend on the OS release and the shape, never on the worker release (CVM.md, TURBO.md).
+#
+# Outputs in --out: ovmf.fd, bzImage, initramfs.cpio.gz, rootfs.img.verity, worker.img.verity, worker.roothash,
+# worker.size, worker.digest, metadata.json, sha256sum.txt, build.json, shapes.json, measurements/<shape>.json.
+# Nothing in them names the build machine, its paths or the time. `--weights` maps shape ids to the dm-verity root
+# hashes of the weights images that shape mounts ({"c2.h200-141gb.x1": ["<64 hex>"]}); RTMR3 records them.
 #
 # Needs root (mkosi), Docker with buildx, and `fetch-inputs.sh tools` output in KUNO_CVM_TOOLS
 # (default image/cvm/.tools). No TDX host. NOT RUN IN THIS REPOSITORY beyond its packing and
@@ -80,7 +84,7 @@ if [ "$check" = 1 ]; then
     echo "not reproducible: $out/a and $out/b differ" >&2
     exit 1
   fi
-  echo "reproducible: two builds produced identical artifacts and measurements" >&2
+  echo "reproducible: two builds produced identical artifacts, image disks and measurements" >&2
   exit 0
 fi
 
@@ -93,7 +97,7 @@ mkdir -p "$out/measurements"
 # 1. pinned inputs, hash-checked
 "$here/fetch-inputs.sh" inputs "$here/.inputs"
 
-# 2. the worker image: two clean builds must agree; its digest is RTMR3's first event
+# 2. the worker image: two clean builds must agree; its digest is RTMR3's second event
 worker_line="$(KUNO_IMAGE_OCI_OUT="$work/worker.oci.tar" "$image/build.sh" --check | grep '^KUNO_IMAGE_DIGEST=')"
 image_digest="${worker_line#KUNO_IMAGE_DIGEST=}"
 expected_digest="$(pin worker_image.expected_digest)"
@@ -102,25 +106,34 @@ if [ -n "$expected_digest" ] && [ "$expected_digest" != "$image_digest" ]; then
   exit 1
 fi
 
-# 3. root filesystem tree and kernel (mkosi at its pinned revision, Debian at its pinned snapshot)
+# 3. the worker image disk, outside the root filesystem: its root hash is RTMR3's first event. kuno-app sizes
+#    KUNO_GPU_GROUPS by each profile's gpus_per_worker, from the catalog the worker image carries, so that table
+#    travels on the same disk.
+image_root="$("$here/pack-image.sh" "$work/worker.oci.tar" "$image/../protocol/src/kuno_protocol/profiles.json" "$out/worker")"
+image_size="$(cat "$out/worker.size")"
+if [ "$(cat "$out/worker.digest")" != "$image_digest" ]; then
+  echo "the worker image disk holds $(cat "$out/worker.digest"), not the built $image_digest" >&2
+  exit 1
+fi
+
+# 4. root filesystem tree and kernel (mkosi at its pinned revision, Debian at its pinned snapshot); nothing of the
+#    worker release goes into it
 printf '[Distribution]\nSnapshot=%s\n' "$(pin debian.snapshot)" > "$work/pins.conf"
 "$tools/bin/mkosi" --directory "$here/mkosi" --include "$work/pins.conf" --output-directory "$work/mkosi" \
   --source-date-epoch "$SOURCE_DATE_EPOCH" --force build
 tree="$work/mkosi/rootfs"
-[ -d "$tree" ] && [ -f "$work/mkosi/bzImage" ] || { echo "mkosi produced no root filesystem tree or kernel" >&2; exit 1; }
-install -D -m 0644 "$work/worker.oci.tar" "$tree/usr/share/kuno/worker.oci.tar"
-printf '%s\n' "$image_digest" > "$tree/usr/share/kuno/worker.digest"
-# kuno-app sizes KUNO_GPU_GROUPS by each profile's gpus_per_worker, from the same catalog the worker image carries.
-python3 -c 'import json, sys; print("\n".join("%s %s" % (p["id"], p["gpus_per_worker"]) for p in json.load(open(sys.argv[1]))["profiles"]))' \
-  "$image/../protocol/src/kuno_protocol/profiles.json" > "$tree/usr/share/kuno/gpus-per-worker"
+if [ ! -d "$tree" ] || [ ! -f "$work/mkosi/bzImage" ]; then
+  echo "mkosi produced no root filesystem tree or kernel" >&2
+  exit 1
+fi
 
-# 4. dm-verity root filesystem and initrd
+# 5. dm-verity root filesystem and initrd
 root_hash="$("$here/pack-rootfs.sh" "$tree" "$work/pack")"
 root_size="$(cat "$work/pack/rootfs.size")"
 mv "$work/pack/rootfs.img.verity" "$out/rootfs.img.verity"
 "$here/mkinitrd.sh" "$tree" "$here/initrd.files" "$here/initrd/init" "$out/initramfs.cpio.gz" > /dev/null
 
-# 5. firmware from the pinned dstack release, kernel with its loader-written setup-header fields zeroed
+# 6. firmware from the pinned dstack release, kernel with its loader-written setup-header fields zeroed
 install -m 0644 "$here/.inputs/ovmf.fd" "$out/ovmf.fd"
 python3 - "$here" "$work/mkosi/bzImage" "$out/bzImage" <<'PY'
 import sys
@@ -130,26 +143,27 @@ import measure
 Path(sys.argv[3]).write_bytes(measure.normalize_setup_header(Path(sys.argv[2]).read_bytes()))
 PY
 
-# 6. the measured command line (dstack's hardening flags; pci=nommconf stays off for Blackwell GPUs),
-#    metadata.json, build.json and the artifact hashes
+# 7. the measured command line (dstack's hardening flags; pci=nommconf stays off for Blackwell GPUs),
+#    metadata.json, build.json and the artifact hashes. The command line names the root filesystem only.
 cmdline="console=ttyS0 init=/init panic=1 net.ifnames=0 biosdevname=0 mce=off oops=panic pci=noearly"
 cmdline="$cmdline random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock"
 cmdline="$cmdline kuno.rootfs_dev=/dev/vda kuno.rootfs_hash=$root_hash kuno.rootfs_size=$root_size"
-python3 - "$lock" "$out" "$cmdline" "$image_digest" "$root_hash" "$root_size" "$unpinned" <<'PY'
+python3 - "$lock" "$out" "$cmdline" "$image_digest" "$image_root" "$image_size" "$root_hash" "$root_size" "$unpinned" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
-lock_path, out, cmdline, image_digest, root_hash, root_size, unpinned = sys.argv[1:8]
+lock_path, out, cmdline, image_digest, image_root, image_size, root_hash, root_size, unpinned = sys.argv[1:10]
 lock = json.loads(Path(lock_path).read_text())
 metadata = {
     "bios": "ovmf.fd", "kernel": "bzImage", "initrd": "initramfs.cpio.gz", "rootfs": "rootfs.img.verity",
     "cmdline": cmdline, "version": "kuno-cvm/1", "is_dev": False,
     "ovmf_variant": lock["ovmf"]["variant"], "kernel_header_normalized": lock["ovmf"]["kernel_header_normalized"],
-    "kuno": {"worker_image_digest": image_digest, "rootfs_hash": root_hash, "rootfs_size": int(root_size)},
+    "kuno": {"rootfs_hash": root_hash, "rootfs_size": int(root_size)},
 }
 build = {
     "unpinned": bool(unpinned.split()), "null_pins": unpinned.split(),
     "inputs_lock_sha256": hashlib.sha256(Path(lock_path).read_bytes()).hexdigest(),
     "source_date_epoch": lock["source_date_epoch"], "worker_image_digest": image_digest,
+    "worker_image_disk": {"file": "worker.img.verity", "root_hash": image_root, "size": int(image_size)},
     "mkosi_revision": lock["mkosi"]["revision"], "debian_snapshot": lock["debian"]["snapshot"],
     "kernel_sha256": lock["kernel"]["sha256"], "ovmf_sha256": lock["ovmf"]["sha256"],
     "dstack_mr_revision": lock["dstack_mr"]["revision"],
@@ -159,13 +173,15 @@ Path(out, "build.json").write_text(json.dumps(build, indent=2, sort_keys=True) +
 PY
 # The shapes travel with the release: launch-td.sh, plan-host.py and kuno-preflight --host --release read them.
 cp "$here/shapes.json" "$out/shapes.json"
-(cd "$out" && sha256sum ovmf.fd bzImage initramfs.cpio.gz rootfs.img.verity metadata.json build.json shapes.json > sha256sum.txt)
+(cd "$out" && sha256sum ovmf.fd bzImage initramfs.cpio.gz rootfs.img.verity worker.img.verity worker.roothash worker.size \
+  worker.digest metadata.json build.json shapes.json > sha256sum.txt)
 
-# 7. measurements per shape; RTMR0 comes from dstack-mr, which must also agree on MRTD, RTMR1, RTMR2
+# 8. measurements per shape; RTMR0 comes from dstack-mr, which must also agree on MRTD, RTMR1, RTMR2
 default_shapes="$(python3 -c 'import json, sys; print(",".join(s["id"] for s in json.load(open(sys.argv[1]))["shapes"]))' "$here/shapes.json")"
 IFS=, read -ra shape_ids <<< "${KUNO_CVM_SHAPES:-$default_shapes}"
 for shape in "${shape_ids[@]}"; do
-  args=(--shape "$here/shapes.json:$shape" --image-digest "$image_digest" --build-info "$out/build.json" --out "$out/measurements/$shape.json")
+  args=(--shape "$here/shapes.json:$shape" --image-root "$image_root" --image-digest "$image_digest"
+    --build-info "$out/build.json" --out "$out/measurements/$shape.json")
   if [ -n "$weights" ]; then
     while read -r root; do
       [ -n "$root" ] && args+=(--weights-root "$root")
@@ -178,4 +194,4 @@ for shape in "${shape_ids[@]}"; do
   fi
   python3 "$here/measure.py" "$out/metadata.json" "${args[@]}"
 done
-echo "built $out: rootfs $root_hash, worker image $image_digest" >&2
+echo "built $out: rootfs $root_hash; worker image $image_digest on image disk $image_root" >&2

@@ -2,12 +2,15 @@
 """Expected TDX measurements (MRTD, RTMR0–3) for a KunoWorld confidential VM image.
 
     image/cvm/measure.py out/cvm/metadata.json --shape image/cvm/shapes.json:c2.h200x1 \
-        --image-digest sha256:<worker image> --weights-root <verity root hash> [--dstack-mr dstack-mr] --out measurements.json
+        --image-root <worker image disk root hash> --image-digest sha256:<worker image> \
+        --weights-root <verity root hash> [--dstack-mr dstack-mr] --out measurements.json
 
 Direct boot on QEMU + TDVF (OVMF): the TDX module measures the firmware pages into MRTD, OVMF
 extends RTMR0 with its configuration (TD HOB, CFV, Secure Boot variables, QEMU's ACPI tables),
 RTMR1 with the kernel (Authenticode) and boot-services events, RTMR2 with the command line and
-the initrd, and our guest agent extends RTMR3 (expected_rtmr3.py).
+the initrd, and our guest agent extends RTMR3 with the worker image disk, the worker image and the
+weights (expected_rtmr3.py). The worker image is not part of anything MRTD or RTMR0–2 cover, so for
+one release directory and shape they are the same whatever --image-root and --image-digest say.
 
 MRTD, RTMR1, RTMR2 and the fixed part of RTMR0 are a line-by-line port of dstack-mr
 (https://github.com/Dstack-TEE/dstack, dstack/dstack-mr/src/{tdvf,kernel,tdx,util,machine}.rs at
@@ -554,10 +557,12 @@ def measure_image(
     shape: Shape,
     *,
     image_digest: str | None = None,
+    image_root: str | None = None,
     weights_roots: list[str] | None = None,
     acpi: AcpiHashes | None = None,
 ) -> dict:
-    """Every register this port can compute from the build outputs; RTMR0 only with ACPI digests."""
+    """Every register this port can compute from the build outputs; RTMR0 only with ACPI digests, RTMR3 only with
+    the worker image digest and its image disk's root hash."""
     metadata = json.loads(metadata_path.read_text())
     root = metadata_path.parent
     for key in ("bios", "kernel", "initrd", "cmdline"):
@@ -584,9 +589,11 @@ def measure_image(
         logs["rtmr0"] = rtmr0_log(measure_td_hob(sections, shape.memory), acpi)
         registers["rtmr0"] = measure_log(logs["rtmr0"]).hex()
     rtmr3_events: list[str] = []
-    if image_digest is not None:
+    if image_digest is not None or image_root is not None:
+        if image_digest is None or image_root is None:
+            raise MeasureError("RTMR3 needs both the worker image digest and its image disk's root hash (pack-image.sh)")
         module = _rtmr3_module()
-        digests = module.events(image_digest, *(weights_roots or []))
+        digests = module.rtmr3_events(image_root, image_digest, *(weights_roots or []))
         registers["rtmr3"] = module.replay(digests)
         rtmr3_events = [d.hex() for d in digests]
     return {
@@ -601,6 +608,7 @@ def measure_image(
             "kernel_header_normalized": normalized,
             "two_pass_add_pages": two_pass,
             "image_digest": image_digest,
+            "image_root": image_root.lower() if image_root is not None else None,
             "weights_roots": sorted(r.lower() for r in weights_roots or []),
         },
         "tool": {"port_of": f"dstack-mr@{DSTACK_MR_REVISION}"},
@@ -641,7 +649,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("metadata", type=Path, help="metadata.json written by build.sh (dstack-compatible)")
     parser.add_argument("--shape", required=True, help="shapes.json:<id>")
-    parser.add_argument("--image-digest", help="worker image digest extended into RTMR3")
+    parser.add_argument("--image-root", help="dm-verity root hash of the worker image disk (pack-image.sh), RTMR3's first event")
+    parser.add_argument("--image-digest", help="worker image digest, RTMR3's second event")
     parser.add_argument("--weights-root", action="append", default=[], help="dm-verity root hash of a weights image (repeatable)")
     parser.add_argument("--acpi-hashes", type=Path, help="JSON {loader, rsdp, tables} replayed from a real TD's RTMR0 event log")
     parser.add_argument("--dstack-mr", help="path to a dstack-mr binary built at the pinned revision")
@@ -651,7 +660,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         shape = load_shape(args.shape)
         acpi = AcpiHashes.from_json(json.loads(args.acpi_hashes.read_text())) if args.acpi_hashes else None
-        result = measure_image(args.metadata, shape, image_digest=args.image_digest, weights_roots=args.weights_root, acpi=acpi)
+        result = measure_image(
+            args.metadata, shape, image_digest=args.image_digest, image_root=args.image_root, weights_roots=args.weights_root, acpi=acpi
+        )
         if args.dstack_mr:
             result = cross_check(result, run_dstack_mr(args.dstack_mr, args.metadata, shape))
         if args.build_info:

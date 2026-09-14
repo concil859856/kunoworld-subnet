@@ -14,15 +14,18 @@ from kuno_protocol.attestation import AttestationEvidence, AttestationUnavailabl
 from kuno_protocol.blobs import decrypt_blob, encrypt_blob
 from kuno_protocol.canonical import b64d, canonical_json, sha256_hex
 from kuno_protocol.crypto import DecryptionError, RecipientSession
+from kuno_protocol.envelope import CAPACITY_REFUSED, advertised, describe, fits
 from kuno_protocol.hotkey import HotkeySigner, sign_hotkey_proof
 from kuno_protocol.media import ROLE_TYPES, sniff_mime
 from kuno_protocol.profiles import ModelProfile, ParamError, load_profiles, validate_params
 from kuno_protocol.receipts import Receipt, ReceiptBody, input_digest, sign_receipt
 from kuno_protocol.schemas import MinerChallenge, MinerJob, SealedPayload, input_label, job_aad, output_label
+from kuno_protocol.sealed_payload import MalformedPayload, open_payload
 from kuno_protocol.verified import MinerAudit
 
 from .audits import AuditCalls, AuditResponder
 from .backends.base import Backend, GenerationTask, InputFile
+from .backends.media_tools import CapacityRefused
 from .config import WorkerConfig
 from .gateway_client import GatewayClient, GatewayError
 from .identity import EnclaveIdentity
@@ -104,6 +107,27 @@ class Worker:
             raise ValueError(f"no backend configured for {profile.family}")
         return backend
 
+    def serving_envelope(self) -> dict[str, dict]:
+        """Per profile, the longest duration this worker's hardware serves at each resolution, aspect ratio and fps
+        (kuno_protocol.envelope): the memory plan on a quantized class, the profile's limits otherwise. Computed once,
+        at start-up (`run`), from plain data: no GPU is touched."""
+        if getattr(self, "_envelope", None) is None:
+            from kuno_protocol.envelope import full_table
+
+            tables = {}
+            for profile_id, profile in self.profiles.items():
+                compute = getattr(self.backend_for(profile), "serving_envelope", None)
+                tables[profile_id] = compute(profile) if compute is not None else full_table(profile)
+            self._envelope = tables
+            self._advertised = advertised(tables, self.profiles)
+        return self._envelope
+
+    @property
+    def advertised_envelope(self) -> dict | None:
+        """What registration carries: the profiles this hardware can't serve in full, or None when it serves them all."""
+        self.serving_envelope()
+        return self._advertised
+
     def attest(self, nonce: bytes) -> AttestationEvidence:
         return build_evidence(
             self.tee,
@@ -121,10 +145,12 @@ class Worker:
         proof = None
         if self.hotkey is not None:
             proof = sign_hotkey_proof(self.hotkey, nonce, self.identity.enclave_id, self.identity.signing_public)
-        if self.turbo_submission is None:
-            self.client.register(evidence, self.miner_hotkey, self.config.capacity, proof)
-        else:
-            self.client.register(evidence, self.miner_hotkey, self.config.capacity, proof, turbo_submission=self.turbo_submission)
+        extra: dict = {}
+        if self.turbo_submission is not None:
+            extra["turbo_submission"] = self.turbo_submission
+        if self.advertised_envelope is not None:
+            extra["envelope"] = self.advertised_envelope
+        self.client.register(evidence, self.miner_hotkey, self.config.capacity, proof, **extra)
         self.evidence = evidence
         self.last_attested = time.time()
         self._refresh_certificate()
@@ -172,16 +198,17 @@ class Worker:
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
             self._certificate_unavailable(signer, current, now, exc)
             return
-        tsa_url = signer.configured_tsa_url or response.get("tsa_url")
-        if tsa_url is None and self.config.tee != "mock":
+        # The gateway lists its timestamp authorities in order of preference (`tsa_urls`); an older one sends `tsa_url`.
+        suggested_tsas = response.get("tsa_urls") or response.get("tsa_url")
+        if not signer.effective_tsa_urls(suggested_tsas) and self.config.tee != "mock":
             # Without a timestamp, readers reject every manifest once the short-lived certificate expires,
             # so a customer's video would stop verifying a day after delivery. Refuse instead.
             self._certificate_unavailable(
                 signer, current, now,
-                MissingTimestampAuthority("no RFC 3161 timestamp authority: set KUNO_PROVENANCE_TSA_URL or the gateway's KUNO_C2PA_TSA_URL"),
+                MissingTimestampAuthority("no RFC 3161 timestamp authority: set KUNO_PROVENANCE_TSA_URL or the gateway's KUNO_C2PA_TSA_URLS"),
             )
             return
-        signer.install(issued, response.get("tsa_url"))
+        signer.install(issued, suggested_tsas)
         log.info("C2PA certificate issued for enclave %s, valid until %s", self.identity.enclave_id,
                  time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(issued.not_after)))
 
@@ -218,6 +245,9 @@ class Worker:
         stop = stop or threading.Event()
         for profile in self.profiles.values():
             self.backend_for(profile).warm(profile)
+        # After warm-up, which refuses a class that cannot serve a profile at all; every registration advertises it.
+        if self.advertised_envelope is not None:
+            log.info("serving envelope: %s serve less than their full limits on this hardware", ", ".join(self.advertised_envelope))
         while not stop.is_set():
             step = "register"
             try:
@@ -330,6 +360,12 @@ class Worker:
         except JobCanceled:
             self._discard_openings(job.job_id)
             log.info("job %s canceled by the customer", job.job_id)
+        except CapacityRefused as exc:
+            # The message names the class, sizes and memory only. Outside the advertised envelope this costs the miner
+            # nothing; inside it the gateway records internal_error (MINING.md §6).
+            self._discard_openings(job.job_id)
+            log.warning("job %s refused: %s", job.job_id, exc)
+            self._fail(job.job_id, CAPACITY_REFUSED, str(exc))
         except Exception as exc:  # never log the message: it may echo request content
             self._discard_openings(job.job_id)
             log.error("job %s failed with %s", job.job_id, type(exc).__name__)
@@ -378,15 +414,20 @@ class Worker:
             validate_params(profile, job.params)
         except ParamError as exc:
             raise JobRejected("invalid_params", str(exc)) from None
+        table = self.serving_envelope().get(profile.id)
+        if not fits(table, job.params):
+            # Before any download or decryption. The gateway doesn't route such a job here, so this costs nothing.
+            raise JobRejected(CAPACITY_REFUSED, f"This worker's hardware {describe(table, job.params)}.")
 
         enc, ciphertext = b64d(job.enc), b64d(job.ciphertext)
         aad = job_aad(job.job_id, self.identity.enclave_id, job.params, job.input_blob_ids)
         try:
             session = RecipientSession(self.identity.hpke_private, enc)
-            payload = SealedPayload.model_validate_json(session.open(ciphertext, aad))
+            # Either form: padded (strictly checked) or bare JSON from clients that predate padding.
+            payload = open_payload(session, ciphertext, aad)
         except DecryptionError:
             raise JobRejected("decrypt_failed", "The request did not decrypt for this enclave (tampered or wrong key).") from None
-        except ValidationError:
+        except (MalformedPayload, ValidationError):
             raise JobRejected("bad_payload", "The decrypted request is malformed.") from None
         self._progress(job.job_id, 0.02, "decrypted", force=True)
 

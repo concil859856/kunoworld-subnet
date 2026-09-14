@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 # KunoWorld CVM application agent. Runs once per boot before anything reads customer data:
 #
-#   1. RTMR3 <- the worker image digest, then each weights image's dm-verity root hash in ascending
-#      order (image/cvm/expected_rtmr3.py computes the same value off-host). RTMR3 must be all zeros
-#      when it starts, and must equal the replayed value when it is done, or the agent stops.
-#   2. Opens each weights image with that root hash and mounts it read-only under /models/<name>.
-#   3. Marks the GPUs ready for work: in Protected PCIe mode only after NVIDIA's PPCIe verifier has
+#   1. RTMR3 <- the worker image disk's dm-verity root hash, then the worker image digest, then each weights
+#      image's dm-verity root hash in ascending order (image/cvm/expected_rtmr3.py computes the same value
+#      off-host). Every event is extended before any disk is opened. RTMR3 must be all zeros when it starts,
+#      and must equal the replayed value when it is done, or the agent stops.
+#   2. Opens the image disk with its measured root hash, mounts it read-only, and stops unless the OCI archive
+#      on it names exactly the measured image digest and its manifest and config hash to their digests.
+#   3. Opens each weights image with its measured root hash and mounts it read-only under /models/<name>.
+#   4. Marks the GPUs ready for work: in Protected PCIe mode only after NVIDIA's PPCIe verifier has
 #      attested every GPU and NVSwitch and checked their NVLink topology.
-#   4. Loads the worker image from the measured root filesystem, checks it is the measured digest,
-#      and runs it with host-provided settings reduced to an allowlist: one worker container per GPU
+#   5. Loads the worker image from the image disk, stops unless podman loaded exactly the measured image's
+#      config, and runs it with host-provided settings reduced to an allowlist: one worker container per GPU
 #      group (KUNO_GPU_GROUPS), or one worker with every GPU.
 #
+# The worker image is not in the root filesystem, so MRTD and RTMR0-2 stay the same across worker releases for
+# one OS release and VM shape; a Turbo candidate differs from its base only in RTMR3 (TURBO.md).
+#
 # Host inputs (QEMU fw_cfg, unmeasured and untrusted except through what RTMR3 records):
+#   opt/kuno/image         one line "<sha256 root hash> <data bytes> <sha256:image digest>"; disk serial kuno-image
 #   opt/kuno/weights       lines "<name> <sha256 root hash> <data bytes>"; disk serial kuno-w-<name>
 #   opt/kuno/env           lines KEY=VALUE, only the keys in ALLOWED_ENV
 #   opt/kuno/hotkey.seed   the miner's hotkey seed (the miner is the host; it is their own secret)
@@ -22,12 +29,16 @@ set -euo pipefail
 
 readonly RTMR3=/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384
 readonly FWCFG=/sys/firmware/qemu_fw_cfg/by_name/opt/kuno
-readonly IMAGE_TAR=/usr/share/kuno/worker.oci.tar
-# "<profile id> <gpus_per_worker>" per catalog profile, written into the measured root filesystem by build.sh.
-readonly GPUS_PER_WORKER=/usr/share/kuno/gpus-per-worker
-readonly PPCIE_VERIFIER=/usr/lib/kuno/ppcie
 readonly STATE=/run/kuno
+readonly IMAGE_MOUNT="$STATE/image"
+readonly IMAGE_TAR="$IMAGE_MOUNT/worker.oci.tar"
+# "<profile id> <gpus_per_worker>" per catalog profile, written onto the measured image disk by pack-image.sh.
+readonly GPUS_PER_WORKER="$IMAGE_MOUNT/gpus-per-worker"
+readonly PPCIE_VERIFIER=/usr/lib/kuno/ppcie
 readonly ZEROS=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+readonly EVENT_IMAGE_DISK=kuno/v1/rtmr3/image-disk
+readonly EVENT_IMAGE=kuno/v1/rtmr3/image
+readonly EVENT_WEIGHTS=kuno/v1/rtmr3/weights
 readonly ALLOWED_ENV=" KUNO_GATEWAY_URL KUNO_PROFILES KUNO_CAPACITY KUNO_MINER_HOTKEY KUNO_VERIFIED_HARDWARE_CLASS KUNO_MODEL_DIGEST KUNO_H3_FL2VA_URL KUNO_H3_REF2VA_URL KUNO_H3_TURBO_LORA KUNO_REATTEST_S KUNO_RETRY_MAX_S KUNO_PROVENANCE KUNO_GPU_EVIDENCE KUNO_SAFETY_REQUIRE_CLASSIFIER KUNO_GPU_GROUPS "
 
 log() { printf 'kuno-app: %s\n' "$*" >&2; }
@@ -42,6 +53,64 @@ replay() { printf '%s%s' "$1" "$2" | hex_to_bin | sha384sum | cut -d' ' -f1; }
 read_rtmr3() { od -An -v -tx1 "$RTMR3" | tr -d ' \n'; }
 # One write of exactly 48 bytes extends the register (Documentation/ABI/testing/sysfs-devices-virtual-misc-tdx_guest).
 extend_rtmr3() { printf '%s' "$1" | hex_to_bin | dd of="$RTMR3" bs=48 count=1 iflag=fullblock status=none; }
+
+# plan_rtmr3 <image disk root hash> <image digest> [weights root hash...]: RTMR3's events in extension order, into
+# event_tags and event_values. This is the one definition of the order, and expected_rtmr3.py mirrors it:
+#   1. the image disk's dm-verity root hash
+#   2. the worker image digest
+#   3. each weights image's dm-verity root hash, ascending (C collation), each at most once
+declare -a event_tags=() event_values=()
+plan_rtmr3() {
+  local root previous=""
+  [[ "${1:-}" =~ ^[0-9a-f]{64}$ ]] || die "the image disk's root hash must be 64 lowercase hex"
+  [[ "${2:-}" =~ ^sha256:[0-9a-f]{64}$ ]] || die "the worker image digest must be sha256:<64 lowercase hex>"
+  event_tags=("$EVENT_IMAGE_DISK" "$EVENT_IMAGE")
+  event_values=("$1" "$2")
+  shift 2
+  while read -r root; do
+    [ -n "$root" ] || continue
+    [[ "$root" =~ ^[0-9a-f]{64}$ ]] || die "weights root hash $root must be 64 lowercase hex"
+    [ "$root" != "$previous" ] || die "the same weights image is listed twice"
+    event_tags+=("$EVENT_WEIGHTS")
+    event_values+=("$root")
+    previous="$root"
+  done < <(printf '%s\n' "$@" | LC_ALL=C sort)
+}
+
+# replayed_rtmr3: the value event_tags and event_values extend an all-zero RTMR3 to.
+replayed_rtmr3() {
+  local value="$ZEROS" i
+  for i in "${!event_tags[@]}"; do
+    value="$(replay "$value" "$(event_digest "${event_tags[$i]}" "${event_values[$i]}")")"
+  done
+  printf '%s\n' "$value"
+}
+
+# open_verity <disk serial> <root hash> <data bytes>: /dev/mapper/<serial>, the disk opened with dm-verity.
+open_verity() {
+  local device="/dev/disk/by-id/virtio-$1" mapped="$1"
+  for _ in $(seq 1 100); do [ -b "$device" ] && break; sleep 0.1; done
+  [ -b "$device" ] || die "disk $device did not appear"
+  if [ ! -b "/dev/mapper/$mapped" ]; then
+    veritysetup open "$device" "$mapped" "$device" "$2" --hash-offset="$3" || die "dm-verity refused $device with root hash $2"
+  fi
+}
+
+# check_image <worker.oci.tar> <image digest>: the archive names exactly that manifest, and the manifest and its
+# config hash to their digests. Prints the config digest, which is the id podman gives the loaded image.
+image_blob() { tar -xOf "$1" "blobs/sha256/${2#sha256:}"; }
+check_image() {
+  local archive="$1" digest="$2" found config
+  [ -r "$archive" ] || die "$archive is missing: the image disk holds no worker image"
+  found="$(tar -xOf "$archive" index.json | jq -r '.manifests | if length == 1 then .[0].digest else error("one manifest expected") end')" \
+    || die "the image archive does not name exactly one manifest"
+  [ "$found" = "$digest" ] || die "the image disk holds image $found, not the measured $digest"
+  [ "$(image_blob "$archive" "$digest" | sha256sum | cut -d' ' -f1)" = "${digest#sha256:}" ] || die "the manifest blob does not hash to $digest"
+  config="$(image_blob "$archive" "$digest" | jq -r '.config.digest')" || die "the image manifest is not JSON"
+  [[ "$config" =~ ^sha256:[0-9a-f]{64}$ ]] || die "the image manifest has no config digest"
+  [ "$(image_blob "$archive" "$config" | sha256sum | cut -d' ' -f1)" = "${config#sha256:}" ] || die "the image config blob does not hash to $config"
+  printf '%s\n' "$config"
+}
 
 # KUNO_GPU_GROUPS="0,1,2,3 4,5,6,7" runs one worker per group, and each container opens only its group's GPUs
 # (CDI devices nvidia.com/gpu=<index>), so each worker's GPU evidence covers only them. The value comes from the
@@ -86,40 +155,49 @@ gpu_groups() {
   [ "$count" -ge 1 ] || die "KUNO_GPU_GROUPS names no GPU group"
 }
 
-# `kuno-app --expected-rtmr3 <image digest> [root hash...]` prints the value these events replay to, with
-# the same functions and without touching the register: an in-guest cross-check of expected_rtmr3.py.
-if [ "${1:-}" = "--expected-rtmr3" ]; then
-  shift
-  value="$(replay "$ZEROS" "$(event_digest kuno/v1/rtmr3/image "${1:?image digest}")")"
-  shift
-  while read -r root; do
-    [ -n "$root" ] && value="$(replay "$value" "$(event_digest kuno/v1/rtmr3/weights "$root")")"
-  done < <(printf '%s\n' "$@" | sort)
-  printf '%s\n' "$value"
-  exit 0
-fi
-
-# `kuno-app --gpu-groups <groups> <profiles> <gpus-per-worker table> <GPU index>...` checks a layout off-host.
-if [ "${1:-}" = "--gpu-groups" ]; then
-  shift
-  gpu_groups "$@"
-  exit 0
-fi
+# Off-host checks with the same functions, touching no register or disk:
+#   kuno-app --expected-rtmr3 <image disk root hash> <image digest> [weights root hash...]   the value RTMR3 replays to
+#   kuno-app --rtmr3-events <image disk root hash> <image digest> [weights root hash...]    "<tag> <value> <digest>" per event
+#   kuno-app --check-image <worker.oci.tar> <image digest>                                  the config digest, or a refusal
+#   kuno-app --gpu-groups <groups> <profiles> <gpus-per-worker table> <GPU index>...        the worker groups
+case "${1:-}" in
+  --expected-rtmr3 | --rtmr3-events)
+    mode="$1"
+    shift
+    [ "$#" -ge 2 ] || die "usage: kuno-app $mode <image disk root hash> <image digest> [weights root hash...]"
+    plan_rtmr3 "$@"
+    if [ "$mode" = --expected-rtmr3 ]; then
+      replayed_rtmr3
+    else
+      for i in "${!event_tags[@]}"; do
+        printf '%s %s %s\n' "${event_tags[$i]}" "${event_values[$i]}" "$(event_digest "${event_tags[$i]}" "${event_values[$i]}")"
+      done
+    fi
+    exit 0
+    ;;
+  --check-image)
+    [ "$#" -eq 3 ] || die "usage: kuno-app --check-image <worker.oci.tar> <image digest>"
+    check_image "$2" "$3"
+    exit 0
+    ;;
+  --gpu-groups)
+    shift
+    gpu_groups "$@"
+    exit 0
+    ;;
+esac
 
 mkdir -p "$STATE" && chmod 0700 "$STATE"
 [ -w "$RTMR3" ] || die "$RTMR3 is not writable: this needs a TDX guest on Linux >= 6.16"
-[ -r "$IMAGE_TAR" ] || die "$IMAGE_TAR is missing from the root filesystem"
 
-# ---- the worker image digest, from the archive the root filesystem carries
-index="$(tar -xOf "$IMAGE_TAR" index.json)"
-image_digest="$(jq -r '.manifests | if length == 1 then .[0].digest else error("one manifest expected") end' <<<"$index")"
-[[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "the image archive has no single sha256 manifest"
-manifest="$(tar -xOf "$IMAGE_TAR" "blobs/sha256/${image_digest#sha256:}")"
-[ "$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)" = "${image_digest#sha256:}" ] || die "manifest blob does not hash to its digest"
-config_digest="$(jq -r '.config.digest' <<<"$manifest")"
-[[ "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "the image manifest has no config digest"
+# ---- the disks the host attached: the worker image disk and the weights images (measured next, opened after)
+image_line="$(fwcfg image)"
+[ -n "$image_line" ] || die "the host attached no worker image disk (fw_cfg opt/kuno/image)"
+[ "$(printf '%s\n' "$image_line" | wc -l)" -eq 1 ] || die "opt/kuno/image must be one line: <root hash> <data bytes> <image digest>"
+read -r image_root image_size image_digest image_extra <<<"$image_line"
+[[ "${image_size:-}" =~ ^[0-9]+$ ]] || die "the image disk's data size must be a number"
+[ -z "${image_extra:-}" ] || die "opt/kuno/image must be one line: <root hash> <data bytes> <image digest>"
 
-# ---- weights images named by the host
 declare -a names=() roots=() sizes=()
 while read -r name root size; do
   [ -n "${name:-}" ] || continue
@@ -128,46 +206,40 @@ while read -r name root size; do
   [[ "$size" =~ ^[0-9]+$ ]] || die "weights data size for $name must be a number"
   names+=("$name"); roots+=("$root"); sizes+=("$size")
 done < <(fwcfg weights)
-mapfile -t sorted_roots < <(printf '%s\n' "${roots[@]}" | sed '/^$/d' | sort)
-if [ "${#sorted_roots[@]}" -ne "$(printf '%s\n' "${sorted_roots[@]}" | sed '/^$/d' | sort -u | wc -l)" ]; then
-  die "the same weights image is listed twice"
-fi
 
-# ---- RTMR3, once per boot
+# ---- RTMR3, once per boot, before any disk is opened
+plan_rtmr3 "$image_root" "$image_digest" "${roots[@]}"
+expected="$(replayed_rtmr3)"
 if [ -f "$STATE/rtmr3.expected" ]; then
-  [ "$(read_rtmr3)" = "$(cat "$STATE/rtmr3.expected")" ] || die "RTMR3 changed since this boot measured it"
+  [ "$(cat "$STATE/rtmr3.expected")" = "$expected" ] || die "the host's image and weights differ from what this boot measured"
+  [ "$(read_rtmr3)" = "$expected" ] || die "RTMR3 changed since this boot measured it"
   log "RTMR3 already measured this boot"
 else
   [ "$(read_rtmr3)" = "$ZEROS" ] || die "RTMR3 was extended before the agent ran"
-  expected="$ZEROS"
   : > "$STATE/rtmr3-events.log"
-  record() {
-    local tag="$1" value="$2" digest
-    digest="$(event_digest "$tag" "$value")"
+  for i in "${!event_tags[@]}"; do
+    digest="$(event_digest "${event_tags[$i]}" "${event_values[$i]}")"
     extend_rtmr3 "$digest"
-    expected="$(replay "$expected" "$digest")"
-    printf '{"event":"%s","value":"%s","digest":"%s"}\n' "$tag" "$value" "$digest" >> "$STATE/rtmr3-events.log"
-  }
-  record "kuno/v1/rtmr3/image" "$image_digest"
-  for root in "${sorted_roots[@]}"; do
-    [ -n "$root" ] && record "kuno/v1/rtmr3/weights" "$root"
+    printf '{"event":"%s","value":"%s","digest":"%s"}\n' "${event_tags[$i]}" "${event_values[$i]}" "$digest" >> "$STATE/rtmr3-events.log"
   done
   [ "$(read_rtmr3)" = "$expected" ] || die "RTMR3 does not equal the replayed events"
   printf '%s\n' "$expected" > "$STATE/rtmr3.expected"
   log "RTMR3 = $expected"
 fi
 
+# ---- the worker image disk: open with the measured root hash, mount read-only, check it holds the measured image
+open_verity kuno-image "$image_root" "$image_size"
+mkdir -p "$IMAGE_MOUNT"
+mountpoint -q "$IMAGE_MOUNT" || mount -t squashfs -o ro,nodev,nosuid,noexec /dev/mapper/kuno-image "$IMAGE_MOUNT" \
+  || die "cannot mount the worker image disk"
+config_digest="$(check_image "$IMAGE_TAR" "$image_digest")"
+
 # ---- weights: open with the measured root hashes, mount read-only
 for i in "${!names[@]}"; do
-  name="${names[$i]}"; device="/dev/disk/by-id/virtio-kuno-w-$name"; mapped="kuno-w-$name"
-  for _ in $(seq 1 100); do [ -b "$device" ] && break; sleep 0.1; done
-  [ -b "$device" ] || die "weights disk $device did not appear"
-  if [ ! -b "/dev/mapper/$mapped" ]; then
-    veritysetup open "$device" "$mapped" "$device" "${roots[$i]}" --hash-offset="${sizes[$i]}" \
-      || die "dm-verity refused weights image $name"
-  fi
+  name="${names[$i]}"
+  open_verity "kuno-w-$name" "${roots[$i]}" "${sizes[$i]}"
   mkdir -p "/models/$name"
-  mountpoint -q "/models/$name" || mount -o ro,nodev,nosuid "/dev/mapper/$mapped" "/models/$name"
+  mountpoint -q "/models/$name" || mount -o ro,nodev,nosuid "/dev/mapper/kuno-w-$name" "/models/$name"
 done
 
 # ---- GPUs: CDI spec for podman, then mark CC GPUs ready for workloads
@@ -194,7 +266,7 @@ else
 fi
 
 # ---- the workers
-podman load --quiet --input "$IMAGE_TAR" >/dev/null
+podman load --quiet --input "$IMAGE_TAR" >/dev/null || die "podman could not load the image disk's archive"
 [ "$(podman image inspect --format '{{.Id}}' "${config_digest#sha256:}")" = "${config_digest#sha256:}" ] \
   || die "the loaded image is not the measured one"
 
@@ -240,7 +312,7 @@ write_env() {
 # uid 0 inside the container only so it can create configfs-tsm report entries; no capabilities.
 run_args=(--network host --read-only --user 0:0
   --cap-drop all --security-opt no-new-privileges
-  --tmpfs /var/lib/kuno:rw,mode=0700 --tmpfs /tmp:rw,mode=1777
+  --tmpfs "/var/lib/kuno:rw,mode=0700" --tmpfs "/tmp:rw,mode=1777"
   --volume /sys/kernel/config:/sys/kernel/config:rw
   --volume /models:/models:ro
   --volume "$STATE/secrets:/run/secrets:ro")
