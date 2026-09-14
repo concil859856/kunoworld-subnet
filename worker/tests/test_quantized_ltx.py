@@ -92,7 +92,7 @@ class TappingPipeline:
 def test_the_class_precision_picks_the_loader_and_unlisted_classes_run_bf16():
     assert resolve_recipe(FAST, RTX5090)[0].precision == "fp8-cast"
     assert resolve_recipe(FAST, RTX4090)[0].components["transformer"].torchao_config == "Int8WeightOnlyConfig"
-    recipe, hardware = resolve_recipe(FAST, "C4.h200-sxm-141gb.x4.ulysses4")  # an H3 class on the same worker
+    recipe, hardware = resolve_recipe(FAST, "C4.h200-141gb.x4.ulysses4")  # an H3 class on the same worker
     assert recipe.precision == "bf16" and hardware is None
 
 

@@ -23,10 +23,11 @@ from kuno_protocol.turbo import is_candidate_profile_list
 
 from .audits import AuditOutcome, AuditPolicy, Auditor, CanaryRecord
 from .canaries import pick_prompt
+from .capacity import CapacityTracker
 from .collateral import CollateralGate
 from .open_tier import AdmissionTracker, TierPolicy, apply_tiers, fraud_penalties, open_tier_gpus
 from .ledger import DURATION_SLACK_S, EnclaveKey, LedgerAudit, audit_ledger, duration_bounds, enclave_keys
-from .scoring import MinerScore, compute_scores, hardware_conflicts, normalize
+from .scoring import CapacityCredit, MinerScore, compute_scores, hardware_conflicts, normalize
 from .usd_pay import UsdPay
 
 log = logging.getLogger("kuno.validator")
@@ -76,6 +77,7 @@ class Validator:
         tier_policy: TierPolicy | None = None,
         calibration: Calibration | None = None,
         pay: UsdPay | None = None,
+        capacity: CapacityTracker | None = None,
     ):
         if not api_key:
             raise ValueError("a validator API key is required: the gateway authenticates every validator read")
@@ -113,6 +115,11 @@ class Validator:
         self._stored_rate_card: dict | None = None
         # (now, window_s, switch) of the last score(), so USD pay prices exactly the round that was scored.
         self._scored: tuple[float, float, SwitchConfig] | None = None
+        # Capacity pay (capacity.py): verified runs of confidential-tier GPUs, the profiles each enclave's evidence
+        # claimed in our own challenges this round, and the capacity credit of the last score().
+        self.capacity = capacity or CapacityTracker()
+        self.enclave_profiles: dict[str, list[str]] = {}
+        self.last_capacity: CapacityCredit | None = None
         self.state_path = state_path
         self._load_state()
         # Step audits of this validator's own canaries: open a random denoising step and replay it (VERIFIED_MODE.md).
@@ -210,6 +217,7 @@ class Validator:
             e for e in self.enclaves()
             if e["status"] == "active" and not is_candidate_profile_list(list(e.get("profiles") or []))
         ]
+        self.enclave_profiles = {}
         pending: dict[str, tuple[dict, bytes]] = {}
         for enclave in enclaves:
             nonce = os.urandom(32)
@@ -234,6 +242,9 @@ class Validator:
                     elif verdict.ok and verdict.tier:
                         # Only our own verdicts decide an enclave's tier (rates, admission, the fraud rule).
                         self.enclave_tiers[verdict.enclave_id] = verdict.tier
+                    if verdict.ok:
+                        # The profiles the evidence claimed and the manifest approved: capacity pay splits GPU-time by them.
+                        self.enclave_profiles[verdict.enclave_id] = list(evidence.profiles)
                     verdicts[enclave["enclave_id"]] = verdict
                     del pending[challenge_id]
                 elif answer["status"] == "expired":
@@ -298,6 +309,29 @@ class Validator:
             if verdict.ok and hotkey and verdict.tier == OPEN:
                 counts[hotkey] = counts.get(hotkey, 0) + open_tier_gpus(self._feed.get(enclave_id, {}), needs)
         return counts
+
+    def record_capacity(self, verdicts: dict[str, Verdict], now: float, window_s: float) -> None:
+        """Checks for capacity pay (capacity.py): every GPU identity our own challenges verified on the confidential tier.
+
+        Open-tier GPUs are never attested, only reported, and GPUs counted without an identity can't be told apart,
+        so neither is checked. Gates are applied when the credit is scored, like any other work in the window.
+        """
+        checks: list[tuple[str, str, list[str]]] = []
+        for enclave_id, verdict in verdicts.items():
+            hotkey = self._hotkeys.get(enclave_id)
+            if not verdict.ok or not hotkey or verdict.tier == OPEN:
+                continue
+            profiles = self.enclave_profiles.get(enclave_id)
+            if profiles is None:  # a verdict from outside check_enclaves (tools, tests): the feed's profile list
+                profiles = list(self._feed.get(enclave_id, {}).get("profiles") or [])
+            checks.extend((hotkey, token, profiles) for token in sorted(verdict.hardware_tokens("gpu")))
+        self.capacity.record(checks, now, window_s)
+
+    def served_families(self, profile_ids: list[str], switch: SwitchConfig) -> list[str]:
+        """The families an enclave's GPU-time is split over: those of its profiles the switch has on."""
+        return sorted({
+            self.profiles[p].family for p in profile_ids if p in self.profiles and switch.profile_enabled(self.profiles[p])
+        })
 
     def enclave_tier(self, enclave_id: str | None) -> str | None:
         """The tier this validator verified itself, else what the gateway's feed says; None when neither knows."""
@@ -519,12 +553,19 @@ class Validator:
             open_gpus = {hotkey: count for hotkey, count in self.open_tier_gpus(verdicts).items() if hotkey in attested}
             for hotkey, reasons in self.collateral.penalties(gpus, now, open_gpus).items():
                 penalties.setdefault(hotkey, []).extend(reasons)
+        self.record_capacity(verdicts, now, window_s)
         self._save_state()
         switch = self.switch()
         self._scored = (now, window_s, switch)
+        # Capacity pay: verified GPU-time of qualified runs, split over the families the switch has on; compute_scores
+        # gates and caps it, and blends it in only when the switch pays for capacity.
+        gpu_seconds = self.capacity.gpu_seconds(
+            now, window_s, switch.capacity_min_uptime_s, lambda profile_ids: self.served_families(profile_ids, switch)
+        )
+        self.last_capacity = CapacityCredit(gpu_seconds)
         return compute_scores(
             audit.entries, attested, self.profiles, switch, now, window_s,
-            penalties=penalties, flags=flags, tier_rates=self.tier_policy.rates(),
+            penalties=penalties, flags=flags, tier_rates=self.tier_policy.rates(), capacity=self.last_capacity,
         )
 
     def step(self, canary_profiles: list[str] | None = None, standard_canary_profiles: list[str] | None = None) -> dict[str, float]:
@@ -545,13 +586,20 @@ class Validator:
                 miner.hotkey, miner.score, miner.succeeded, miner.failed, "; ".join(miner.reasons),
                 f" [flags: {'; '.join(miner.flags)}]" if miner.flags else "",
             )
+        usd = self.pay is not None and self.pay.policy.usd
+        for family, ready in sorted((self.last_capacity.families if self.last_capacity is not None else {}).items()):
+            log.info(
+                "capacity %s: %.2f verified GPUs on average over the window for a target of %d (utilization %.2f, credit scale %.3f)%s",
+                family, ready.average_gpus, ready.target, ready.utilization, ready.scale,
+                "" if usd else f"; {ready.blend:.3f} of the family's split paid for capacity",
+            )
         if self.pay is not None and self.pay.policy.usd and self._scored is not None:
             # USD-denominated pay: the same gates, with work priced by the owner-signed rate card. PayUnavailable
             # propagates, so the caller leaves the previous weights in place.
             now, window_s, switch = self._scored
             entries = self.last_audit.entries if self.last_audit is not None else []
             try:
-                return self.pay.weights(scores, entries, self.profiles, switch, now, window_s)
+                return self.pay.weights(scores, entries, self.profiles, switch, now, window_s, self.last_capacity)
             finally:
                 self._save_state()
         return normalize(scores)
@@ -582,6 +630,8 @@ class Validator:
         if self.collateral is not None and state.get("collateral"):
             self.collateral.load(state["collateral"])
         self.admission.load(state.get("admission") or {})
+        # Verified GPU runs for capacity pay, so a restart doesn't restart every GPU's uptime.
+        self.capacity.load(state.get("capacity"))
         self.enclave_tiers = {k: v for k, v in (state.get("tiers") or {}).items() if isinstance(v, str)}
         # Kept even when USD pay is off, so switching modes back and forth can't roll the accepted card back.
         self._stored_rate_card = state.get("rate_card") if isinstance(state.get("rate_card"), dict) else None
@@ -601,6 +651,7 @@ class Validator:
             "admission": self.admission.dump(),
             "tiers": self.enclave_tiers,
             "rate_card": (self.pay.dump() if self.pay is not None else None) or self._stored_rate_card,
+            "capacity": self.capacity.dump(),
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")

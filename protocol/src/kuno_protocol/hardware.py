@@ -19,9 +19,13 @@ Where each identity comes from:
                        permanent per manufactured device) claim of each GPU's EAT, as issued
                        in NRAS's signed detached tokens or NVIDIA's nvattest claims after the
                        device certificate chain verified to NVIDIA's root.
+  nvswitch / NVIDIA    The `ueid` claim of each NVSwitch's EAT, from the same verifiers. Only a
+                       Protected PCIe (Hopper multi-GPU) VM holds its NVSwitches, and every
+                       enclave in that VM attests all of them, so two enclaves of one hotkey
+                       share switch identities while their GPUs stay disjoint.
   mock                 A simulated platform id inside the signed mock quote body and simulated
-                       GPU ueids inside mock GPU evidence (bound to that quote by REPORTDATA),
-                       so development networks exercise the same registry paths.
+                       GPU and NVSwitch ueids inside mock GPU evidence (bound to that quote by
+                       REPORTDATA), so development networks exercise the same registry paths.
 
 Raw identifiers are never published. Each is turned into a token with a keyed hash under a
 protocol-wide salt, so every gateway and validator derives the same token for the same
@@ -38,8 +42,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
-HardwareKind = Literal["cpu_platform", "gpu"]
-HARDWARE_KINDS: tuple[str, ...] = ("cpu_platform", "gpu")
+HardwareKind = Literal["cpu_platform", "gpu", "nvswitch"]
+HARDWARE_KINDS: tuple[str, ...] = ("cpu_platform", "gpu", "nvswitch")
 TOKEN_SALT = b"kuno/v1/hardware-id"
 TOKEN_PREFIX = "hw1"
 
@@ -207,5 +211,11 @@ def mock_platform_id(machine_id: str) -> str:
     return hashlib.sha256(b"kuno-mock/platform/" + machine_id.encode()).hexdigest()
 
 
-def mock_gpu_ueids(machine_id: str, count: int) -> list[str]:
-    return [hashlib.sha256(f"kuno-mock/gpu/{machine_id}/{index}".encode()).hexdigest() for index in range(count)]
+def mock_gpu_ueids(machine_id: str, count: int, indices: Iterable[int] | None = None) -> list[str]:
+    """Simulated GPU ueids: the machine's GPUs 0..count-1, or the given GPU indices (one worker's group)."""
+    chosen = list(range(count)) if indices is None else list(indices)
+    return [hashlib.sha256(f"kuno-mock/gpu/{machine_id}/{index}".encode()).hexdigest() for index in chosen]
+
+
+def mock_nvswitch_ueids(machine_id: str, count: int) -> list[str]:
+    return [hashlib.sha256(f"kuno-mock/nvswitch/{machine_id}/{index}".encode()).hexdigest() for index in range(count)]

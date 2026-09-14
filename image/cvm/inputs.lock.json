@@ -43,10 +43,58 @@
     "driver_version": "595.91.07",
     "run_url": "https://us.download.nvidia.com/tesla/595.91.07/NVIDIA-Linux-x86_64-595.91.07.run",
     "run_sha256": "ca23c88dd24b07a191644e1e11cfb7bcdd7537305749af40f980018b095e6313",
-    "nvattest_revision": "9d12801cea8a198ea0f29640dfaf8a4017c841c5",
     "container_toolkit_revision": "c748619c592030519361274a2fdd43f2c2ced73a",
     "note": "version and hashes from dstack; the download URL follows NVIDIA's data-center layout and is unverified",
-    "from_dstack": true
+    "from_dstack": true,
+    "fabricmanager": {
+      "url": "https://developer.download.nvidia.com/compute/nvidia-driver/redist/fabricmanager/linux-x86_64/fabricmanager-linux-x86_64-595.91.07-archive.tar.xz",
+      "sha256": "c91cd6e2fb845a4554d50e061974ebc80f35034f9655e348908783a02e87ddb6",
+      "note": "Protected PCIe runs Fabric Manager in the guest. The same sha256 is in NVIDIA's redistrib_595.91.07.json and dstack's versions.env, and a download on 2026-09-14 matched it",
+      "from_dstack": true
+    },
+    "nscq": {
+      "url": "https://developer.download.nvidia.com/compute/nvidia-driver/redist/libnvidia_nscq/linux-x86_64/libnvidia_nscq-linux-x86_64-595.91.07-archive.tar.xz",
+      "sha256": "86fbe59adef7696b2364ecba50d928d3e4b266113fe155cc6461387d9ba462dd",
+      "note": "NVSwitch state and evidence for Protected PCIe. The same sha256 is in NVIDIA's redistrib_595.91.07.json and dstack's versions.env, and a download on 2026-09-14 matched it",
+      "from_dstack": true
+    },
+    "nvattest": {
+      "version": "2026.06.09",
+      "repository": "https://github.com/NVIDIA/attestation-sdk",
+      "revision": "9d12801cea8a198ea0f29640dfaf8a4017c841c5",
+      "ocsp_freshness_patch": {
+        "url": "https://raw.githubusercontent.com/Dstack-TEE/dstack/44dd0fc8a6f392685ebc5ccfb206022189e5eed9/os/yocto/layers/meta-nvidia/recipes-graphics/nvattest/files/0001-validate-ocsp-response-freshness.patch",
+        "sha256": "23e6b842096dd04c3533dc2a38493b7fe33823702424919f3769f5f3cc1e3687"
+      },
+      "pin_fetchcontent_patch": {
+        "url": "https://raw.githubusercontent.com/Dstack-TEE/dstack/44dd0fc8a6f392685ebc5ccfb206022189e5eed9/os/mkosi/components/nvattest/patches/0001-pin-fetchcontent-inputs.patch",
+        "sha256": "b0bcc413d8b3459ba11746ba9ae3c6304b3bf5591f45ba139d02fd5ea9c39628"
+      },
+      "regorus_ffi_cargo_lock": {
+        "url": "https://raw.githubusercontent.com/Dstack-TEE/dstack/44dd0fc8a6f392685ebc5ccfb206022189e5eed9/os/yocto/layers/meta-nvidia/recipes-graphics/nvattest/files/regorus-ffi-Cargo.lock",
+        "sha256": "e4c93ba24a9911dbd118fba456e087d4bb5c0503acacc70f7d5244afb87ceb4f"
+      },
+      "note": "NVIDIA's Attestation SDK CLI, run by NVIDIA's PPCIe verifier in the guest; built as dstack's nvattest component builds it, with dstack's patches and Cargo.lock (Apache-2.0) hashed from downloads on 2026-09-14",
+      "from_dstack": true
+    }
+  },
+  "ppcie_verifier": {
+    "note": "NVIDIA's Protected PCIe verifier, run by kuno-app with the root filesystem's python3 (Debian python3-cryptography, python3-ecdsa, python3-prettytable). Installed without its declared dependencies, most of which are lint and test tools: only the packages it imports that Debian lacks. Hashes are PyPI's; downloads on 2026-09-14 matched them",
+    "nv_ppcie_verifier": {
+      "version": "2.0.0",
+      "url": "https://files.pythonhosted.org/packages/71/30/db8f3636cd3225e95a17b2acaecee35bcc171cb0278d280c6a08e2ce38d2/nv_ppcie_verifier-2.0.0-py3-none-any.whl",
+      "sha256": "bfe171cd862b034d78588231f31cea25138dfa150b1183b74e92a1b304419e02"
+    },
+    "nvidia_ml_py": {
+      "version": "12.575.51",
+      "url": "https://files.pythonhosted.org/packages/db/24/552ebea28f0570b9e65e62b50287a273804c9f997cc1c2dcd4e2d64b9e7d/nvidia_ml_py-12.575.51-py3-none-any.whl",
+      "sha256": "eb8641800d98ce40a22f479873f34b482e214a7e80349c63be51c3919845446e"
+    },
+    "timeout_decorator": {
+      "version": "0.5.0",
+      "url": "https://files.pythonhosted.org/packages/80/f8/0802dd14c58b5d3d72bb9caa4315535f58787a1dc50b81bbbcaaa15451be/timeout-decorator-0.5.0.tar.gz",
+      "sha256": "6a2f2f58db1c5b24a2cc79de6345760377ad8bdc13813f5265f6c3e63d16b3d7"
+    }
   },
   "worker_image": {
     "build": "image/build.sh",

@@ -11,6 +11,7 @@ from pathlib import Path
 from kuno_protocol.canonical import b64d
 from kuno_protocol.policy import policy_from_env
 
+from .capacity import CapacityTracker
 from .collateral import CollateralGate
 from .open_tier import TierPolicy
 from .usd_pay import PayUnavailable, UsdPay
@@ -76,6 +77,12 @@ def main() -> None:
         parser.error(str(exc))
     if pay is not None and args.netuid is None:
         parser.error("KUNO_PAY_MODE=usd prices work against the subnet's emission, which is read from the chain: pass --netuid")
+    # Capacity pay (capacity.py): a GPU's verified run breaks after KUNO_CAPACITY_MAX_GAP_S without a successful check
+    # (default two round intervals).
+    try:
+        capacity = CapacityTracker.from_env(env, args.interval)
+    except ValueError as exc:
+        parser.error(str(exc))
     validator = Validator(
         env.get("KUNO_GATEWAY_URL", "http://127.0.0.1:8080"),
         env["KUNO_VALIDATOR_API_KEY"],
@@ -87,6 +94,7 @@ def main() -> None:
         tier_policy=TierPolicy.from_env(env),
         calibration=calibration,
         pay=pay,
+        capacity=capacity,
     )
 
     turbo = None

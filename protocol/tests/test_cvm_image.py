@@ -5,7 +5,8 @@
 * RTMR3 events, identical in Python and in the guest agent's shell;
 * deterministic root filesystem, initrd and weights packing;
 * golden manifest entries: built, signed with kuno-devkit, parsed under the production policy;
-* script syntax, lock and shape files, and the CI job's no-real-keys guarantees.
+* script syntax, lock and shape files, and the CI job's no-real-keys guarantees;
+* several TDs on one server: vsock CIDs and state directories, host NUMA pinning, and plan-host.py on a fake sysfs.
 """
 
 from __future__ import annotations
@@ -201,7 +202,7 @@ def test_measure_computes_every_register_and_takes_rtmr0_from_an_agreeing_dstack
     registers = result["registers"]
     assert registers["rtmr0"] is None
     kernel, initrd = (image_dir / "bzImage").read_bytes(), b"initrd bytes"
-    assert registers["rtmr1"] == measure.measure_log(measure.rtmr1_log(kernel, len(initrd), 256 << 30, True)).hex()
+    assert registers["rtmr1"] == measure.measure_log(measure.rtmr1_log(kernel, len(initrd), 224 << 30, True)).hex()
     cmdline = json.loads((image_dir / "metadata.json").read_text())["cmdline"]
     assert registers["rtmr2"] == measure.measure_log(measure.rtmr2_log(cmdline, initrd)).hex()
     rtmr3 = load("expected_rtmr3")
@@ -212,7 +213,7 @@ def test_measure_computes_every_register_and_takes_rtmr0_from_an_agreeing_dstack
     (tmp_path / "acpi.json").write_text(json.dumps(acpi))
     assert measure.main(args + ["--acpi-hashes", str(tmp_path / "acpi.json"), "--out", str(out)]) == 0
     sections = measure.parse_tdvf((image_dir / "ovmf.fd").read_bytes())
-    expected_rtmr0 = measure.measure_log(measure.rtmr0_log(measure.measure_td_hob(sections, 256 << 30), measure.AcpiHashes.from_json(acpi)))
+    expected_rtmr0 = measure.measure_log(measure.rtmr0_log(measure.measure_td_hob(sections, 224 << 30), measure.AcpiHashes.from_json(acpi)))
     assert json.loads(out.read_text())["registers"]["rtmr0"] == expected_rtmr0.hex()
 
     agreeing = {k: registers[k] for k in ("mrtd", "rtmr1", "rtmr2")} | {"rtmr0": "44" * 48}
@@ -344,6 +345,35 @@ def test_the_lock_file_pins_every_input_but_the_release_image_and_shapes_name_re
         load("measure").Shape.from_json(shape)
 
 
+def test_every_shape_is_the_vm_of_one_confidential_class_in_each_profile_it_serves():
+    catalog = load_profiles()
+    shapes = {s["id"]: s for s in json.loads((CVM / "shapes.json").read_text())["shapes"]}
+    for shape in shapes.values():
+        tier, model, size = shape["id"].split(".")
+        for profile in shape["profiles"]:
+            per_worker = catalog[profile].gpus_per_worker
+            # A one-worker shape boots its own class (c2.h200-141gb.x1 boots C2.h200-141gb.x1); a whole-server shape runs
+            # num_gpus // gpus_per_worker workers of the profile's class (c8.h200-141gb.x8 runs two C4.h200-141gb.x4.*).
+            one_worker = shape["num_gpus"] == per_worker
+            prefix = f"{tier.upper()}.{model}.{size}" if one_worker else f"{catalog[profile].hardware_class}.{model}.x{per_worker}"
+            classes = [h for h in catalog[profile].verified.hardware_classes if h.id.startswith(prefix)]
+            assert len(classes) == 1, (shape["id"], profile)
+            assert classes[0].comparison == "bitwise" and not classes[0].dev and classes[0].gpu_count == per_worker
+            assert shape["num_gpus"] % per_worker == 0
+    for gpu, vram, switches, mode in (("h200", 141, 4, "ppcie"), ("b200", 180, 0, "mpt"), ("b300", 288, 0, "mpt")):
+        shape = shapes[f"c8.{gpu}-{vram}gb.x8"]
+        assert (shape["num_gpus"], shape["num_nvswitches"], shape["gpu_mode"]) == (8, switches, mode)
+        assert shape["profiles"] == ["h3-turbo", "h3", "h3-reference"]
+    # NVIDIA supports no 4-GPU confidential VM on an HGX baseboard: Protected PCIe takes all 8 GPUs and 4 NVSwitches.
+    assert not [s for s in shapes if s.startswith("c4.")]
+    for gpu, vram in (("b200", 180), ("b300", 288)):
+        shape = shapes[f"c2.{gpu}-{vram}gb.x1"]
+        assert shape["num_gpus"] == 1 and shape["profiles"] == ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k"]
+        for profile in shape["profiles"]:
+            hardware = catalog[profile].verified.hardware_class(f"C2.{gpu}-{vram}gb.x1")
+            assert hardware.tier == "C2" and gpu.upper() in hardware.gpu_sku and catalog[profile].min_vram_gb <= vram
+
+
 # ------------------------------------------------------------------ publishing
 
 
@@ -427,7 +457,11 @@ def test_a_live_quote_is_compared_register_by_register(publish, tmp_path):
 # ------------------------------------------------------------------ launching a shape
 
 
-def test_the_launch_command_has_exactly_the_devices_the_rtmr0_model_assumes(tmp_path):
+BASH = shutil.which("bash") or "bash"
+
+
+def launch_release(tmp_path: Path) -> tuple[Path, Path, str]:
+    """A release directory and an appended-layout weights prefix holding just what launch-td.sh checks."""
     release = tmp_path / "release"
     release.mkdir()
     for name in ("ovmf.fd", "bzImage", "initramfs.cpio.gz", "rootfs.img.verity"):
@@ -438,6 +472,15 @@ def test_the_launch_command_has_exactly_the_devices_the_rtmr0_model_assumes(tmp_
     prefix.parent.mkdir()
     for suffix, content in (("img", "x"), ("roothash", "cd" * 32 + "\n"), ("size", "8192\n")):
         Path(f"{prefix}.{suffix}").write_text(content)
+    return release, prefix, cmdline
+
+
+def launch(release: Path, shape: str, *args, env=None, check=True):
+    return subprocess.run([BASH, str(CVM / "launch-td.sh"), str(release), shape, *map(str, args)], capture_output=True, text=True, check=check, env={**os.environ, **(env or {})})
+
+
+def test_the_launch_command_has_exactly_the_devices_the_rtmr0_model_assumes(tmp_path):
+    release, prefix, cmdline = launch_release(tmp_path)
     base = ["bash", str(CVM / "launch-td.sh"), str(release), "c2.h200-141gb.x1"]
     out = subprocess.run(base + ["--gpu", "0000:17:00.0", "--weights", f"ltx-2.5={prefix}"], capture_output=True, text=True, check=True).stdout
     args = shlex.split(out)
@@ -446,12 +489,249 @@ def test_the_launch_command_has_exactly_the_devices_the_rtmr0_model_assumes(tmp_
     kinds = [d.split(",")[0] for d in devices]
     assert kinds == ["virtio-blk-pci", "virtio-blk-pci", "virtio-blk-pci", "virtio-net-pci", "vhost-vsock-pci", "pcie-root-port", "vfio-pci"]
     assert "serial=kuno-w-ltx-2.5" in devices[2] and "host=0000:17:00.0" in devices[6]
-    assert (args[args.index("-smp") + 1], args[args.index("-m") + 1]) == ("24", f"{256 * 1024}M")
+    assert (args[args.index("-smp") + 1], args[args.index("-m") + 1]) == ("24", f"{224 * 1024}M")
+    assert "q35-pcihost.pci-hole64-size=0x80000000000" in args  # the shape's 8 TiB hole, as dstack-mr is told
     assert "confidential-guest-support=tdx" in args[args.index("-machine") + 1]
     assert args[-2:] == ["-append", cmdline]
     assert (release / "launch-c2.h200-141gb.x1" / "weights.txt").read_text() == f"ltx-2.5 {'cd' * 32} 8192\n"
     refused = subprocess.run(base + ["--weights", f"ltx-2.5={prefix}"], capture_output=True, text=True)
     assert refused.returncode != 0 and "needs 1 GPU(s)" in refused.stderr
+
+
+# ------------------------------------------------------------------ several TDs on one server
+
+
+HGX_GPUS = ("0000:18:00.0", "0000:2a:00.0", "0000:3a:00.0", "0000:5d:00.0", "0000:9a:00.0", "0000:ab:00.0", "0000:ba:00.0", "0000:db:00.0")
+NVSWITCHES = ("0000:07:00.0", "0000:08:00.0", "0000:09:00.0", "0000:0a:00.0")
+
+
+def pci_device(address: str, numa_node: int = 0, *, vendor="0x10de", klass="0x030200", driver="vfio-pci", iommu_group=None) -> dict:
+    """A B200 in a 3D-controller slot unless told otherwise; its IOMMU group is its bus number."""
+    group = str(int(address[5:7], 16)) if iommu_group is None else iommu_group
+    return {"address": address, "vendor": vendor, "device": "0x2901", "class": klass, "numa_node": numa_node, "driver": driver, "iommu_group": group}
+
+
+def fake_sysfs(root: Path, *, nodes: dict[int, tuple[str, int]], devices: list[dict]) -> Path:
+    """Just what launch-td.sh --numa-node and plan-host.py read. nodes: {id: (cpulist, GiB)}."""
+    system = root / "devices" / "system"
+    (system / "cpu").mkdir(parents=True)
+    (system / "cpu" / "online").write_text(",".join(cpulist for cpulist, _ in nodes.values()) + "\n")
+    for node, (cpulist, size) in nodes.items():
+        path = system / "node" / f"node{node}"
+        path.mkdir(parents=True)
+        (path / "cpulist").write_text(cpulist + "\n")
+        (path / "meminfo").write_text(f"Node {node} MemTotal:       {size << 20} kB\nNode {node} MemFree:        {size << 19} kB\n")
+    for device in devices:
+        path = root / "bus" / "pci" / "devices" / device["address"]
+        path.mkdir(parents=True)
+        for name in ("vendor", "device", "class", "numa_node"):
+            (path / name).write_text(f"{device[name]}\n")
+        for link, target in (("driver", "../../../bus/pci/drivers/{}"), ("iommu_group", "../../../kernel/iommu_groups/{}")):
+            if device[link] is not None:
+                (path / link).symlink_to(target.format(device[link]))
+    return root
+
+
+def two_socket_host(root: Path, *, threads_per_node: int = 112, gib_per_node: int = 1000, overrides: dict | None = None, nvswitches: int = 1) -> Path:
+    """An HGX server: two sockets, four GPUs on each, plus NVSwitches (4 on an HGX H200 board) and a NIC that are not GPUs."""
+    devices = [pci_device(a, n // 4, **(overrides or {}).get(a, {})) for n, a in enumerate(HGX_GPUS)]
+    devices += [pci_device(a, 0, klass="0x068000", **(overrides or {}).get(a, {})) for a in NVSWITCHES[:nvswitches]]  # NVSwitch: a bridge
+    devices.append(pci_device("0000:19:00.0", 0, vendor="0x8086", klass="0x020000", driver="ice"))
+    half = threads_per_node // 2
+    cpulists = [f"{i * half}-{(i + 1) * half - 1},{(i + 2) * half}-{(i + 3) * half - 1}" for i in (0, 1)]
+    return fake_sysfs(root, nodes={0: (cpulists[0], gib_per_node), 1: (cpulists[1], gib_per_node)}, devices=devices)
+
+
+def fake_numactl(bin_dir: Path, log: Path) -> str:
+    """A PATH entry whose numactl records its arguments instead of running anything."""
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "numactl").write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(str(log))}\n")
+    (bin_dir / "numactl").chmod(0o755)
+    return f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+
+
+@pytest.fixture(scope="module")
+def plan_host():
+    return load("plan-host")
+
+
+def test_each_instance_gets_its_own_vsock_cid_and_state_but_the_same_devices(tmp_path):
+    release, prefix, _ = launch_release(tmp_path)
+    shape, common = "c2.b200-180gb.x1", ["--gpu", HGX_GPUS[0], "--weights", f"ltx-2.5={prefix}"]
+    default = shlex.split(launch(release, shape, *common).stdout)
+    fifth = shlex.split(launch(release, shape, *common, "--instance", "5").stdout)
+    assert "vhost-vsock-pci,guest-cid=3" in default and "vhost-vsock-pci,guest-cid=8" in fifth
+    state = release / f"launch-{shape}.5"
+    assert (state / "data.img").exists() and (state / "weights.txt").read_text() == (release / f"launch-{shape}" / "weights.txt").read_text()
+    # Only the CID and the state paths differ: the same devices, so the same ACPI tables and one measurement.
+    assert [a.replace(f"launch-{shape}.5/", f"launch-{shape}/").replace("guest-cid=8", "guest-cid=3") for a in fifth] == default
+    for bad in ("-1", "08", "100", "two"):
+        refused = launch(release, shape, *common, "--instance", bad, check=False)
+        assert refused.returncode != 0 and "--instance must be an integer from 0 to 99" in refused.stderr
+
+
+def test_numa_pinning_wraps_qemu_on_the_host_and_leaves_the_guest_command_unchanged(tmp_path):
+    release, prefix, _ = launch_release(tmp_path)
+    shape, gpu = "c2.b200-180gb.x1", HGX_GPUS[4]
+    sysfs = two_socket_host(tmp_path / "sys")
+    log = tmp_path / "numactl.argv"
+    env = {"PATH": fake_numactl(tmp_path / "bin", log), "KUNO_SYSFS_ROOT": str(sysfs)}
+    common = ["--gpu", gpu, "--weights", f"ltx-2.5={prefix}"]
+    flat = shlex.split(launch(release, shape, *common).stdout)
+    assert shlex.split(launch(release, shape, *common, "--numa-node", "auto", env=env).stdout) == ["numactl", "--cpunodebind=1", "--membind=1", *flat]
+    assert shlex.split(launch(release, shape, *common, "--numa-node", "0", env=env).stdout)[:3] == ["numactl", "--cpunodebind=0", "--membind=0"]
+    launch(release, shape, *common, "--numa-node", "auto", "--qemu", "/opt/qemu/bin/qemu-system-x86_64", "--run", env=env)
+    assert log.read_text().splitlines()[:3] == ["--cpunodebind=1", "--membind=1", "/opt/qemu/bin/qemu-system-x86_64"]
+
+    (sysfs / "bus" / "pci" / "devices" / gpu / "numa_node").write_text("-1\n")
+    for extra, message in ((["auto"], "reports no NUMA node (-1)"), (["2"], "this host has no NUMA node 2"), (["one"], "must be a node number or auto")):
+        refused = launch(release, shape, *common, "--numa-node", *extra, env=env, check=False)
+        assert refused.returncode != 0 and message in refused.stderr, refused.stderr
+    no_numactl = tmp_path / "no-numactl"
+    no_numactl.mkdir()
+    (no_numactl / "dirname").symlink_to(shutil.which("dirname"))
+    refused = launch(release, shape, *common, "--numa-node", "0", env={"PATH": str(no_numactl), "KUNO_SYSFS_ROOT": str(sysfs)}, check=False)
+    assert refused.returncode != 0 and "--numa-node needs numactl on the host" in refused.stderr
+
+
+def test_plan_host_puts_one_td_on_each_gpu_pinned_to_its_node_and_the_commands_launch(plan_host, measure, tmp_path, capsys):
+    sysfs = two_socket_host(tmp_path / "sys")
+    host = plan_host.probe(sysfs)
+    assert (host.cpus, host.memory, [(n.id, n.cpus, n.memory) for n in host.nodes]) == (224, 2000 << 30, [(0, 112, 1000 << 30), (1, 112, 1000 << 30)])
+    assert [g.address for g in host.gpus] == list(HGX_GPUS)  # not the NVSwitch, not the NIC
+    assert host.gpus[4] == plan_host.Gpu("0000:9a:00.0", "0x2901", 1, "154", "vfio-pci")
+    shape = measure.load_shape(f"{CVM / 'shapes.json'}:c2.b200-180gb.x1")
+    instances = plan_host.plan(host, shape)
+    assert [(i.instance, i.gpu, i.numa_node, i.guest_cid) for i in instances] == [(n, a, n // 4, 3 + n) for n, a in enumerate(HGX_GPUS)]
+    assert instances[5].state_dir == "launch-c2.b200-180gb.x1.5"
+    assert [i.numa_node for i in plan_host.plan(host, shape, pin=False)] == [None] * 8
+    assert [i.gpu for i in plan_host.plan(host, shape, gpus=[HGX_GPUS[7], HGX_GPUS[0]])] == [HGX_GPUS[0], HGX_GPUS[7]]
+
+    release, prefix, _ = launch_release(tmp_path)
+    argv = ["--shape", shape.id, "--sysfs", str(sysfs), "--release", str(release), "--", "--weights", f"ltx-2.5={prefix}"]
+    assert plan_host.main(argv) == 0
+    commands = [shlex.split(line) for line in capsys.readouterr().out.splitlines() if not line.startswith("#")]
+    assert len(commands) == 8 and commands[5][:7] == [str(CVM / "launch-td.sh"), str(release), shape.id, "--instance", "5", "--gpu", HGX_GPUS[5]]
+    env = {**os.environ, "PATH": fake_numactl(tmp_path / "bin", tmp_path / "log"), "KUNO_SYSFS_ROOT": str(sysfs)}
+    qemu = shlex.split(subprocess.run([BASH, *commands[5]], capture_output=True, text=True, check=True, env=env).stdout)
+    assert qemu[:3] == ["numactl", "--cpunodebind=1", "--membind=1"] and "vhost-vsock-pci,guest-cid=8" in qemu
+    assert (release / "launch-c2.b200-180gb.x1.5" / "serial.log").parent.is_dir()
+
+    assert plan_host.main(argv[:4] + ["--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert [i["guest_cid"] for i in document["instances"]] == list(range(3, 11))
+    assert document["instances"][0]["command"][-4:] == ["--gpu", HGX_GPUS[0], "--numa-node", "0"] and document["host"]["cpus"] == 224
+
+
+def test_plan_host_refuses_gpus_off_vfio_and_tds_that_do_not_fit(plan_host, measure, tmp_path, capsys):
+    b200 = measure.load_shape(f"{CVM / 'shapes.json'}:c2.b200-180gb.x1")
+    unbound = plan_host.probe(two_socket_host(tmp_path / "unbound", overrides={HGX_GPUS[0]: {"driver": "nvidia"}, HGX_GPUS[1]: {"driver": None}}))
+    with pytest.raises(plan_host.PlanError) as refused:
+        plan_host.plan(unbound, b200)
+    message = str(refused.value)
+    assert f"{HGX_GPUS[0]} needs vfio-pci but is bound to nvidia" in message and f"driverctl set-override {HGX_GPUS[0]} vfio-pci" in message
+    assert f"{HGX_GPUS[1]} needs vfio-pci but has no driver" in message and HGX_GPUS[2] not in message
+    with pytest.raises(plan_host.PlanError, match="0000:99:00.0 is not an NVIDIA GPU"):
+        plan_host.plan(unbound, b200, gpus=["0000:99:00.0"])
+
+    # 1024 GiB less the 64 GiB reserve holds four 192 GiB TDs with their 2 GiB overhead, not eight.
+    small = plan_host.probe(two_socket_host(tmp_path / "small", gib_per_node=512))
+    with pytest.raises(plan_host.PlanError, match=r"not enough memory: 8 TDs of c2\.b200-180gb\.x1 need 1552 GiB .*has 960 GiB after a reserve of 64 GiB; 4 fit"):
+        plan_host.plan(small, b200)
+    assert len(plan_host.plan(small, b200, gpus=[HGX_GPUS[i] for i in (0, 1, 4, 5)])) == 4
+    sysfs = two_socket_host(tmp_path / "cpus")
+    assert plan_host.main(["--shape", b200.id, "--sysfs", str(sysfs), "--host-cpus", "100"]) == 1
+    assert "plan-host: not enough CPUs: 8 TDs of c2.b200-180gb.x1 need 192 vCPUs, and the host has 92 after a reserve of 8; 3 fit" in capsys.readouterr().err
+
+    # Sub-NUMA clustering: four nodes, the host fits eight TDs but a node does not fit its four, and --membind is strict.
+    snc = fake_sysfs(tmp_path / "snc", nodes={i: (f"{56 * i}-{56 * i + 55}", 500) for i in range(4)}, devices=[pci_device(a, n // 4) for n, a in enumerate(HGX_GPUS)])
+    with pytest.raises(plan_host.PlanError, match="NUMA node 0 has 4 of these GPUs.*disable sub-NUMA clustering"):
+        plan_host.plan(plan_host.probe(snc), b200)
+    assert len(plan_host.plan(plan_host.probe(snc), b200, pin=False)) == 8
+
+    shared = plan_host.probe(two_socket_host(tmp_path / "shared", overrides={HGX_GPUS[1]: {"iommu_group": "24"}}))
+    with pytest.raises(plan_host.PlanError, match=f"{HGX_GPUS[0]}, {HGX_GPUS[1]} share IOMMU group 24"):
+        plan_host.plan(shared, b200)
+    with pytest.raises(plan_host.PlanError, match="plans single-GPU shapes"):
+        plan_host.plan(shared, measure.load_shape(f"{CVM / 'shapes.json'}:c8.h200-141gb.x8"))
+
+
+@pytest.mark.parametrize(("shape_id", "threads_per_node", "eight_fit"), [("c2.b200-180gb.x1", 112, True), ("c2.b300-288gb.x1", 128, True), ("c2.h200-141gb.x1", 112, True)])
+def test_eight_single_gpu_tds_fit_the_2tb_server_their_shape_is_sized_for(plan_host, measure, tmp_path, shape_id, threads_per_node, eight_fit):
+    # DGX B200 and DGX H200: 2 × 56 cores; DGX B300: 2 × 64 cores; all from 2 TB. At 224 GiB the H200 shape needs
+    # 8 × 226 = 1808 of the 1936 GiB left after the reserve, and 4 × 226 = 904 of each node's 968.
+    host = plan_host.probe(two_socket_host(tmp_path / "sys", threads_per_node=threads_per_node))
+    shape = measure.load_shape(f"{CVM / 'shapes.json'}:{shape_id}")
+    if eight_fit:
+        assert len(plan_host.plan(host, shape)) == 8
+    else:
+        with pytest.raises(plan_host.PlanError, match="not enough memory"):
+            plan_host.plan(host, shape)
+
+
+# ------------------------------------------------------------------ whole-server TDs (H3: two workers of four GPUs)
+
+
+def test_every_gpu_shape_pins_its_64_bit_pci_hole_and_its_gpu_mode_fits_its_topology(publish, measure):
+    for document in json.loads((CVM / "shapes.json").read_text())["shapes"]:
+        shape = measure.Shape.from_json(document)
+        assert shape.pci_hole64_size == 8 << 40 and "--pci-hole64-size" in shape.dstack_mr_args(), shape.id
+        gpu = publish.gpu_fields(document, document["profiles"])
+        assert gpu["gpu_mode"] == document["gpu_mode"] and gpu["nvswitches_per_enclave"] == shape.num_nvswitches
+        assert gpu["gpus_per_enclave"] == (4 if shape.num_gpus == 8 else 1)
+
+
+@pytest.mark.parametrize(("shape_id", "threads_per_node", "switches"), [("c8.h200-141gb.x8", 112, 4), ("c8.b200-180gb.x8", 112, 0), ("c8.b300-288gb.x8", 128, 0)])
+def test_a_whole_server_shape_is_one_td_with_every_gpu_and_its_nvswitches_in_dstack_vmms_order(plan_host, measure, tmp_path, capsys, shape_id, threads_per_node, switches):
+    sysfs = two_socket_host(tmp_path / "sys", threads_per_node=threads_per_node, nvswitches=4)
+    host = plan_host.probe(sysfs)
+    assert host.nvswitches and [s.address for s in host.nvswitches] == list(NVSWITCHES) and len(host.gpus) == 8
+    shape = measure.load_shape(f"{CVM / 'shapes.json'}:{shape_id}")
+    server = plan_host.plan_server(host, shape)
+    # Multi-GPU passthrough CC keeps the NVSwitches (and Fabric Manager) on the host even where the host shows them.
+    assert server.gpus == HGX_GPUS and server.nvswitches == NVSWITCHES[:switches] and server.state_dir == f"launch-{shape_id}"
+
+    release, prefix, _ = launch_release(tmp_path)
+    argv = ["--shape", shape_id, "--sysfs", str(sysfs), "--release", str(release), "--", "--weights", f"ltx-2.5={prefix}"]
+    assert plan_host.main(argv) == 0
+    out = capsys.readouterr().out
+    [command] = [shlex.split(line) for line in out.splitlines() if not line.startswith("#")]
+    assert ("--set-ppcie-mode=on" in out) == bool(switches) and "KUNO_GPU_GROUPS" in out
+    qemu = shlex.split(subprocess.run([BASH, *command], capture_output=True, text=True, check=True).stdout)
+    devices = [qemu[i + 1] for i, arg in enumerate(qemu) if arg == "-device"]
+    ports = [d for d in devices if d.startswith(("pcie-root-port", "vfio-pci"))]
+    assert [d.split("host=")[1].split(",")[0] for d in ports if d.startswith("vfio-pci")] == [*HGX_GPUS, *NVSWITCHES[:switches]]
+    assert [d.split("chassis=")[1] for d in ports if d.startswith("pcie-root-port")] == [str(n) for n in range(1, 9 + switches)]
+    assert all("bus=pcie.0" in d for d in ports if d.startswith("pcie-root-port"))
+    assert (qemu[qemu.index("-smp") + 1], qemu[qemu.index("-m") + 1]) == ("192", f"{1792 * 1024}M")
+    assert "q35-pcihost.pci-hole64-size=0x80000000000" in qemu and qemu[0] != "numactl"
+
+    assert plan_host.main(argv[:6] + ["--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["server"]["nvswitches"] == list(NVSWITCHES[:switches])
+
+
+def test_a_whole_server_td_needs_its_gpus_and_nvswitches_on_vfio_and_room_on_the_host(plan_host, measure, tmp_path):
+    h200 = measure.load_shape(f"{CVM / 'shapes.json'}:c8.h200-141gb.x8")
+    unbound = plan_host.probe(two_socket_host(tmp_path / "unbound", nvswitches=4, overrides={NVSWITCHES[2]: {"driver": "nvidia"}}))
+    with pytest.raises(plan_host.PlanError, match=rf"{NVSWITCHES[2]} needs vfio-pci but is bound to nvidia"):
+        plan_host.plan_server(unbound, h200)
+    one_switch = plan_host.probe(two_socket_host(tmp_path / "one"))
+    with pytest.raises(plan_host.PlanError, match=r"takes all 4 NVSwitches into the TD \(Protected PCIe\), but this host shows 1"):
+        plan_host.plan_server(one_switch, h200)
+    with pytest.raises(plan_host.PlanError, match="takes 8 GPUs into one TD, but 2 were chosen"):
+        plan_host.plan_server(plan_host.probe(two_socket_host(tmp_path / "chosen", nvswitches=4)), h200, gpus=list(HGX_GPUS[:2]))
+    small = plan_host.probe(two_socket_host(tmp_path / "small", nvswitches=4, gib_per_node=512))
+    with pytest.raises(plan_host.PlanError, match=r"not enough memory: c8\.h200-141gb\.x8 needs 1794 GiB .*has 960 GiB after a reserve of 64 GiB"):
+        plan_host.plan_server(small, h200)
+    with pytest.raises(plan_host.PlanError, match="has one GPU: plan it with plan"):
+        plan_host.plan_server(small, measure.load_shape(f"{CVM / 'shapes.json'}:c2.h200-141gb.x1"))
+
+    release, prefix, _ = launch_release(tmp_path)
+    gpus = [arg for gpu in HGX_GPUS for arg in ("--gpu", gpu)]
+    refused = launch(release, "c8.h200-141gb.x8", *gpus, "--nvswitch", NVSWITCHES[0], "--nvswitch", NVSWITCHES[1], "--weights", f"ltx-2.5={prefix}", check=False)
+    assert refused.returncode != 0 and "c8.h200-141gb.x8 needs 4 NVSwitch(es); got 2" in refused.stderr
+    refused = launch(release, "c8.b200-180gb.x8", *gpus, "--nvswitch", NVSWITCHES[0], "--weights", f"ltx-2.5={prefix}", check=False)
+    assert refused.returncode != 0 and "c8.b200-180gb.x8 needs 0 NVSwitch(es); got 1" in refused.stderr
 
 
 # ------------------------------------------------------------------ CI job

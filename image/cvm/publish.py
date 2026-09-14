@@ -16,7 +16,11 @@
         --measurements c2.h200-141gb.x1.json
 
 An entry is an `AllowedMeasurement` (platform "tdx", the worker image digest RTMR3 binds, the
-profiles the shape serves, MRTD and RTMR0–3). `entry` refuses measurements that are incomplete,
+profiles the shape serves, MRTD and RTMR0–3). A shape that names its `gpu_mode` (spt, ppcie or mpt)
+also gets the GPU fields every enclave's evidence must then show: that mode, `gpus_per_enclave` (the
+shape's profiles' common `gpus_per_worker`, which kuno-app's KUNO_GPU_GROUPS sizes worker groups to)
+and `nvswitches_per_enclave` (the shape's `num_nvswitches`: every worker in a Protected PCIe VM attests
+all of them). `entry` refuses measurements that are incomplete,
 came from an unpinned build or were not cross-checked with dstack-mr (`--dev` lifts the last two,
 for rehearsals), and a base manifest that trusts the simulated TEE. It never signs: the owner key
 stays with `kuno-devkit sign-manifest` on an offline machine.
@@ -74,12 +78,45 @@ def load_measurements(path: Path, *, dev: bool = False) -> dict:
     return document
 
 
-def shape_profiles(shapes_path: Path, shape_id: str) -> list[str]:
+def load_shape(shapes_path: Path, shape_id: str) -> dict:
     shapes = json.loads(Path(shapes_path).read_text())["shapes"]
     match = [s for s in shapes if s["id"] == shape_id]
     if len(match) != 1:
         raise PublishError(f"{shapes_path} has no shape {shape_id!r}")
-    return list(match[0].get("profiles") or [])
+    return match[0]
+
+
+def shape_profiles(shapes_path: Path, shape_id: str) -> list[str]:
+    return list(load_shape(shapes_path, shape_id).get("profiles") or [])
+
+
+# What NVIDIA's R595 Trusted Computing release notes allow per VM in each mode.
+GPU_MODE_TOPOLOGY = {
+    "spt": "one GPU and no NVSwitch",  # single GPU passthrough
+    "ppcie": "8 GPUs and 4 NVSwitches",  # HGX H100/H200 8-GPU, every GPU and switch in the VM
+    "mpt": "2 to 8 GPUs and no NVSwitch",  # HGX B200/B300; Fabric Manager and the switches stay on the host
+}
+
+
+def gpu_fields(shape: dict, profiles: list[str]) -> dict:
+    """The manifest entry's GPU fields for a shape; {} for a shape that names no gpu_mode."""
+    mode = shape.get("gpu_mode")
+    if mode is None:
+        return {}
+    gpus, switches = int(shape.get("num_gpus", 0)), int(shape.get("num_nvswitches", 0))
+    fits = {"spt": gpus == 1 and switches == 0, "ppcie": gpus == 8 and switches == 4, "mpt": 2 <= gpus <= 8 and switches == 0}
+    if mode not in fits:
+        raise PublishError(f"shape {shape['id']}: gpu_mode must be one of {', '.join(fits)}, not {mode!r}")
+    if not fits[mode]:
+        raise PublishError(f"shape {shape['id']}: {mode} mode needs {GPU_MODE_TOPOLOGY[mode]}; the shape has {gpus} GPU(s) and {switches} NVSwitch(es)")
+    catalog = load_profiles()
+    per_worker = {catalog[p].gpus_per_worker for p in profiles}
+    if len(per_worker) != 1:
+        raise PublishError(f"shape {shape['id']}: its profiles need different GPU counts per worker ({sorted(per_worker)})")
+    size = per_worker.pop()
+    if gpus % size:
+        raise PublishError(f"shape {shape['id']}: {gpus} GPU(s) do not split into workers of {size}")
+    return {"gpu_mode": mode, "gpus_per_enclave": size, "nvswitches_per_enclave": switches}
 
 
 def check_profiles(profiles: list[str]) -> list[str]:
@@ -108,12 +145,13 @@ def parse_model_digests(pairs: list[str]) -> dict[str, str]:
     return out
 
 
-def entry_for(document: dict, profiles: list[str]) -> AllowedMeasurement:
+def entry_for(document: dict, profiles: list[str], gpu: dict | None = None) -> AllowedMeasurement:
     return AllowedMeasurement(
         platform="tdx",
         image_digest=document["inputs"]["image_digest"],
         profiles=check_profiles(profiles),
         **{k: document["registers"][k] for k in REGISTERS},
+        **(gpu or {}),
     )
 
 
@@ -195,13 +233,16 @@ def main(argv: list[str] | None = None) -> int:
             documents = [load_measurements(p, dev=args.dev) for p in args.measurements]
             entries = []
             for path, document in zip(args.measurements, documents):
+                gpu: dict = {}
                 if args.shapes:
-                    profiles = shape_profiles(args.shapes, document["shape"])
+                    shape = load_shape(args.shapes, document["shape"])
+                    profiles = list(shape.get("profiles") or [])
+                    gpu = gpu_fields(shape, check_profiles(profiles))
                 elif args.profiles:
                     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
                 else:
                     raise PublishError("pass --shapes or --profiles")
-                entries.append(entry_for(document, profiles))
+                entries.append(entry_for(document, profiles, gpu))
             base = parse_manifest(args.base.read_text()) if args.base else None
             manifest = build_manifest(base, entries, parse_model_digests(args.model_digest), issued_at=args.issued_at, dev=args.dev)
             args.out.write_text(manifest.model_dump_json(indent=2) + "\n")

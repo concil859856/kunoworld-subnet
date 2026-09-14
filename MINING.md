@@ -19,9 +19,10 @@ reachability, then lists which profiles the machine can serve and what is missin
 
 | Profile | GPUs | VRAM per GPU | Notes |
 |---|---|---|---|
-| `ltx-2.5-fast`, `ltx-2.5-pro` | 1 | 80 GB | cheapest entry; an H100 80GB or H200 works |
-| `ltx-2.5-4k` | 1 | 141 GB | an H200 or a B200; the 96 GB RTX PRO 6000 is too small |
-| `h3-turbo`, `h3`, `h3-reference` | 4 | 80 GB | official recipe is 4 GPUs with Ulysses sequence parallelism |
+| `ltx-2.5-fast` | 1 | 80 GB | cheapest confidential entry: an RTX PRO 6000 Server Edition; also H200, B200, B300 |
+| `ltx-2.5-pro` | 1 | 80 GB | an H200, B200 or B300 on the confidential tier |
+| `ltx-2.5-4k` | 1 | 141 GB | an H200, B200 or B300; the 96 GB RTX PRO 6000 is too small |
+| `h3-turbo`, `h3`, `h3-reference` | 4 per worker | 80 GB | a whole 8-GPU H200, B200 or B300 server running two workers |
 
 The subnet README's hardware classes (C1, C2, C4) are how the network groups these profiles;
 the VRAM column is the minimum each one needs. RTX 4090 and 5090 cards run quantized LTX-2.5 on the
@@ -32,6 +33,43 @@ The confidential tier, which serves private jobs, additionally requires an Intel
 confidential-computing mode. Consumer cards (RTX 4090/5090) have no confidential mode, so they
 cannot join it. AMD SEV-SNP is not admitted yet. A plain GPU box can still mine standard jobs on
 the **open tier** where the owner enables it; see [section 6](#6-open-tier-mining-without-a-tee).
+
+Check a TDX server itself before booting the confidential VM image on it:
+
+```bash
+uv run kuno-preflight --host                            # TDX, IOMMU, QEMU, QGS, PCCS, vfio-pci, GPU CC modes
+uv run kuno-preflight --host --json > host-profile.json # the host profile
+```
+
+It lists the published VM shapes (`image/cvm/shapes.json`, or `--release DIR`) the server can
+launch and how many single-GPU TDs fit, with the command that fixes each blocker. Reading GPU CC
+modes needs root and NVIDIA's `nvidia_gpu_tools.py` (`--gpu-tools`). If no shape fits your
+hardware, send the host profile to the subnet owner to request one. It holds the CPU and GPU
+topology, QEMU, kernel, OS, board and BIOS, and no serial numbers, UUIDs or MAC addresses.
+
+**Several TDs on one server.** NVIDIA's single-GPU confidential mode lets an 8-GPU server (HGX H200,
+B200 or B300, or 8× RTX PRO 6000 Server Edition) run eight single-GPU TDs, each matching the same
+published measurement. Switch every GPU to CC mode and bind it to vfio-pci, then run:
+
+```bash
+image/cvm/plan-host.py --shape <c1 or c2 shape> -- --weights … --env worker.env --hotkey-seed hotkey.seed
+```
+
+It prints one `launch-td.sh` command per GPU with its own `--instance` and `--numa-node`, and refuses
+a server whose CPUs or memory can't hold them. Disable sub-NUMA clustering in the BIOS or pass
+`--no-numa`. Run every TD under the same hotkey; start each one under systemd or tmux
+(image/CVM.md, "Several TDs on one server").
+
+**H3 on a whole 8-GPU server.** NVIDIA allows multi-GPU confidential computing only for a whole
+server, so H3 runs as one 8-GPU TD with two workers of four GPUs each:
+- `c8.h200-141gb.x8`: every GPU and NVSwitch in Protected PCIe mode. Traffic between the GPUs is
+  not encrypted, which customers are told.
+- `c8.b200-180gb.x8` or `c8.b300-288gb.x8`: CC mode on, with Fabric Manager on the host set to
+  `PARTITION_RAIL_POLICY=symmetric`. Traffic between the GPUs is encrypted.
+
+Plan it with `plan-host.py --shape c8.…`, and put `KUNO_PROFILES=h3-turbo,h3,h3-reference` and
+`KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7` in `worker.env`. The second worker's SGLang servers listen on
+ports 30020 and 30021.
 
 ## 2. Get the weights
 
@@ -381,12 +419,27 @@ abuse does.
 ## What earns
 
 Validators score verified video compute units from enclave-signed receipts, split between
-model families by the owner-signed switch. Scores are gated on:
+model families by the owner-signed switch.
+
+**Ready capacity.** When the switch sets `capacity_share`, part of each family's pay also goes to
+the time your confidential-tier GPUs are verified by validators' own challenges, so a ready
+server earns even when traffic is low.
+- A GPU counts only after an hour of continuous verification (`capacity_min_uptime_s`); then the
+  whole run counts. A missed or failed challenge restarts the clock.
+- Each GPU needs its NVIDIA identity, so open-tier GPUs earn from jobs only.
+- You need at least one succeeded job of that family in the 24-hour window. Validators' canaries go
+  first to miners that don't have one yet.
+- Each family is capped at the owner's GPU target: more GPUs than the target share the same pay
+  instead of adding to it. The share and targets are placeholders until launch (VALIDATING.md,
+  "Capacity pay").
+
+Scores are gated on:
 - a live attestation;
 - reliability: at least 98% success once you have 20 finished jobs in the 24-hour window;
 - enough locked collateral for your attested GPUs (open tier: per open-tier GPU, at the higher rate);
 - not sharing hardware with a hotkey that showed it first (confidential tier);
-- open tier: admission probes passed, and earnings at `KUNO_OPEN_TIER_RATE` of confidential-tier work.
+- open tier: admission probes passed, and earnings at `KUNO_OPEN_TIER_RATE` of confidential-tier work;
+- capacity pay: an attested GPU identity, and a succeeded confidential-tier job per family in the window.
 
 Jobs that fail because of your machine (crash, timeout, going offline with work assigned)
 count against the success rate. Customer-side failures such as a blocked prompt do not.

@@ -1,7 +1,8 @@
 [Unit]
 Description=KunoWorld worker: measure the application into RTMR3, mount verity weights, run the pinned image
-After=network-online.target systemd-modules-load.service
+After=network-online.target systemd-modules-load.service nvidia-persistenced.service
 Wants=network-online.target
+Requires=nvidia-persistenced.service
 # A failed measurement must not be retried into a register that already holds part of the events:
 # kuno-app refuses unless RTMR3 is zero or equals what this boot already recorded.
 StartLimitIntervalSec=0

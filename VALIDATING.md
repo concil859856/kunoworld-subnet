@@ -32,6 +32,7 @@ export KUNO_TOLERANCE_CALIBRATION=/path/to/tolerance_calibration.json  # default
 export KUNO_COLLATERAL_MAX_STALE_S=8640            # how long a failed chain read may reuse the last reading
 export KUNO_CHAIN_ENDPOINT=wss://...               # optional; defaults to the --network's public endpoint
 export KUNO_PAY_MODE=vcu                           # or usd: see USD-denominated pay (needs KUNO_RATE_CARD and --netuid)
+export KUNO_CAPACITY_MAX_GAP_S=8640                # capacity pay: longest gap between a GPU's verified checks; default 2 × --interval
 kuno-validator run --interval 4320 --netuid <netuid> \
   --wallet-name <name> --wallet-hotkey <hotkey> --canary ltx-2.5-fast --standard-canary ltx-2.5-fast
 ```
@@ -51,10 +52,11 @@ Without `KUNO_OWNER_PUBLIC_KEY` the validator logs an error at startup and on ev
 it cannot verify the model switch. It refuses to submit live weights in that state unless you pass
 `--allow-unsigned-switch`; dry runs are allowed.
 
-The state file keeps the last accepted switch, recent canary outcomes, hardware sightings and
-the last collateral readings. A restart can therefore not accept an older switch, forget a
-failed canary, reset who showed some hardware first, or zero every miner because the chain is
-briefly unreachable. Keep it on persistent storage.
+The state file keeps the last accepted switch, recent canary outcomes, hardware sightings, the
+last collateral readings and each GPU's verified runs for capacity pay. A restart can therefore
+not accept an older switch, forget a failed canary, reset who showed some hardware first, zero
+every miner because the chain is briefly unreachable, or restart every GPU's uptime. Keep it on
+persistent storage.
 
 `once` runs a single round and prints the weight vector as JSON. `run` loops on an
 interval; one tempo (360 blocks, roughly 72 minutes) is a reasonable cadence.
@@ -93,7 +95,8 @@ vector it would submit.
    no penalty in the window. Penalties include [hardware dedupe](#hardware-dedupe) and
    [collateral](#collateral) as well as canaries, replays, step audits and the open-tier fraud
    rule. Open-tier work earns at `KUNO_OPEN_TIER_RATE` and only after admission ([Open tier](#open-tier)). Every zeroed hotkey is logged with
-   its reasons (`miner <hotkey>: score=0.0000 … <reasons>`). With `KUNO_PAY_MODE=usd` the same
+   its reasons (`miner <hotkey>: score=0.0000 … <reasons>`). When the switch sets `capacity_share`,
+   part of each family's split pays for ready, attested GPU-time ([Capacity pay](#capacity-pay)). With `KUNO_PAY_MODE=usd` the same
    gated work is priced in US dollars instead ([USD-denominated pay](#usd-denominated-pay)).
 5. **Weights.** Set for registered hotkeys, renormalized over those actually on the subnet.
    Never to the owner hotkey and never to a burn UID: burned miner emission cuts the
@@ -277,6 +280,100 @@ about their hardware, image or memory is attested, so the validator weighs them 
   machine posing as many open-tier miners is limited by collateral per GPU, admission per hotkey
   and the lower rate, not by identities.
 
+## Capacity pay
+
+Serving pay is for finished jobs, so at launch, with little traffic, a ready miner on an expensive
+TDX server earns only from canaries. The owner-signed switch can therefore pay a capped share of
+the serving emission for **ready, attested capacity** (`validator/src/kuno_validator/capacity.py`,
+`scoring.py`). It is off (`capacity_share: 0`) on every switch that doesn't set it.
+
+The design follows Chutes (SN64). Chutes pays miners for the time their attested GPUs serve
+(instance-seconds × a per-GPU multiplier), not per request. An instance that lives under an hour
+earns nothing. A validator-owned autoscaler decides how many instances each model should have, so
+unneeded capacity doesn't earn. Chutes moved away from invocation-based scoring, and removed
+demand boosts on free models, after miners manufactured demand. Here the owner's
+`capacity_targets` do the autoscaler's job, and nothing a miner sends can raise its capacity
+credit: GPU-time comes only from your own challenges.
+
+| Switch field | Default | |
+|---|---|---|
+| `capacity_share` | 0 | `s`: the most of the serving miner emission capacity pay can take |
+| `capacity_targets` | none | family → GPUs the network wants paid. No target, no capacity pay in that family |
+| `capacity_min_uptime_s` | 3600 | continuous verified uptime before a GPU's run counts |
+
+**What counts as ready capacity.**
+- **A check:** each GPU `ueid` identity (PROTOCOL.md, "Hardware identities") in one of your own
+  successful challenge verdicts on the confidential tier. A GPU that several enclaves of one hotkey
+  show is one check. GPUs counted without an identity earn no capacity pay.
+- **A run:** consecutive checks of one (hotkey, GPU) at most `KUNO_CAPACITY_MAX_GAP_S` apart. The
+  default is two `--interval`s (8640 s): a round that runs long keeps the run, and a round in which
+  the GPU wasn't verified breaks it. Set it yourself if something other than `kuno-validator run`
+  schedules your rounds.
+- **Uptime rule:** a run counts once it spans `capacity_min_uptime_s`, and then all of it counts,
+  the first hour included. Only the part inside the scoring window is credited.
+- **Families:** the time between two checks is split equally over the families the enclave served at
+  the later check: the profiles its attested evidence claimed, counting only those the switch has on.
+
+**Gates.** GPU-time earns only for a miner that, at scoring time:
+- passes every gate scoring applies: attestation, reliability, canary, replay and step-audit
+  penalties, the open-tier fraud rule, hardware dedupe and collateral. Hardware dedupe already
+  decides which hotkey rightfully holds a GPU, so a GPU shown under two hotkeys is paid once at most;
+- has at least one succeeded, credited job of that family on the confidential tier (customer or
+  canary) in the window, so capacity that is up but can't serve doesn't earn. With little traffic,
+  least-loaded routing alone could leave a ready miner without one all day, so the gateway lists
+  confidential enclaves whose hotkey hasn't finished a job of the family in the last 24 hours first
+  for validator accounts, on `/v1/route` and for standard canaries (`platform/gateway` `admission.py`).
+  Your canaries therefore reach uncovered miners first; customers' routing is unchanged;
+- runs a family the switch enables and gives a target.
+
+Each miner's line in the round log flags what it was credited (`capacity ltx-2.5: 7.20 GPU-hours
+credited, scaled by 0.500 …`) or why GPU-time earned nothing, and each family gets a line
+(`capacity ltx-2.5: 3.10 verified GPUs on average over the window for a target of 4 …`). The runs
+persist in the state file.
+
+**Why only the confidential tier.** Open-tier evidence has no quote and no GPU evidence, so an
+open-tier enclave's GPU count is whatever it reports. There is no identity to measure uptime
+against or to dedupe, and nothing stops one GPU from being reported by many enclaves. Open-tier
+miners earn from verified jobs only.
+
+**Capped by targets.** Per family, over the window:
+
+| Term | Definition |
+|---|---|
+| `avg_f` | Σ gated GPU-seconds in family f ÷ `window_s`: the average number of verified GPUs |
+| `scale_f` | `min(1, target_f / avg_f)`, applied to every miner's credit in the family |
+| `C_i,f` | miner i's gated GPU-seconds in family f × `scale_f` |
+
+More GPUs than the target dilute everyone's share instead of adding pay, so there is no reason to
+bring capacity the network didn't ask for. Paying for capacity by itself would reward exactly the
+over-provisioning Chutes' autoscaler exists to prevent.
+
+**VCU mode** (the default):
+
+```
+score_i = Σ_f split_f × [(1 − s_f) × VCU_i,f / Σ VCU_f  +  s_f × C_i,f / Σ C_f]
+s_f     = capacity_share × min(1, avg_f / target_f)
+```
+
+- `split_f` is the switch's `emission_split` over the families in use, as for job scoring, so
+  capacity pay never moves emission from one family to another.
+- `s_f` grows with how much of the target is present, so a thinly served target doesn't hand the
+  full share to the few miners there. For example, with `capacity_share` 0.25 and 2 GPUs verified
+  all window against a target of 4, `s_f` is 0.125.
+- A family with capacity credit but no VCU gives its job part to capacity (`s_f = 1`). A family
+  without capacity credit pays by VCU alone (`s_f = 0`).
+- With `capacity_share` 0 every score is exactly the VCU score.
+
+**USD mode** (`KUNO_PAY_MODE=usd`): `capacity_i = Σ_f C_i,f / 3600 × gpu_hour_usd(f)` from the rate
+card, averaged per tempo like job owed. The sum over miners is limited to `capacity_share ×
+pool_usd`; above it every miner's capacity owed is scaled down by the same factor. Each miner's
+capacity owed is then added to its job owed and renormalized as described below. A family the card
+has no `gpu_hour_usd` for earns no capacity pay, and that is logged.
+
+**Placeholders.** `kuno-devkit init` signs `switch.placeholder_switch()`: `capacity_share` 0.25 and
+targets of 8 GPUs for `minimax-h3` and 4 for `ltx-2.5`. The rate card template prices every family
+at $2.00 per GPU-hour (`PLACEHOLDER_USD_PER_GPU_HOUR`). None of these are owner decisions.
+
 ## USD-denominated pay
 
 `KUNO_PAY_MODE=usd` (`validator/src/kuno_validator/usd_pay.py`) pays serving miners for verified
@@ -348,7 +445,10 @@ wrong.
 
 **The rate card** is `{"card": RateCard, "signature"}`, signed by the owner over
 `"kuno/v1/rate-card\n" + canonical_json(card)` (`kuno_protocol/rate_card.py`). It gives USD per
-verified video-second per profile and tier (`confidential`, `open`). It is accepted like the switch:
+verified video-second per profile and tier (`confidential`, `open`), and for [capacity pay](#capacity-pay)
+USD per credited GPU-hour per family (`gpu_hour_usd`). `gpu_hour_usd` is left out of the file and
+the signed bytes while empty, so cards signed before it still verify. Validators older than the
+field refuse a card that sets it, so upgrade validators before publishing one. It is accepted like the switch:
 the signature must verify, and `issued_at` never goes backwards. A different card with the same
 `issued_at` is ignored. The accepted card is kept in the state file, so a restart can't roll it back.
 A card file that later goes missing or turns bad keeps the accepted card in use (logged). The owner
@@ -373,7 +473,8 @@ otherwise. A placeholder card is logged at error level every round and flagged i
 | `subsidy_ratio` | emission value ÷ miner USD owed, per tempo (`pool_usd_per_tempo / owed_usd_per_tempo`). Above 1, emissions pay miners more than their work is worth at card rates. It should fall as demand grows. |
 | `emission_to_revenue` | value of everything the subnet mints over the window (owner, validators and miners, both mechanisms) ÷ customer revenue over the window |
 | `revenue_usd_window` | list price of the window's succeeded jobs (replays excluded), from each job's public params and the profile's pricing, or the ledger's `price_usd` if the gateway publishes one. Validators can't see discounts, credits or refunds, and canaries count as revenue. |
-| `miners` | per hotkey: USD owed over the window and per tempo, priced seconds, raw and final weight |
+| `miners` | per hotkey: USD owed over the window and per tempo, priced seconds, `job_usd_owed`, `capacity_usd_owed` (after the cap), `capacity_gpu_hours`, raw and final weight |
+| `capacity_*` | [Capacity pay](#capacity-pay): `capacity_share`; capacity owed per tempo before the cap (`capacity_uncapped_usd_per_tempo`), the limit (`capacity_limit_usd_per_tempo`), the multiplier (`capacity_scale`) and after it (`capacity_usd_per_tempo`, `capacity_usd_window`); priced GPU-hours per family (`capacity_gpu_hours`), GPU-hours without a card rate (`capacity_unpriced`), and each family's target, average GPUs, target scale and utilization (`capacity_families`). `owed_usd_*` include capacity. |
 | also | prices and their sources, `miner_burned`, `moving_tao_per_alpha`, `unpriced` seconds, `rate_card_issued_at`, `rate_card_placeholder` |
 
 ## Model switch rules

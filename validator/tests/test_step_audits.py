@@ -290,7 +290,7 @@ def test_a_golden_set_certifies_an_honest_image_and_rejects_a_divergent_one(tmp_
     skipped = check_image(golden, lambda case: reference(case)[:-1])
     assert not skipped.ok and "skipped" in skipped.mismatches[0]
     with pytest.raises(ValueError):
-        compute_golden(PROFILE, "C4.h200-sxm-141gb.x4.ulysses4", reference)
+        compute_golden(PROFILE, "C4.h200-141gb.x4.ulysses4", reference)
 
 
 def test_the_golden_cli_computes_and_checks(tmp_path, capsys):

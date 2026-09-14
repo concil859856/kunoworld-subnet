@@ -11,6 +11,16 @@ stores the encrypted video on Cloudflare R2 until you delete it, but it cannot d
 you lose the key, the video is gone.** Nobody, including KunoWorld, can recover it. [Key sync](#key-sync)
 can keep your keys for your other devices, encrypted so that KunoWorld still can't open them.
 
+One limit sits inside the GPU server. The largest model, MiniMax H3, spreads each video over four
+GPUs, and those GPUs pass the work between them:
+- **8×H200 servers:** that GPU-to-GPU traffic is **not encrypted**. It stays inside the server, on
+  wiring the confidential VM holds, so reading it takes physical access to the machine. Traffic
+  between the server's CPU and its GPUs is still encrypted.
+- **8×B200 and 8×B300 servers:** GPU-to-GPU traffic is encrypted.
+- **Single-GPU models:** there is no GPU-to-GPU traffic at all.
+
+Every enclave's attestation states which of these its GPUs run in. See [SECURITY.md](SECURITY.md).
+
 **Standard: you, KunoWorld and the GPU provider.** KunoWorld and the GPU provider that renders
 the video can technically read your prompt, inputs and video. KunoWorld seals the job to the
 miner and decrypts the result, which is what makes a server-side library and previews possible,

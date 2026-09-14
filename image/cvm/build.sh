@@ -12,7 +12,7 @@
 # metadata.json (dstack-mr compatible), sha256sum.txt, build.json -> measure.py per shape.
 #
 # Outputs in --out: ovmf.fd, bzImage, initramfs.cpio.gz, rootfs.img.verity, metadata.json,
-# sha256sum.txt, build.json, measurements/<shape>.json. Nothing in them names the build machine, its
+# sha256sum.txt, build.json, shapes.json, measurements/<shape>.json. Nothing in them names the build machine, its
 # paths or the time. `--weights` maps shape ids to the dm-verity root hashes of the weights images
 # that shape mounts ({"c2.h200-141gb.x1": ["<64 hex>"]}); RTMR3 records them.
 #
@@ -110,6 +110,9 @@ tree="$work/mkosi/rootfs"
 [ -d "$tree" ] && [ -f "$work/mkosi/bzImage" ] || { echo "mkosi produced no root filesystem tree or kernel" >&2; exit 1; }
 install -D -m 0644 "$work/worker.oci.tar" "$tree/usr/share/kuno/worker.oci.tar"
 printf '%s\n' "$image_digest" > "$tree/usr/share/kuno/worker.digest"
+# kuno-app sizes KUNO_GPU_GROUPS by each profile's gpus_per_worker, from the same catalog the worker image carries.
+python3 -c 'import json, sys; print("\n".join("%s %s" % (p["id"], p["gpus_per_worker"]) for p in json.load(open(sys.argv[1]))["profiles"]))' \
+  "$image/../protocol/src/kuno_protocol/profiles.json" > "$tree/usr/share/kuno/gpus-per-worker"
 
 # 4. dm-verity root filesystem and initrd
 root_hash="$("$here/pack-rootfs.sh" "$tree" "$work/pack")"
@@ -154,7 +157,9 @@ build = {
 Path(out, "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 Path(out, "build.json").write_text(json.dumps(build, indent=2, sort_keys=True) + "\n")
 PY
-(cd "$out" && sha256sum ovmf.fd bzImage initramfs.cpio.gz rootfs.img.verity metadata.json build.json > sha256sum.txt)
+# The shapes travel with the release: launch-td.sh, plan-host.py and kuno-preflight --host --release read them.
+cp "$here/shapes.json" "$out/shapes.json"
+(cd "$out" && sha256sum ovmf.fd bzImage initramfs.cpio.gz rootfs.img.verity metadata.json build.json shapes.json > sha256sum.txt)
 
 # 7. measurements per shape; RTMR0 comes from dstack-mr, which must also agree on MRTD, RTMR1, RTMR2
 default_shapes="$(python3 -c 'import json, sys; print(",".join(s["id"] for s in json.load(open(sys.argv[1]))["shapes"]))' "$here/shapes.json")"

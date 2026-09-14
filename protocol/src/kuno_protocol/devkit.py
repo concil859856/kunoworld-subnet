@@ -5,7 +5,7 @@ Writes into the data directory:
   mock_quote.key        signing key of the simulated TEE (development only)
   manifest.json         golden manifest trusting the mock TEE and the dev worker image
   manifest.signed.json  the same manifest, signed by the owner key
-  switch.json           initial signed switch (auto mode, H3 preferred)
+  switch.json           initial signed switch (auto mode, H3 preferred, PLACEHOLDER capacity pay)
   hotkey.seed           a throwaway sr25519 miner hotkey seed, so dev workers send hotkey proofs
   c2pa_root.key/.pem    development C2PA root CA (in production the root never leaves the owner)
   c2pa_ca.key           development C2PA issuing (intermediate) CA key, for the gateway
@@ -40,7 +40,7 @@ from .canonical import b64d, b64e
 from .crypto import generate_signing_key, public_key_bytes, signing_key_bytes, signing_key_from_bytes
 from .hotkey import Sr25519Signer
 from .profiles import load_profiles
-from .switch import SwitchConfig, sign_switch
+from .switch import placeholder_switch, sign_switch
 
 DEV_IMAGE_DIGEST = "sha256:kuno-worker-dev"
 
@@ -79,7 +79,8 @@ def init(data_dir: Path, force: bool = False) -> dict[str, str]:
     # The bare file stays for readers that predate signed manifests.
     (data_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2))
     (data_dir / "manifest.signed.json").write_text(sign_manifest(owner, manifest).model_dump_json(indent=2))
-    (data_dir / "switch.json").write_text(sign_switch(owner, SwitchConfig()).model_dump_json(indent=2))
+    # PLACEHOLDER capacity pay (switch.placeholder_switch), so a dev network exercises it; the owner sets real values.
+    (data_dir / "switch.json").write_text(sign_switch(owner, placeholder_switch()).model_dump_json(indent=2))
     ca_key_path, ca_chain_path = create_dev_c2pa_ca(data_dir)
 
     env = {

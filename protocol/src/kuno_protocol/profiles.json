@@ -89,25 +89,36 @@
         ],
         "hardware_classes": [
           {
-            "id": "C4.h100-sxm-80gb.x4.ulysses4",
+            "id": "C4.h200-141gb.x4.ulysses4",
             "tier": "C4",
-            "gpu_sku": "NVIDIA H100 80GB SXM (HGX)",
+            "gpu_sku": "NVIDIA H200 141GB (HGX H200 8-GPU; one of the two workers in a c8.h200-141gb.x8 TD)",
             "gpu_count": 4,
             "parallel": {
               "ulysses": 4
             },
-            "interconnect": "nvlink, protected PCIe",
+            "interconnect": "nvlink, protected PCIe (GPU-to-GPU traffic not encrypted)",
             "dev": false
           },
           {
-            "id": "C4.h200-sxm-141gb.x4.ulysses4",
+            "id": "C4.b200-180gb.x4.ulysses4",
             "tier": "C4",
-            "gpu_sku": "NVIDIA H200 141GB SXM (HGX)",
+            "gpu_sku": "NVIDIA B200 180GB (HGX B200; one of the two workers in a c8.b200-180gb.x8 TD)",
             "gpu_count": 4,
             "parallel": {
               "ulysses": 4
             },
-            "interconnect": "nvlink, protected PCIe",
+            "interconnect": "nvlink, multi-GPU passthrough CC (encrypted)",
+            "dev": false
+          },
+          {
+            "id": "C4.b300-288gb.x4.ulysses4",
+            "tier": "C4",
+            "gpu_sku": "NVIDIA B300 288GB (HGX B300; one of the two workers in a c8.b300-288gb.x8 TD)",
+            "gpu_count": 4,
+            "parallel": {
+              "ulysses": 4
+            },
+            "interconnect": "nvlink, multi-GPU passthrough CC (encrypted)",
             "dev": false
           },
           {
@@ -233,25 +244,36 @@
         ],
         "hardware_classes": [
           {
-            "id": "C4.h100-sxm-80gb.x4.ulysses4",
+            "id": "C4.h200-141gb.x4.ulysses4",
             "tier": "C4",
-            "gpu_sku": "NVIDIA H100 80GB SXM (HGX)",
+            "gpu_sku": "NVIDIA H200 141GB (HGX H200 8-GPU; one of the two workers in a c8.h200-141gb.x8 TD)",
             "gpu_count": 4,
             "parallel": {
               "ulysses": 4
             },
-            "interconnect": "nvlink, protected PCIe",
+            "interconnect": "nvlink, protected PCIe (GPU-to-GPU traffic not encrypted)",
             "dev": false
           },
           {
-            "id": "C4.h200-sxm-141gb.x4.ulysses4",
+            "id": "C4.b200-180gb.x4.ulysses4",
             "tier": "C4",
-            "gpu_sku": "NVIDIA H200 141GB SXM (HGX)",
+            "gpu_sku": "NVIDIA B200 180GB (HGX B200; one of the two workers in a c8.b200-180gb.x8 TD)",
             "gpu_count": 4,
             "parallel": {
               "ulysses": 4
             },
-            "interconnect": "nvlink, protected PCIe",
+            "interconnect": "nvlink, multi-GPU passthrough CC (encrypted)",
+            "dev": false
+          },
+          {
+            "id": "C4.b300-288gb.x4.ulysses4",
+            "tier": "C4",
+            "gpu_sku": "NVIDIA B300 288GB (HGX B300; one of the two workers in a c8.b300-288gb.x8 TD)",
+            "gpu_count": 4,
+            "parallel": {
+              "ulysses": 4
+            },
+            "interconnect": "nvlink, multi-GPU passthrough CC (encrypted)",
             "dev": false
           },
           {
@@ -406,25 +428,36 @@
         ],
         "hardware_classes": [
           {
-            "id": "C4.h100-sxm-80gb.x4.ulysses4",
+            "id": "C4.h200-141gb.x4.ulysses4",
             "tier": "C4",
-            "gpu_sku": "NVIDIA H100 80GB SXM (HGX)",
+            "gpu_sku": "NVIDIA H200 141GB (HGX H200 8-GPU; one of the two workers in a c8.h200-141gb.x8 TD)",
             "gpu_count": 4,
             "parallel": {
               "ulysses": 4
             },
-            "interconnect": "nvlink, protected PCIe",
+            "interconnect": "nvlink, protected PCIe (GPU-to-GPU traffic not encrypted)",
             "dev": false
           },
           {
-            "id": "C4.h200-sxm-141gb.x4.ulysses4",
+            "id": "C4.b200-180gb.x4.ulysses4",
             "tier": "C4",
-            "gpu_sku": "NVIDIA H200 141GB SXM (HGX)",
+            "gpu_sku": "NVIDIA B200 180GB (HGX B200; one of the two workers in a c8.b200-180gb.x8 TD)",
             "gpu_count": 4,
             "parallel": {
               "ulysses": 4
             },
-            "interconnect": "nvlink, protected PCIe",
+            "interconnect": "nvlink, multi-GPU passthrough CC (encrypted)",
+            "dev": false
+          },
+          {
+            "id": "C4.b300-288gb.x4.ulysses4",
+            "tier": "C4",
+            "gpu_sku": "NVIDIA B300 288GB (HGX B300; one of the two workers in a c8.b300-288gb.x8 TD)",
+            "gpu_count": 4,
+            "parallel": {
+              "ulysses": 4
+            },
+            "interconnect": "nvlink, multi-GPU passthrough CC (encrypted)",
             "dev": false
           },
           {
@@ -597,6 +630,24 @@
             "id": "C2.h200-141gb.x1",
             "tier": "C2",
             "gpu_sku": "NVIDIA H200 141GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false
+          },
+          {
+            "id": "C2.b200-180gb.x1",
+            "tier": "C2",
+            "gpu_sku": "NVIDIA B200 180GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false
+          },
+          {
+            "id": "C2.b300-288gb.x1",
+            "tier": "C2",
+            "gpu_sku": "NVIDIA B300 288GB",
             "gpu_count": 1,
             "parallel": {},
             "interconnect": null,
@@ -816,6 +867,24 @@
             "dev": false
           },
           {
+            "id": "C2.b200-180gb.x1",
+            "tier": "C2",
+            "gpu_sku": "NVIDIA B200 180GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false
+          },
+          {
+            "id": "C2.b300-288gb.x1",
+            "tier": "C2",
+            "gpu_sku": "NVIDIA B300 288GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false
+          },
+          {
             "id": "O1.rtx-pro-6000-bw-96gb.x1",
             "tier": "O1",
             "gpu_sku": "NVIDIA RTX PRO 6000 Blackwell 96GB (workstation or Server Edition without CC)",
@@ -961,6 +1030,24 @@
             "id": "C2.h200-141gb.x1",
             "tier": "C2",
             "gpu_sku": "NVIDIA H200 141GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false
+          },
+          {
+            "id": "C2.b200-180gb.x1",
+            "tier": "C2",
+            "gpu_sku": "NVIDIA B200 180GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
+            "dev": false
+          },
+          {
+            "id": "C2.b300-288gb.x1",
+            "tier": "C2",
+            "gpu_sku": "NVIDIA B300 288GB",
             "gpu_count": 1,
             "parallel": {},
             "interconnect": null,

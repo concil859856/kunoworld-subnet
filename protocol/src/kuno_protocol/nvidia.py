@@ -4,10 +4,27 @@ Evidence is what NVIDIA's own tooling produces inside the CVM: for each GPU, the
 attestation report generated for our 32-byte `gpu_nonce` and the device certificate
 chain (`nvattest collect-evidence`, or NVML directly). We carry it as
 
-    canonical_json({"format": "kuno/v1/nvidia-gpu", "nonce": hex, "gpus": [{"arch", "evidence", "certificate"}]})
+    canonical_json({"format": "kuno/v1/nvidia-gpu", "nonce": hex, "gpus": [{"arch", "evidence", "certificate"}],
+                    "cc"?: {"mode", "devtools"}, "switches"?: [{"arch", "evidence", "certificate"}]})
 
 with `evidence` and `certificate` in the standard base64 NVIDIA's services expect, so the
-bytes hashed into REPORTDATA are exactly the bytes a verifier forwards.
+bytes hashed into REPORTDATA are exactly the bytes a verifier forwards. `cc` is the GPUs'
+confidential-computing mode as the worker read it from the driver, and `switches` the
+NVSwitch reports of a Protected PCIe VM (collected through NSCQ for the same nonce). Both
+are left out of the bytes when unset, so evidence from workers that predate them is unchanged.
+
+The GPUs' modes (NVIDIA R595 Trusted Computing release notes):
+
+  spt    Single GPU passthrough CC: one GPU per VM, its PCIe traffic encrypted.
+  ppcie  Protected PCIe, Hopper HGX 8-GPU only: all 8 GPUs and all 4 NVSwitches in one VM. CPU-GPU
+         traffic is encrypted; GPU-to-GPU NVLink traffic is NOT. The NVSwitches attest as well.
+  mpt    Multi-GPU passthrough CC, Blackwell HGX: up to 8 GPUs per VM with encrypted NVLink.
+         Fabric Manager and the NVSwitches stay on the host, so there is no switch evidence.
+
+NVIDIA's signed GPU and NVSwitch claims do not say which mode a device is in, nor whether it
+runs in devtools mode (NVIDIA claims guide 3.0: only `dbgstat` and `secboot`). `cc` is
+therefore the measured worker's reading of NVML, trusted exactly as far as the TD that
+REPORTDATA binds it to. The verifiers only check that the devices in the evidence fit it.
 
 Two verifiers, both usable as the `GpuVerifier` hook of `verify_evidence`:
 
@@ -47,6 +64,10 @@ from .canonical import canonical_json
 GPU_EVIDENCE_FORMAT = "kuno/v1/nvidia-gpu"
 DEFAULT_NRAS_URL = "https://nras.attestation.nvidia.com/v4/attest/gpu"
 GPU_ARCHITECTURES = ("HOPPER", "BLACKWELL")
+# NRAS's architecture name for third-generation NVSwitches (HGX H100/H200), https://docs.api.nvidia.com/attestation/reference/attestswitch
+NVSWITCH_ARCH = "LS10"
+GpuCcMode = Literal["spt", "ppcie", "mpt"]
+GPU_CC_MODES: tuple[str, ...] = ("spt", "ppcie", "mpt")
 
 HttpCall = Callable[[str, str, bytes | None, dict[str, str], float], tuple[int, bytes]]
 
@@ -57,13 +78,22 @@ class GpuEvidenceItem(BaseModel):
     certificate: str
 
 
+class GpuCcSettings(BaseModel):
+    """The GPUs' confidential-computing mode and whether devtools mode is on, as the driver reports them."""
+
+    mode: GpuCcMode
+    devtools: bool
+
+
 class GpuEvidenceBundle(BaseModel):
     format: Literal["kuno/v1/nvidia-gpu"] = GPU_EVIDENCE_FORMAT
     nonce: str
     gpus: list[GpuEvidenceItem] = Field(min_length=1)
+    cc: GpuCcSettings | None = None
+    switches: list[GpuEvidenceItem] | None = Field(default=None, min_length=1)
 
     def encode(self) -> bytes:
-        return canonical_json(self.model_dump(mode="json"))
+        return canonical_json(self.model_dump(mode="json", exclude_none=True))
 
     @classmethod
     def decode(cls, data: bytes) -> GpuEvidenceBundle:
@@ -75,7 +105,7 @@ class GpuEvidenceBundle(BaseModel):
 
 class GpuEvidenceCollector(Protocol):
     def collect(self, gpu_nonce: bytes) -> list[GpuEvidenceItem]:
-        """Evidence for every GPU in the VM, generated for this 32-byte nonce."""
+        """Evidence for every GPU (or NVSwitch) the worker can open, generated for this 32-byte nonce."""
 
 
 class GpuVerifierUnavailable(RuntimeError):
@@ -85,15 +115,22 @@ class GpuVerifierUnavailable(RuntimeError):
 @dataclass
 class GpuVerification:
     """A GPU verifier's full answer. `ueids` holds each attested GPU's `ueid` claim (None where a
-    token carried none), taken only from claims whose signature or local verification succeeded."""
+    token carried none), taken only from claims whose signature or local verification succeeded;
+    `switch_ueids` the same for NVSwitches. `cc` is the evidence's declared mode once it verified."""
 
     ok: bool
     detail: str
     ueids: list[str | None] = dc_field(default_factory=list)
+    cc: GpuCcSettings | None = None
+    switch_ueids: list[str | None] = dc_field(default_factory=list)
 
     @property
     def gpu_count(self) -> int:
         return len(self.ueids)
+
+    @property
+    def switch_count(self) -> int:
+        return len(self.switch_ueids)
 
 
 def _ueid(claims: dict) -> str | None:
@@ -105,19 +142,59 @@ class GpuTokenError(ValueError):
     pass
 
 
-def gpu_claim_problems(claims: dict) -> list[str]:
-    """What a relying party must see for one GPU. NRAS and NVAT spell some values differently."""
+def _claim_problems(claims: dict, device: Literal["gpu", "switch"]) -> list[str]:
+    label = "GPU" if device == "gpu" else "NVSwitch"
     problems = []
     if str(claims.get("measres", "")).lower() != "success":
         problems.append(f"runtime measurements do not match NVIDIA's reference values (measres={claims.get('measres')!r})")
     if claims.get("dbgstat") not in ("disabled", False):
-        problems.append(f"GPU debug is not confirmed disabled (dbgstat={claims.get('dbgstat')!r})")
+        problems.append(f"{label} debug is not confirmed disabled (dbgstat={claims.get('dbgstat')!r})")
     if claims.get("secboot") is not True:
-        problems.append("GPU secure boot is not confirmed")
-    for name in ("x-nvidia-gpu-attestation-report-nonce-match", "x-nvidia-gpu-attestation-report-signature-verified"):
+        problems.append(f"{label} secure boot is not confirmed")
+    for name in (f"x-nvidia-{device}-attestation-report-nonce-match", f"x-nvidia-{device}-attestation-report-signature-verified"):
         if claims.get(name) is not True:
             problems.append(f"{name} is not true")
     return problems
+
+
+def gpu_claim_problems(claims: dict) -> list[str]:
+    """What a relying party must see for one GPU. NRAS and NVAT spell some values differently."""
+    return _claim_problems(claims, "gpu")
+
+
+def switch_claim_problems(claims: dict) -> list[str]:
+    """The same for one NVSwitch. NVIDIA's NVSwitch claims guide names `measres`, `dbgstat`, `secboot` and
+    `x-nvidia-switch-attestation-report-nonce-match`; the signature claim's name is assumed by analogy
+    with the GPU's (unverified), so a different spelling refuses every switch rather than passing one."""
+    return _claim_problems(claims, "switch")
+
+
+def cc_problems(cc: GpuCcSettings | None, architectures: set[str] | None, switch_count: int) -> list[str]:
+    """Whether the devices in the evidence fit its declared mode. `architectures` is None where unknown (mock evidence)."""
+    if cc is None:
+        return ["the evidence carries NVSwitch evidence but declares no GPU confidential-computing mode"] if switch_count else []
+    problems = []
+    if cc.mode == "ppcie":
+        if architectures is not None and architectures != {"HOPPER"}:
+            problems.append("Protected PCIe mode exists only on Hopper GPUs")
+        if not switch_count:
+            problems.append("Protected PCIe mode needs evidence from the VM's NVSwitches")
+    elif switch_count:
+        problems.append(f"{cc.mode} mode keeps the NVSwitches out of the VM, yet the evidence carries NVSwitch evidence")
+    if cc.mode == "mpt" and architectures is not None and architectures != {"BLACKWELL"}:
+        problems.append("multi-GPU passthrough CC exists only on Blackwell GPUs")
+    return problems
+
+
+def _bundle_problems(bundle: GpuEvidenceBundle, gpu_nonce: bytes) -> str | None:
+    if bundle.nonce.lower() != gpu_nonce.hex():
+        return "GPU evidence was collected for a different nonce"
+    if len({g.arch for g in bundle.gpus}) != 1:
+        return "GPUs of mixed architectures must be attested separately"
+    if bundle.switches and len({s.arch for s in bundle.switches}) != 1:
+        return "NVSwitches of mixed architectures must be attested separately"
+    problems = cc_problems(bundle.cc, {g.arch for g in bundle.gpus}, len(bundle.switches or []))
+    return "; ".join(problems) or None
 
 
 # ---------------------------------------------------------------- JWT (ES384) without extra dependencies
@@ -180,7 +257,7 @@ def _urllib_http(method: str, url: str, body: bytes | None, headers: dict[str, s
 
 
 def _split_detached_eat(document) -> tuple[str, dict[str, str]]:
-    """NRAS answers `[["JWT", overall_token], {"GPU-0": token, ...}]`."""
+    """NRAS answers `[["JWT", overall_token], {"GPU-0": token, ...}]` (`{"SWITCH0": token, ...}` for NVSwitches)."""
     if (
         isinstance(document, list)
         and len(document) == 2
@@ -208,9 +285,12 @@ class NrasGpuVerifier:
         jwks_ttl_s: float = 3600.0,
         http: HttpCall | None = None,
         clock: Callable[[], float] = time.time,
+        switch_url: str | None = None,
     ):
         parsed = urlparse(url)
         self.url = url
+        # NRAS attests NVSwitches next to GPUs: .../v4/attest/gpu and .../v4/attest/switch.
+        self.switch_url = switch_url or url.rstrip("/").rsplit("/", 1)[0] + "/switch"
         self.jwks_url = f"{parsed.scheme}://{parsed.netloc}/.well-known/jwks.json"
         self._service_key = service_key
         self.claims_version = claims_version
@@ -250,49 +330,59 @@ class NrasGpuVerifier:
         result = self.verify_devices(evidence, gpu_nonce)
         return result.ok, result.detail
 
-    def verify_devices(self, evidence: bytes, gpu_nonce: bytes) -> GpuVerification:
-        try:
-            bundle = GpuEvidenceBundle.decode(evidence)
-        except ValueError as exc:
-            return GpuVerification(False, str(exc))
-        if bundle.nonce.lower() != gpu_nonce.hex():
-            return GpuVerification(False, "GPU evidence was collected for a different nonce")
-        archs = {g.arch for g in bundle.gpus}
-        if len(archs) != 1:
-            return GpuVerification(False, "GPUs of mixed architectures must be attested separately")
+    def _attest(self, url: str, items: list[GpuEvidenceItem], gpu_nonce: bytes, noun: str) -> tuple[list[dict] | None, list[str]]:
+        """One NRAS call for devices of one kind: (their verified claims in token-name order, problems)."""
         body = {
             "nonce": gpu_nonce.hex(),
-            "arch": archs.pop(),
-            "evidence_list": [{"evidence": g.evidence, "certificate": g.certificate} for g in bundle.gpus],
+            "arch": items[0].arch,
+            "evidence_list": [{"evidence": g.evidence, "certificate": g.certificate} for g in items],
             "claims_version": self.claims_version,
         }
         headers = {"content-type": "application/json", "accept": "application/json"}
         if self._service_key:
             headers["authorization"] = f"Bearer {self._service_key}"
         try:
-            status, payload = self._http("POST", self.url, json.dumps(body).encode(), headers, self.timeout_s)
+            status, payload = self._http("POST", url, json.dumps(body).encode(), headers, self.timeout_s)
             if status != 200:
-                return GpuVerification(False, f"NRAS returned HTTP {status}: {payload[:200].decode('utf-8', 'replace')}")
+                return None, [f"NRAS returned HTTP {status}: {payload[:200].decode('utf-8', 'replace')}"]
             overall_token, detached = _split_detached_eat(json.loads(payload))
             overall = self._claims(overall_token)
-            per_gpu = {name: self._claims(token) for name, token in detached.items()}
+            per_device = {name: self._claims(token) for name, token in detached.items()}
         except (OSError, ValueError) as exc:  # URLError is an OSError; GpuTokenError and JSON errors are ValueErrors
-            return GpuVerification(False, f"NRAS verification failed: {exc}")
+            return None, [f"NRAS verification failed: {exc}"]
 
         problems = []
         if overall.get("x-nvidia-overall-att-result") is not True:
             problems.append("NRAS overall attestation result is not true")
         if str(overall.get("eat_nonce", "")).lower() != gpu_nonce.hex():
             problems.append("NRAS token is for a different nonce")
-        if len(per_gpu) != len(bundle.gpus):
-            problems.append(f"NRAS attested {len(per_gpu)} GPU(s) but the evidence holds {len(bundle.gpus)}")
-        for name, claims in sorted(per_gpu.items()):
-            problems += [f"{name}: {p}" for p in gpu_claim_problems(claims)]
-        if problems:
+        if len(per_device) != len(items):
+            problems.append(f"NRAS attested {len(per_device)} {noun}(s) but the evidence holds {len(items)}")
+        check = gpu_claim_problems if noun == "GPU" else switch_claim_problems
+        for name, claims in sorted(per_device.items()):
+            problems += [f"{name}: {p}" for p in check(claims)]
+        return [claims for _, claims in sorted(per_device.items())], problems
+
+    def verify_devices(self, evidence: bytes, gpu_nonce: bytes) -> GpuVerification:
+        try:
+            bundle = GpuEvidenceBundle.decode(evidence)
+        except ValueError as exc:
+            return GpuVerification(False, str(exc))
+        refused = _bundle_problems(bundle, gpu_nonce)
+        if refused:
+            return GpuVerification(False, refused)
+        gpus, problems = self._attest(self.url, bundle.gpus, gpu_nonce, "GPU")
+        switches: list[dict] = []
+        if gpus is not None and not problems and bundle.switches:
+            attested, switch_problems = self._attest(self.switch_url, bundle.switches, gpu_nonce, "NVSwitch")
+            switches, problems = attested or [], [f"NVSwitch evidence: {p}" for p in switch_problems]
+        if gpus is None or problems:
             return GpuVerification(False, "; ".join(problems))
-        models = sorted({str(c.get("hwmodel", "?")) for c in per_gpu.values()})
-        ueids = [_ueid(claims) for _, claims in sorted(per_gpu.items())]
-        return GpuVerification(True, f"{len(per_gpu)} GPU(s) attested by NRAS ({', '.join(models)})", ueids)
+        models = sorted({str(c.get("hwmodel", "?")) for c in gpus})
+        detail = f"{len(gpus)} GPU(s) attested by NRAS ({', '.join(models)})"
+        if switches:
+            detail += f" with {len(switches)} NVSwitch(es)"
+        return GpuVerification(True, detail, [_ueid(c) for c in gpus], bundle.cc, [_ueid(c) for c in switches])
 
 
 class NvattestGpuVerifier:
@@ -316,15 +406,11 @@ class NvattestGpuVerifier:
         result = self.verify_devices(evidence, gpu_nonce)
         return result.ok, result.detail
 
-    def verify_devices(self, evidence: bytes, gpu_nonce: bytes) -> GpuVerification:
-        try:
-            bundle = GpuEvidenceBundle.decode(evidence)
-        except ValueError as exc:
-            return GpuVerification(False, str(exc))
-        if bundle.nonce.lower() != gpu_nonce.hex():
-            return GpuVerification(False, "GPU evidence was collected for a different nonce")
+    def _attest(self, device: str, items: list[GpuEvidenceItem], gpu_nonce: bytes) -> tuple[list[dict] | None, list[str]]:
+        """`nvattest attest --device gpu|nvswitch` on an evidence file: (claims, problems)."""
+        noun = "GPU" if device == "gpu" else "NVSwitch"
         document = {
-            "evidences": [{**g.model_dump(), "nonce": gpu_nonce.hex()} for g in bundle.gpus],
+            "evidences": [{**g.model_dump(), "nonce": gpu_nonce.hex()} for g in items],
             "result_code": 0,
             "result_message": "Ok",
         }
@@ -332,8 +418,8 @@ class NvattestGpuVerifier:
             path = Path(tmp) / "evidence.json"
             path.write_text(json.dumps(document))
             command = [
-                self.binary, "attest", "--device", "gpu", "--verifier", self.verifier,
-                "--gpu-evidence-source", "file", "--gpu-evidence-file", str(path),
+                self.binary, "attest", "--device", device, "--verifier", self.verifier,
+                f"--{device}-evidence-source", "file", f"--{device}-evidence-file", str(path),
                 "--nonce", gpu_nonce.hex(), "--format", "json",
             ]
             if self.policy is not None:
@@ -344,23 +430,43 @@ class NvattestGpuVerifier:
             try:
                 done = self._run(command, capture_output=True, text=True, timeout=self.timeout_s)
             except FileNotFoundError:
-                return GpuVerification(False, f"{self.binary} is not installed on this verifier (NVIDIA Attestation SDK CLI)")
+                return None, [f"{self.binary} is not installed on this verifier (NVIDIA Attestation SDK CLI)"]
             except subprocess.TimeoutExpired:
-                return GpuVerification(False, f"nvattest did not finish within {self.timeout_s:.0f}s")
+                return None, [f"nvattest did not finish within {self.timeout_s:.0f}s"]
         try:
             result = json.loads(done.stdout)
         except ValueError:
-            return GpuVerification(False, f"nvattest exited {done.returncode} without JSON output")
+            return None, [f"nvattest exited {done.returncode} without JSON output"]
         if result.get("result_code") != 0 or done.returncode != 0:
-            return GpuVerification(False, f"nvattest: {result.get('result_message', 'attestation failed')} (code {result.get('result_code')})")
+            return None, [f"nvattest: {result.get('result_message', 'attestation failed')} (code {result.get('result_code')})"]
         claims = [c for c in result.get("claims", []) if isinstance(c, dict)]
         problems = []
-        if len(claims) != len(bundle.gpus):
-            problems.append(f"nvattest returned claims for {len(claims)} GPU(s) but the evidence holds {len(bundle.gpus)}")
+        if len(claims) != len(items):
+            problems.append(f"nvattest returned claims for {len(claims)} {noun}(s) but the evidence holds {len(items)}")
+        check = gpu_claim_problems if device == "gpu" else switch_claim_problems
+        prefix = "GPU" if device == "gpu" else "SWITCH"
         for index, claim in enumerate(claims):
             if claim.get("eat_nonce") is not None and str(claim["eat_nonce"]).lower() != gpu_nonce.hex():
-                problems.append(f"GPU-{index}: claims are for a different nonce")
-            problems += [f"GPU-{index}: {p}" for p in gpu_claim_problems(claim)]
-        if problems:
+                problems.append(f"{prefix}-{index}: claims are for a different nonce")
+            problems += [f"{prefix}-{index}: {p}" for p in check(claim)]
+        return claims, problems
+
+    def verify_devices(self, evidence: bytes, gpu_nonce: bytes) -> GpuVerification:
+        try:
+            bundle = GpuEvidenceBundle.decode(evidence)
+        except ValueError as exc:
+            return GpuVerification(False, str(exc))
+        refused = _bundle_problems(bundle, gpu_nonce)
+        if refused:
+            return GpuVerification(False, refused)
+        gpus, problems = self._attest("gpu", bundle.gpus, gpu_nonce)
+        switches: list[dict] = []
+        if gpus is not None and not problems and bundle.switches:
+            attested, switch_problems = self._attest("nvswitch", bundle.switches, gpu_nonce)
+            switches, problems = attested or [], [f"NVSwitch evidence: {p}" for p in switch_problems]
+        if gpus is None or problems:
             return GpuVerification(False, "; ".join(problems))
-        return GpuVerification(True, f"{len(claims)} GPU(s) attested by nvattest ({self.verifier})", [_ueid(c) for c in claims])
+        detail = f"{len(gpus)} GPU(s) attested by nvattest ({self.verifier})"
+        if switches:
+            detail += f" with {len(switches)} NVSwitch(es)"
+        return GpuVerification(True, detail, [_ueid(c) for c in gpus], bundle.cc, [_ueid(c) for c in switches])

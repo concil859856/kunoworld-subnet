@@ -24,6 +24,7 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
@@ -39,10 +40,11 @@ from .hardware import (
     HardwareIdentity,
     identity,
     mock_gpu_ueids,
+    mock_nvswitch_ueids,
     mock_platform_id,
     pck_ppid_from_quote,
 )
-from .nvidia import GpuEvidenceBundle, GpuEvidenceCollector
+from .nvidia import GpuCcMode, GpuCcSettings, GpuEvidenceBundle, GpuEvidenceCollector, cc_problems
 
 # "open" is an open-tier miner with no TEE: it may only run standard (non-private) jobs.
 TeeKind = Literal["mock", "tdx", "open"]
@@ -110,6 +112,15 @@ class AllowedMeasurement(BaseModel):
     rtmr1: str
     rtmr2: str
     rtmr3: str
+    # What the GPU evidence of an enclave matching this entry must show: the GPUs' confidential-computing mode
+    # (kuno_protocol.nvidia: spt, ppcie or mpt) and how many GPUs and NVSwitches it attests. None checks nothing.
+    gpu_mode: GpuCcMode | None = None
+    gpus_per_enclave: int | None = Field(default=None, ge=1)
+    nvswitches_per_enclave: int | None = Field(default=None, ge=0)
+
+
+# Left out of an entry's signed bytes when unset, so entries signed before they existed still verify.
+OPTIONAL_ENTRY_FIELDS = ("gpu_mode", "gpus_per_enclave", "nvswitches_per_enclave")
 
 
 class OpenTierImage(BaseModel):
@@ -166,13 +177,17 @@ class GoldenManifest(BaseModel):
         return self.model_digests.get(profile_id)
 
     def signed_fields(self) -> dict:
-        """What the owner signs. `open_tier` and `model_digests` are left out when unset, so manifests signed
-        before they existed still verify."""
+        """What the owner signs. `open_tier`, `model_digests` and each entry's GPU fields (OPTIONAL_ENTRY_FIELDS)
+        are left out when unset, so manifests signed before they existed still verify."""
         fields = self.model_dump(mode="json")
         if fields.get("open_tier") is None:
             fields.pop("open_tier", None)
         if not fields.get("model_digests"):
             fields.pop("model_digests", None)
+        for entry in fields.get("allowed", []):
+            for name in OPTIONAL_ENTRY_FIELDS:
+                if entry.get(name) is None:
+                    entry.pop(name, None)
         return fields
 
 
@@ -265,16 +280,31 @@ class MockTEE:
     It simulates one machine: a platform id in the signed quote body (the PPID's stand-in) and
     `gpus` GPU ueids in its GPU evidence, which REPORTDATA binds to the quote. Each instance is
     a new machine unless `machine_id` (or KUNO_MOCK_MACHINE_ID) names one, so tests and dev
-    networks can put two workers on the same simulated hardware.
+    networks can put two workers on the same simulated hardware. `gpu_indices` picks which of
+    the machine's GPUs this worker sees (one GPU group of a multi-worker VM), and `gpu_mode`
+    with `nvswitches` simulates the declared mode and a Protected PCIe VM's switches; unset,
+    the evidence bytes are what they always were.
     """
 
     kind: TeeKind = "mock"
 
-    def __init__(self, quote_key, image_digest: str, machine_id: str | None = None, gpus: int = MOCK_GPUS):
+    def __init__(
+        self,
+        quote_key,
+        image_digest: str,
+        machine_id: str | None = None,
+        gpus: int = MOCK_GPUS,
+        gpu_indices: Sequence[int] | None = None,
+        gpu_mode: GpuCcMode | None = None,
+        gpu_devtools: bool = False,
+        nvswitches: int = 0,
+    ):
         self._key = quote_key
         self._measurements = mock_measurements(image_digest)
         self.machine_id = machine_id or os.environ.get("KUNO_MOCK_MACHINE_ID") or uuid.uuid4().hex
-        self.gpus = gpus
+        self.gpu_indices = list(gpu_indices) if gpu_indices is not None else None
+        self.gpus = len(self.gpu_indices) if self.gpu_indices is not None else gpus
+        self.gpu_mode, self.gpu_devtools, self.nvswitches = gpu_mode, gpu_devtools, nvswitches
 
     def quote(self, report_data: bytes) -> bytes:
         body = {
@@ -287,26 +317,40 @@ class MockTEE:
         return canonical_json({"body": body, "signature": b64e(signature)})
 
     def gpu_evidence(self, gpu_nonce: bytes) -> bytes | None:
-        return canonical_json(
-            {
-                "mock_gpu": "NVIDIA H200 (simulated)",
-                "nonce": gpu_nonce.hex(),
-                "cc_mode": "on",
-                "gpus": [{"ueid": ueid} for ueid in mock_gpu_ueids(self.machine_id, self.gpus)],
-            }
-        )
+        document = {
+            "mock_gpu": "NVIDIA H200 (simulated)",
+            "nonce": gpu_nonce.hex(),
+            "cc_mode": "on",
+            "gpus": [{"ueid": ueid} for ueid in mock_gpu_ueids(self.machine_id, self.gpus, self.gpu_indices)],
+        }
+        if self.gpu_mode is not None:
+            document["cc"] = {"mode": self.gpu_mode, "devtools": self.gpu_devtools}
+        if self.nvswitches:
+            document["switches"] = [{"ueid": ueid} for ueid in mock_nvswitch_ueids(self.machine_id, self.nvswitches)]
+        return canonical_json(document)
 
 
 class TdxTEE:
     """Intel TDX guest. Requires Linux ≥ 6.7 with configfs-tsm inside the confidential VM,
-    and NVIDIA GPUs in confidential-computing mode passed through to it."""
+    and NVIDIA GPUs in confidential-computing mode passed through to it.
+
+    `cc_settings` reads the GPUs' confidential-computing mode from the driver; when it reports
+    Protected PCIe, `switch_collector` adds the VM's NVSwitch evidence for the same nonce."""
 
     kind: TeeKind = "tdx"
     TSM_ROOT = Path("/sys/kernel/config/tsm/report")
 
-    def __init__(self, gpu_collector: GpuEvidenceCollector | None = None, tsm_root: Path | None = None):
+    def __init__(
+        self,
+        gpu_collector: GpuEvidenceCollector | None = None,
+        tsm_root: Path | None = None,
+        switch_collector: GpuEvidenceCollector | None = None,
+        cc_settings: Callable[[], GpuCcSettings] | None = None,
+    ):
         self.gpu_collector = gpu_collector
         self.tsm_root = tsm_root or self.TSM_ROOT
+        self.switch_collector = switch_collector
+        self.cc_settings = cc_settings
 
     def quote(self, report_data: bytes) -> bytes:
         if len(report_data) != 64:
@@ -344,7 +388,17 @@ class TdxTEE:
         gpus = self.gpu_collector.collect(gpu_nonce)
         if not gpus:
             raise GpuEvidenceUnavailable("the GPU evidence collector found no GPUs: check GPU passthrough into the CVM")
-        return GpuEvidenceBundle(nonce=gpu_nonce.hex(), gpus=gpus).encode()
+        cc = self.cc_settings() if self.cc_settings is not None else None
+        switches = None
+        if cc is not None and cc.mode == "ppcie":
+            if self.switch_collector is None:
+                raise GpuEvidenceUnavailable("the GPUs are in Protected PCIe mode but no NVSwitch evidence collector is configured")
+            switches = self.switch_collector.collect(gpu_nonce)
+            if not switches:
+                raise GpuEvidenceUnavailable(
+                    "the GPUs are in Protected PCIe mode but no NVSwitch evidence was collected: pass the VM's NVSwitches into the worker"
+                )
+        return GpuEvidenceBundle(nonce=gpu_nonce.hex(), gpus=gpus, cc=cc, switches=switches).encode()
 
 
 class OpenTEE:
@@ -436,6 +490,11 @@ class Verdict:
     gpu_count: int | None = None
     # kuno_protocol.tiers tier of the evidence ("confidential" or "open"); None when it could not be parsed.
     tier: str | None = None
+    # The GPUs' declared confidential-computing mode and devtools state, and the attested NVSwitch count.
+    # Like the identities, filled only when the verdict is ok and None when the evidence did not say.
+    gpu_mode: str | None = None
+    gpu_devtools: bool | None = None
+    nvswitch_count: int | None = None
 
     def hardware_tokens(self, kind: str | None = None) -> set[str]:
         return {h.token for h in self.hardware if kind is None or h.kind == kind}
@@ -446,6 +505,8 @@ def _seal(verdict: Verdict, reasons: list[str], hardware: list[HardwareIdentity]
     verdict.ok = not reasons
     # Identities from a refused verdict must not be used for anything, so they aren't kept.
     verdict.hardware, verdict.gpu_count = (hardware, gpu_count) if verdict.ok else ([], None)
+    if not verdict.ok:
+        verdict.gpu_mode = verdict.gpu_devtools = verdict.nvswitch_count = None
     return verdict
 
 
@@ -506,6 +567,8 @@ def verify_evidence(
         reasons.append("REPORTDATA does not bind this nonce, these keys and this GPU evidence")
 
     gpu_ueids: list[str | None] | None = None
+    switch_ueids: list[str | None] | None = None
+    gpu_cc: GpuCcSettings | None = None
     if evidence.tee == "tdx":
         if gpu is None:
             reasons.append("GPU evidence is required on TDX workers")
@@ -517,23 +580,32 @@ def verify_evidence(
             if callable(verify_devices):
                 result = verify_devices(gpu, gpu_nonce)
                 ok, detail = result.ok, result.detail
-                gpu_ueids = list(result.ueids) if ok else None
+                if ok:
+                    gpu_ueids = list(result.ueids)
+                    switch_ueids = list(getattr(result, "switch_ueids", None) or [])
+                    gpu_cc = getattr(result, "cc", None)
             else:  # a verifier that only answers yes or no: GPUs are verified but not counted
                 ok, detail = gpu_verifier.verify(gpu, gpu_nonce)
             if not ok:
                 reasons.append(f"GPU evidence rejected: {detail}")
     elif evidence.tee == "mock" and gpu is not None and bound:
-        gpu_ueids = _mock_gpu_ueids(gpu)
+        gpu_ueids, gpu_cc, switch_ueids = _mock_gpu_devices(gpu, reasons)
 
-    gpu_count = None
+    gpu_count = nvswitch_count = None
+    prefix, source = ("mock:", SOURCE_MOCK) if evidence.tee == "mock" else ("", SOURCE_NVIDIA_UEID)
     if gpu_ueids is not None:
         gpu_count = len(gpu_ueids)
-        prefix, source = ("mock:", SOURCE_MOCK) if evidence.tee == "mock" else ("", SOURCE_NVIDIA_UEID)
         gpus = [identity("gpu", prefix + ueid, source) for ueid in gpu_ueids if ueid]
         if len({g.token for g in gpus}) != len(gpus):
             # Repeating one GPU's evidence must not count it twice.
             reasons.append("the same GPU appears more than once in the GPU evidence")
         hardware.extend(gpus)
+    if switch_ueids is not None:
+        nvswitch_count = len(switch_ueids)
+        switches = [identity("nvswitch", prefix + ueid, source) for ueid in switch_ueids if ueid]
+        if len({s.token for s in switches}) != len(switches):
+            reasons.append("the same NVSwitch appears more than once in the GPU evidence")
+        hardware.extend(switches)
 
     if measurements:
         allowed = [
@@ -545,21 +617,54 @@ def verify_evidence(
         ]
         if not allowed:
             reasons.append("measurements are not in the golden manifest")
-        elif not set(evidence.profiles) <= set(allowed[0].profiles):
-            reasons.append("image is not approved for all claimed profiles")
+        else:
+            if not set(evidence.profiles) <= set(allowed[0].profiles):
+                reasons.append("image is not approved for all claimed profiles")
+            reasons.extend(_entry_gpu_problems(allowed[0], gpu_cc, gpu_count, nvswitch_count))
 
+    verdict.gpu_mode = gpu_cc.mode if gpu_cc is not None else None
+    verdict.gpu_devtools = gpu_cc.devtools if gpu_cc is not None else None
+    verdict.nvswitch_count = nvswitch_count
     return _seal(verdict, reasons, hardware, gpu_count)
 
 
-def _mock_gpu_ueids(gpu: bytes) -> list[str | None] | None:
+def _entry_gpu_problems(entry: AllowedMeasurement, cc: GpuCcSettings | None, gpu_count: int | None, nvswitch_count: int | None) -> list[str]:
+    """The GPU evidence must fit the manifest entry the measurements matched, not merely some entry."""
+    problems = []
+    if entry.gpu_mode is not None and (cc is None or cc.mode != entry.gpu_mode):
+        shown = f"{cc.mode} mode" if cc is not None else "no confidential-computing mode"
+        problems.append(f"the GPU evidence declares {shown}, but the manifest entry requires {entry.gpu_mode}")
+    if entry.gpus_per_enclave is not None and gpu_count != entry.gpus_per_enclave:
+        shown = "an uncounted number of" if gpu_count is None else str(gpu_count)
+        problems.append(f"the evidence attests {shown} GPU(s), but the manifest entry requires {entry.gpus_per_enclave} per enclave")
+    if entry.nvswitches_per_enclave is not None and nvswitch_count != entry.nvswitches_per_enclave:
+        shown = "an uncounted number of" if nvswitch_count is None else str(nvswitch_count)
+        problems.append(
+            f"the evidence attests {shown} NVSwitch(es), but the manifest entry requires {entry.nvswitches_per_enclave} per enclave"
+        )
+    return problems
+
+
+def _mock_gpu_devices(gpu: bytes, reasons: list[str]) -> tuple[list[str | None] | None, GpuCcSettings | None, list[str | None] | None]:
+    """(GPU ueids, declared mode, NVSwitch ueids) of simulated GPU evidence."""
     try:
         document = json.loads(gpu)
         gpus = document["gpus"]
     except (ValueError, KeyError, TypeError):
-        return None  # simulated evidence from before identities: verified, not counted
+        return None, None, None  # simulated evidence from before identities: verified, not counted
     if not isinstance(gpus, list):
-        return None
-    return [str(g["ueid"]) if isinstance(g, dict) and g.get("ueid") else None for g in gpus]
+        return None, None, None
+    ueids = [str(g["ueid"]) if isinstance(g, dict) and g.get("ueid") else None for g in gpus]
+    cc = None
+    if document.get("cc") is not None:
+        try:
+            cc = GpuCcSettings.model_validate(document["cc"])
+        except ValidationError:
+            reasons.append("malformed confidential-computing settings in the GPU evidence")
+    raw = document.get("switches") or []
+    switches = [str(s["ueid"]) if isinstance(s, dict) and s.get("ueid") else None for s in raw] if isinstance(raw, list) else []
+    reasons.extend(cc_problems(cc, None, len(switches)))
+    return ueids, cc, switches
 
 
 def _quote_claims(
@@ -691,6 +796,13 @@ class AttestationPolicy:
                     extra.append("the GPU verifier did not report which GPUs it attested")
                 elif len(verdict.hardware_tokens("gpu")) < verdict.gpu_count or verdict.gpu_count == 0:
                     extra.append("an attested GPU carries no device identity (ueid)")
+                if verdict.nvswitch_count and len(verdict.hardware_tokens("nvswitch")) < verdict.nvswitch_count:
+                    extra.append("an attested NVSwitch carries no device identity (ueid)")
+                # devtools keeps encryption but opens performance counters and debugging to the host.
+                if verdict.gpu_mode is None:
+                    extra.append("the GPU evidence declares no confidential-computing mode, so devtools mode is not ruled out")
+                elif verdict.gpu_devtools is not False:
+                    extra.append("the GPUs run in devtools mode, which production refuses")
             _seal(verdict, extra + verdict.reasons, verdict.hardware, verdict.gpu_count)
         return verdict
 

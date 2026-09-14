@@ -507,7 +507,9 @@ class Shape:
         if fields.get("pci_hole64_size") is not None:
             fields["pci_hole64_size"] = parse_size(fields["pci_hole64_size"])
         known = set(cls.__dataclass_fields__)
-        unknown = set(fields) - known - {"description", "profiles"}
+        # description, profiles, gpu_mode (publish.py's manifest entry) and gpu_device_ids (kuno-preflight --host)
+        # don't change any register.
+        unknown = set(fields) - known - {"description", "profiles", "gpu_mode", "gpu_device_ids"}
         if unknown:
             raise MeasureError(f"shape {fields.get('id')}: unknown fields {sorted(unknown)}")
         return cls(**{k: v for k, v in fields.items() if k in known})

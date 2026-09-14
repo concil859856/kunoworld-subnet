@@ -23,13 +23,19 @@ a first run on a dev network, and the mainnet requirements.
 | Class | GPUs | Serves |
 |---|---|---|
 | C1 | 1× RTX PRO 6000 Blackwell Server Edition (96 GB) | LTX-2.5 Fast |
-| C2 | 1× H200 (141 GB) | LTX-2.5 Pro, LTX-2.5 4K |
-| C4 | 4× H100/H200 (HGX, protected PCIe) | MiniMax H3, H3 Turbo, H3 Director |
-| C8 | 8× B200/B300 (HGX, encrypted NVLink) | H3 fast path, future flagship profiles |
+| C2 | 1× H200 (141 GB), B200 (180 GB) or B300 (288 GB) | LTX-2.5 Fast, Pro, 4K |
+| C4 | 4× H200, B200 or B300 per worker: two workers in one whole-server 8-GPU VM | MiniMax H3, H3 Turbo, H3 Director |
+
+An 8-GPU server (HGX H200, B200, B300, or 8× RTX PRO 6000 Server Edition) runs eight single-GPU
+C1/C2 VMs, each matching the same published measurement, or one 8-GPU VM for H3
+([image/CVM.md](image/CVM.md)). NVIDIA allows multi-GPU confidential computing only for whole
+8-GPU servers: on 8×H200 the traffic between GPUs inside the server is not encrypted (reading it
+takes physical access to the machine); B200 and B300 servers encrypt it, and single-GPU VMs have none.
 
 Required: Intel Xeon 5th gen (Emerald Rapids) or Xeon 6 (Granite Rapids) with TDX enabled,
 NVIDIA GPUs in confidential-computing mode, bare-metal BIOS access or a supported cloud
-confidential VM. Consumer GPUs (RTX 4090/5090) have no confidential mode and cannot join.
+confidential VM. Consumer GPUs (RTX 4090/5090) have no confidential mode and cannot join the
+confidential tier; they can serve Standard jobs on the open tier.
 
 **How the worker behaves** (`subnet/worker`)
 - Generates its HPKE and Ed25519 keys in memory at boot; they never leave the VM.

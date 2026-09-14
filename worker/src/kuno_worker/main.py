@@ -11,7 +11,7 @@ from kuno_protocol.attestation import MockTEE, OpenTEE, TdxTEE
 from kuno_protocol.canonical import b64d
 from kuno_protocol.crypto import signing_key_from_bytes
 
-from .attestation import build_gpu_collector
+from .attestation import NvmlCcSettings, build_gpu_collector, build_switch_collector
 from .backends import build_backends
 from .config import WorkerConfig
 from .hotkey import HotkeyConfigError, load_hotkey
@@ -26,7 +26,12 @@ SHUTDOWN_GRACE_S = 120.0
 def build_tee(config: WorkerConfig):
     if config.tee == "tdx":
         try:
-            return TdxTEE(gpu_collector=build_gpu_collector(config.gpu_evidence, config.nvattest_bin))
+            # The GPU mode goes into every GPU evidence bundle; Protected PCIe adds the VM's NVSwitch evidence.
+            return TdxTEE(
+                gpu_collector=build_gpu_collector(config.gpu_evidence, config.nvattest_bin),
+                switch_collector=build_switch_collector(config.nvattest_bin),
+                cc_settings=NvmlCcSettings(),
+            )
         except ValueError as exc:
             raise SystemExit(str(exc)) from None
     if config.tee == "mock":

@@ -35,18 +35,74 @@ make -C "$src" INSTALL_MOD_PATH="$DESTDIR/usr" INSTALL_MOD_STRIP=1 DEPMOD=true m
 rm -f "$DESTDIR/usr/lib/modules/$kver/build" "$DESTDIR/usr/lib/modules/$kver/source"
 install -m 0644 "$src/arch/x86/boot/bzImage" "$OUTPUTDIR/bzImage"
 
-# ---- NVIDIA open kernel modules and userspace
+# ---- NVIDIA open kernel modules and userspace, Fabric Manager and NSCQ (Protected PCIe)
 run="$inputs/NVIDIA-Linux-x86_64-$NVIDIA_VERSION.run"
 check "$run" "$NVIDIA_RUN_SHA256"
 sh "$run" --extract-only --target "$BUILDDIR/nvidia" >/dev/null
 make -C "$BUILDDIR/nvidia/kernel-open" -j"$jobs" SYSSRC="$src" SYSOUT="$src" modules
 install -d "$DESTDIR/usr/lib/modules/$kver/extra"
 install -m 0644 "$BUILDDIR"/nvidia/kernel-open/*.ko "$DESTDIR/usr/lib/modules/$kver/extra/"
-while read -r kind file; do
-  case "$kind" in ''|'#'*) continue ;; bin) dest=usr/bin ;; lib) dest=usr/lib/x86_64-linux-gnu ;; *) echo "bad line in nvidia.files" >&2; exit 1 ;; esac
-  file="${file//@VERSION@/$NVIDIA_VERSION}"
-  install -D -m 0755 "$BUILDDIR/nvidia/$file" "$DESTDIR/$dest/$file"
+fm="$BUILDDIR/fabricmanager"; nscq="$BUILDDIR/nscq"; libdir=usr/lib/x86_64-linux-gnu
+check "$inputs/fabricmanager-$NVIDIA_VERSION.tar.xz" "$NVIDIA_FABRICMANAGER_SHA256"
+check "$inputs/nscq-$NVIDIA_VERSION.tar.xz" "$NVIDIA_NSCQ_SHA256"
+mkdir -p "$fm" "$nscq"
+tar -xJf "$inputs/fabricmanager-$NVIDIA_VERSION.tar.xz" -C "$fm" --strip-components=1
+tar -xJf "$inputs/nscq-$NVIDIA_VERSION.tar.xz" -C "$nscq" --strip-components=1
+while read -r kind file target; do
+  file="${file//@VERSION@/$NVIDIA_VERSION}"; target="${target//@VERSION@/$NVIDIA_VERSION}"
+  case "$kind" in
+    ''|'#'*) continue ;;
+    bin) install -D -m 0755 "$BUILDDIR/nvidia/$file" "$DESTDIR/usr/bin/$file" ;;
+    lib) install -D -m 0755 "$BUILDDIR/nvidia/$file" "$DESTDIR/$libdir/$file" ;;
+    fm-bin) install -D -m 0755 "$fm/$file" "$DESTDIR/usr/bin/${file##*/}" ;;
+    fm-lib) install -D -m 0755 "$fm/$file" "$DESTDIR/$libdir/${file##*/}" ;;
+    fm-cfg) install -D -m 0644 "$fm/$file" "$DESTDIR/usr/share/nvidia/nvswitch/${file##*/}" ;;
+    fm-share) install -d "$DESTDIR/usr/$file" && cp -R --no-preserve=ownership "$fm/$file/." "$DESTDIR/usr/$file/" ;;
+    fm-unit) install -D -m 0644 "$fm/$file" "$DESTDIR/usr/lib/systemd/system/${file##*/}" ;;
+    nscq-lib) install -D -m 0755 "$nscq/$file" "$DESTDIR/$libdir/${file##*/}" ;;
+    link) ln -sfn "$target" "$DESTDIR/$libdir/$file" ;;
+    *) echo "bad line in nvidia.files" >&2; exit 1 ;;
+  esac
 done < "$SRCDIR/nvidia.files"
+
+# ---- nvattest, NVIDIA's Attestation SDK CLI, which NVIDIA's PPCIe verifier runs. Built as dstack's
+# os/mkosi/components/nvattest/nvattest-build.sh builds it: dstack's OCSP-freshness patch, its patch pinning the
+# CMake FetchContent inputs, and its Cargo.lock for the regorus FFI crate. dstack builds in a fixed path because
+# Rust hashes RUSTFLAGS into symbols; whether this step is byte-reproducible here is unverified.
+check "$inputs/nvattest-ocsp-freshness.patch" "$NVATTEST_OCSP_PATCH_SHA256"
+check "$inputs/nvattest-pin-fetchcontent.patch" "$NVATTEST_FETCHCONTENT_PATCH_SHA256"
+check "$inputs/regorus-ffi-Cargo.lock" "$NVATTEST_REGORUS_LOCK_SHA256"
+nvat="$BUILDDIR/attestation-sdk"
+git init --quiet "$nvat"
+git -C "$nvat" fetch --quiet --depth=1 "$NVATTEST_REPOSITORY" "$NVATTEST_REVISION"
+git -C "$nvat" checkout --quiet --detach FETCH_HEAD
+[ "$(git -C "$nvat" rev-parse HEAD)" = "$NVATTEST_REVISION" ] || { echo "attestation-sdk is not at $NVATTEST_REVISION" >&2; exit 1; }
+patch -d "$nvat" -p1 --fuzz=0 < "$inputs/nvattest-ocsp-freshness.patch"
+patch -d "$nvat" -p1 --fuzz=0 < "$inputs/nvattest-pin-fetchcontent.patch"
+export CFLAGS="-O2 -g0 -ffile-prefix-map=$BUILDDIR=/usr/src" CXXFLAGS="-O2 -g0 -ffile-prefix-map=$BUILDDIR=/usr/src"
+export CARGO_INCREMENTAL=0 RUSTFLAGS="--remap-path-prefix=$BUILDDIR=/usr/src -C strip=debuginfo"
+cmake -S "$nvat/nv-attestation-cli" -B "$BUILDDIR/nvattest-build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+  -DNVAT_BUILD_TESTS=OFF -DNVAT_BUILD_SAMPLES=OFF -DCMAKE_SKIP_RPATH=ON -DFETCHCONTENT_FULLY_DISCONNECTED=OFF -DUSE_SYSTEM_DEPS=ON
+install -m 0644 "$inputs/regorus-ffi-Cargo.lock" "$BUILDDIR/nvattest-build/_deps/regorus-src/bindings/ffi/Cargo.lock"
+cmake --build "$BUILDDIR/nvattest-build" -j"$jobs"
+cmp "$inputs/regorus-ffi-Cargo.lock" "$BUILDDIR/nvattest-build/_deps/regorus-src/bindings/ffi/Cargo.lock"
+DESTDIR="$BUILDDIR/nvattest-stage" cmake --install "$BUILDDIR/nvattest-build" --prefix /usr
+install -D -m 0755 "$BUILDDIR/nvattest-stage/usr/bin/nvattest" "$DESTDIR/usr/bin/nvattest"
+cp -P "$BUILDDIR/nvattest-stage/usr/lib/"libnvat.so* "$DESTDIR/usr/lib/"
+unset CFLAGS CXXFLAGS RUSTFLAGS
+
+# ---- NVIDIA's PPCIe verifier (kuno-app: python3 -m ppcie.verifier.verification) and the two packages it imports
+# that Debian doesn't ship. Its declared dependencies are mostly lint and test tools, so none are installed from them.
+ppcie="$DESTDIR/usr/lib/kuno/ppcie"
+check "$inputs/$PPCIE_VERIFIER_FILE" "$PPCIE_VERIFIER_SHA256"
+check "$inputs/$NVIDIA_ML_PY_FILE" "$NVIDIA_ML_PY_SHA256"
+check "$inputs/$TIMEOUT_DECORATOR_FILE" "$TIMEOUT_DECORATOR_SHA256"
+install -d "$ppcie"
+python3 -m zipfile -e "$inputs/$PPCIE_VERIFIER_FILE" "$ppcie"
+python3 -m zipfile -e "$inputs/$NVIDIA_ML_PY_FILE" "$ppcie"
+rm -f "$ppcie/example.py"
+tar -xzf "$inputs/$TIMEOUT_DECORATOR_FILE" -C "$BUILDDIR"
+cp -R "$BUILDDIR/${TIMEOUT_DECORATOR_FILE%.tar.gz}/timeout_decorator" "$ppcie/"
 
 # ---- nvidia-ctk (CDI spec generation) at its pinned revision
 git clone --quiet https://github.com/NVIDIA/nvidia-container-toolkit "$BUILDDIR/nvidia-container-toolkit"

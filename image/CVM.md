@@ -19,7 +19,7 @@ an operator runs on a TDX host to prove the measured chain matches.
 - The mkosi build (kernel, NVIDIA driver).
 - The guest agent that extends RTMR3.
 - RTMR0 from dstack-mr on our images.
-- The TD launch command.
+- The TD launch command, and running several TDs on one server (`plan-host.py`).
 - The CI job.
 
 **Never done:** nothing has booted on a TDX host.
@@ -151,15 +151,16 @@ because dm-verity already guarantees the content. The layout without `KUNO_WEIGH
 |---|---|
 | `inputs.lock.json` | Every external input, pinned (see below). The only null is the release's worker image digest. |
 | `shapes.json` | VM shapes (vCPUs, memory, GPUs, disks, QEMU version) and the profiles each serves. Each is its own manifest entry. |
-| `fetch-inputs.sh` | `inputs`: downloads and hash-checks the kernel, OVMF and NVIDIA driver. `tools`: installs mkosi and dstack-mr at their pinned revisions. |
+| `fetch-inputs.sh` | `inputs`: downloads and hash-checks the kernel, OVMF, the NVIDIA driver, Fabric Manager, NSCQ, dstack's nvattest patches and NVIDIA's PPCIe verifier. `tools`: installs mkosi and dstack-mr at their pinned revisions. |
 | `build.sh` | The whole build (below). `--check` builds twice and compares every byte; `--pins` lists unpinned inputs. |
 | `mkosi/mkosi.conf`, `mkosi.build`, `mkosi.postinst.chroot`, `kernel/kuno.config`, `nvidia.files` | The root filesystem: systemd, podman, cryptsetup, busybox. The build script compiles the kernel and the NVIDIA open modules. Postinst masks every unit that could extend an RTMR or offer a login (no getty, no ssh). |
 | `pack-rootfs.sh` | Squashfs from a name-sorted tar with clamped metadata, then dm-verity appended (fixed salt and UUID). |
 | `mkinitrd.sh`, `initrd.files`, `initrd/init` | The initrd: busybox and veritysetup with the libraries listed, nothing else. It opens the root filesystem with the root hash from the measured command line, then `switch_root`. |
-| `rootfs/usr/lib/kuno/kuno-app`, `kuno-app.service`, `rootfs/etc/fstab` | Guest agent (RTMR3, weights, worker container); in-memory `/var` and `/tmp`. |
+| `rootfs/usr/lib/kuno/kuno-app`, `kuno-app.service`, `nvidia-persistenced.service`, `rootfs/etc/fstab` | Guest agent: RTMR3, weights, the GPUs' ready state (after NVIDIA's PPCIe verifier in Protected PCIe mode), and one worker container per GPU group (`KUNO_GPU_GROUPS`, §6). In-memory `/var` and `/tmp`. |
 | `measure.py` | Expected MRTD and RTMR0–3 per shape. |
 | `publish.py` | `entry`, `verify` and `compare-quote`. |
-| `launch-td.sh` | The QEMU command for a shape. |
+| `launch-td.sh` | The QEMU command for a shape. `--instance` and `--numa-node` run several TDs on one server (§6). |
+| `plan-host.py` | One `launch-td.sh` command per GPU of a multi-GPU server for a single-GPU shape, or one command for a whole-server `c8.*` shape, after checking the host (§6). |
 
 Pinned inputs:
 
@@ -171,9 +172,14 @@ Pinned inputs:
 | OVMF | from dstack's `mkosi-os-v0.6.0-rc4` release: archive sha256 `4efd96e7…`, `ovmf.fd` sha256 `7909f289…`, published single-pass MRTD `1b5c7f83…` |
 | dstack-mr | `44dd0fc8…` |
 | NVIDIA driver | 595.91.07 (sha256 `ca23c88d…`) |
+| Fabric Manager, NSCQ | NVIDIA's 595.91.07 redistributable archives (sha256 `c91cd6e2…`, `86fbe59a…`) |
+| nvattest | NVIDIA/attestation-sdk `9d12801c…` (2026.06.09), with dstack's two patches and regorus Cargo.lock at dstack `44dd0fc8…` |
+| NVIDIA PPCIe verifier | `nv-ppcie-verifier` 2.0.0 (`bfe171cd…`), `nvidia-ml-py` 12.575.51 (`eb864180…`), `timeout-decorator` 0.5.0 (`6a2f2f58…`) |
 | SOURCE_DATE_EPOCH | `1788220800` |
 
-Every value except SOURCE_DATE_EPOCH is dstack's own pin, recorded as such.
+Every value except SOURCE_DATE_EPOCH and the PPCIe verifier's Python packages is dstack's own pin, recorded as such.
+The Fabric Manager and NSCQ hashes are also in NVIDIA's `redistrib_595.91.07.json`. The Python packages carry
+PyPI's hashes. Every one of these downloads matched its pin on 2026-09-14.
 
 ```bash
 sudo image/cvm/fetch-inputs.sh tools image/cvm/.tools                   # needs git and cargo
@@ -187,7 +193,7 @@ sudo image/cvm/build.sh --out out/cvm --weights weights.json --check    # writes
 3. Build the mkosi root filesystem tree and kernel, then add the worker OCI archive to the tree.
 4. `pack-rootfs.sh` and `mkinitrd.sh`.
 5. Normalize the kernel's setup header.
-6. Write the command line, `metadata.json` (dstack-mr compatible), `build.json` and `sha256sum.txt`.
+6. Write the command line, `metadata.json` (dstack-mr compatible), `build.json`, a copy of `shapes.json` and `sha256sum.txt`.
 7. `measure.py` per shape, with dstack-mr for RTMR0 and a cross-check of MRTD, RTMR1 and RTMR2.
 
 Nothing written names the build machine, its paths or the time. A null pin stops the build unless
@@ -245,7 +251,8 @@ checks it lists the measurements.
        --weights ltx-2.5=out/weights/ltx-2.5 --env worker.env --hotkey-seed hotkey.seed --run
    ```
    Pass `worker.env` with `KUNO_GATEWAY_URL`, `KUNO_PROFILES`, `KUNO_MINER_HOTKEY` and `KUNO_MODEL_DIGEST`;
-   `kuno-app` ignores other keys. Watch the serial log (`launch-c2.h200-141gb.x1/serial.log`):
+   `kuno-app` ignores other keys. Watch the serial log (`launch-c2.h200-141gb.x1/serial.log`, or
+   `launch-<shape>.<n>/serial.log` with `--instance n`):
    - `kuno-app: RTMR3 = <hex>` must equal the manifest's `rtmr3`;
    - the worker must register.
 4. **Quote.** Run the worker against a gateway you operate with `KUNO_ATTESTATION=production` (or
@@ -272,6 +279,170 @@ checks it lists the measurements.
    - Add a NIC: RTMR0 changes.
    - Boot with `debug=on`: `compare-quote` reports debug, and the verifier refuses.
 
+## 6. Several TDs on one server
+
+Confidential GPU miners on Chutes (SN64) run 8-GPU TDX servers: 8× RTX PRO 6000 Blackwell Server Edition, HGX
+H200, HGX B200 and B300. On such a server a KunoWorld miner runs one single-GPU TD per GPU. Every TD boots the same shape, so all of them
+match the same manifest entry.
+
+**NVIDIA mode.** Single GPU Passthrough CC mode (SPT) puts one GPU in each confidential VM and allows several such
+VMs on one server. NVIDIA's R595 Trusted Computing release notes list SPT for:
+- H100 PCIe, H100 NVL, H200 NVL and the H800 variants;
+- HGX H100 and H200 8-GPU, HGX H20 and H20A;
+- HGX B200, B200-850 and HGX B300;
+- RTX PRO 6000 Blackwell Server Edition, including LC.
+
+The multi-GPU modes belong to the whole-server shapes (below):
+- Hopper PPCIe puts all 8 GPUs and 4 NVSwitches in one CVM.
+- Blackwell MPT puts up to 8 GPUs in one CVM, with encrypted NVLink.
+
+NVIDIA's Confidential Containers stack requires every GPU on the host to be in one VM. `launch-td.sh` is plain QEMU
+and is not bound by that rule.
+
+**Plan and launch.**
+
+```bash
+image/cvm/plan-host.py --shape c2.b200-180gb.x1 --release out/cvm/a -- \
+    --weights ltx-2.5=out/weights/ltx-2.5 --env worker.env --hotkey-seed hotkey.seed
+```
+
+`plan-host.py` reads sysfs and prints one command per GPU (`--json` for tooling), for example:
+
+```bash
+image/cvm/launch-td.sh out/cvm/a c2.b200-180gb.x1 --instance 0 --gpu 0000:18:00.0 --numa-node 0 \
+    --weights ltx-2.5=out/weights/ltx-2.5 --env worker.env --hotkey-seed hotkey.seed
+```
+
+Append `--run` to boot. The TDs differ only where RTMR0 does not look:
+- **vsock guest CID 3 + n.** vhost-vsock CIDs must be unique on the host. The CID stays out of RTMR0 according to
+  three sources, read but never booted, so this is unverified:
+  - QEMU keeps the CID in the device's virtio config space and passes it to the kernel with an ioctl, never in ACPI.
+  - The pinned dstack-mr's ACPI model has no CID input.
+  - dstack-vmm gives every VM its own CID from a pool, under one measurement.
+
+  All TDs reach the QGS on host CID 2, and `kuno-app` does not use vsock. Keep other VMs on the host (dstack-vmm's pool starts at 1000) off CIDs 3 + n.
+- **State directory `launch-<shape>.<n>`**, holding the data disk, the weights list and the serial log. The weights
+  images are attached read-only, so the TDs can share one copy.
+- **Host NUMA node.** `--numa-node N` runs QEMU under `numactl --cpunodebind=N --membind=N`, which keeps vCPUs and
+  guest memory, bounce buffers included, next to the GPU. `plan-host.py` passes each GPU's node; `--numa-node auto`
+  reads the first GPU's. No `-numa` option is added, so the guest still sees one flat node.
+  Unverified: that the host kernel honours `--membind` for TD private memory. Check with `numastat -p <qemu pid>`.
+
+`plan-host.py` refuses to plan:
+- a shape with more than one GPU;
+- a GPU not bound to vfio-pci (it prints the `driverctl` command), or two GPUs in one IOMMU group;
+- more TDs than the host's CPUs and memory hold after the reserve. The reserve is `--reserve-cpus` (default 8) and
+  `--reserve-memory` (default 64G), plus an estimated 2 GiB per TD for QEMU and page tables;
+- with pinning, more TDs on a node than that node holds, because `--membind` is strict. The usual cause is sub-NUMA
+  clustering (SNC) splitting each socket. Disable it, or pass `--no-numa`.
+
+**One measurement per shape, not per host layout.** RTMR0 hashes QEMU's ACPI tables. Showing host NUMA to the
+guest adds `-numa` nodes, and so an SRAT table, plus a PCIe expander bridge per node; dstack-vmm does both when
+hugepages are on. The measurement then depends on how each server's BIOS lays out nodes and GPUs. That is why
+Chutes publishes one set per layout, for example `8xRTX_PRO_6000 [10.2.1, NUMA2-3/5]` and
+`8xb200 [10.2.1, XEON6, SNC3]`, for 8-GPU guests.
+
+A single-GPU TD needs one node, and the host can place it there. So the guest stays flat, one manifest entry per
+shape covers every server, and the manifest does not grow with the hardware miners buy. The whole-server `c8.*`
+shapes are flat too, but span both sockets, so they run unpinned. `launch-td.sh` refuses hugepages.
+
+**Sizing.** Each single-GPU shape is sized so that eight TDs fit on a 2-socket, 2 TB server, pinned four per
+socket, with the default reserve. Each whole-server shape is sized to fit that server alone:
+
+| Shape | vCPUs | Memory | Server threads |
+|---|---|---|---|
+| `c2.h200-141gb.x1` | 24 | 224 GiB | 224 (DGX H200: 2× Xeon Platinum 8480C) |
+| `c2.b200-180gb.x1` | 24 | 192 GiB | 224 (DGX B200: 2× Xeon Platinum 8570) |
+| `c2.b300-288gb.x1` | 28 | 224 GiB | 256 (DGX B300: 2× Xeon 6776P) |
+| `c8.h200-141gb.x8`, `c8.b200-180gb.x8`, `c8.b300-288gb.x8` | 192 | 1792 GiB | 224 or 256 |
+
+The server specs come from vendor pages and were not checked on hardware. Eight `c2.h200-141gb.x1` TDs take
+8 × 226 = 1808 of the 1936 GiB left after the reserve on a host showing 2000 GiB, and 904 of each node's 968.
+`protocol/tests/test_cvm_image.py` checks every fit against fake hosts. The B300 shapes have less RAM than VRAM:
+`c2.b300-288gb.x1` has 224 GiB for a 288 GB GPU, and `c8.b300-288gb.x8` has 1792 GiB for 2304 GB of VRAM. A
+2 TB server can't hold more, and whether H3 needs it is unmeasured.
+
+### Whole-server TDs for MiniMax H3
+
+H3 runs on four GPUs with Ulysses sequence parallelism. NVIDIA supports no four-GPU confidential VM on an HGX
+baseboard, so each H3 shape takes the whole 8-GPU server into one TD and runs two workers of four GPUs:
+
+| Shape | NVIDIA mode | In the TD | GPU-to-GPU traffic | Ready state |
+|---|---|---|---|---|
+| `c8.h200-141gb.x8` | Protected PCIe | 8 GPUs, 4 NVSwitches, Fabric Manager | **not encrypted** | NVIDIA's PPCIe verifier |
+| `c8.b200-180gb.x8`, `c8.b300-288gb.x8` | Multi-GPU passthrough CC | 8 GPUs (NVSwitches and Fabric Manager stay on the host, `PARTITION_RAIL_POLICY=symmetric`) | encrypted NVLink | `nvidia-smi conf-compute -srs 1` |
+
+Host setup per mode:
+- **Protected PCIe:** switch every GPU and NVSwitch into the mode with
+  `nvidia_gpu_tools.py --set-ppcie-mode=on --reset-after-ppcie-mode-switch`, one device at a time.
+- **Multi-GPU passthrough:** turn CC mode on for every GPU, and run Fabric Manager on the host.
+
+Then plan and boot the TD:
+
+```bash
+image/cvm/plan-host.py --shape c8.h200-141gb.x8 --release out/cvm/a -- \
+    --weights h3=out/weights/h3 --env worker.env --hotkey-seed hotkey.seed
+# prints: image/cvm/launch-td.sh out/cvm/a c8.h200-141gb.x8 --gpu … (8) --nvswitch … (4) --weights … --env …
+```
+
+`plan-host.py` checks that the host shows exactly the shape's GPUs and NVSwitches, that every one is bound to
+vfio-pci with an IOMMU group, and that the TD's CPUs and memory fit after the reserve. `launch-td.sh` refuses any
+other NVSwitch count. It puts each NVSwitch behind its own root port after the GPUs, with the port numbers
+continuing, the way dstack-vmm does (`configure_gpus`: GPUs, then bridges). The pinned dstack-mr counts
+`num_gpus + num_nvswitches` root ports on `pcie.0` for that.
+
+`worker.env` sets the layout, and `kuno-app` starts one container per group:
+
+```
+KUNO_PROFILES=h3-turbo,h3,h3-reference
+KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7
+```
+
+- **Devices.** Each container gets its group's CDI devices, `nvidia.com/gpu=<index>`, and in Protected PCIe mode
+  the NVSwitch device nodes and the root filesystem's NSCQ library.
+- **Layout checks.** `kuno-app` refuses overlapping groups, missing indices, and a group whose size isn't every
+  listed profile's `gpus_per_worker`. The table it checks against is measured with the root filesystem.
+- **Supervision.** If one worker exits, `kuno-app` stops the other and fails, and systemd restarts both.
+- **H3 runtime ports.** The workers share the host network namespace, so worker *i* gets
+  `KUNO_H3_FL2VA_URL=http://127.0.0.1:30010+10i` and `KUNO_H3_REF2VA_URL=…:30011+10i`. Its runtime servers must
+  listen there.
+- **No layout set.** One worker with every GPU, as before.
+
+Why a hostile layout can't claim more GPUs than it has:
+- each worker's GPU evidence covers only the GPUs its container opens;
+- the gateway binds every GPU to one enclave;
+- capacity is attested GPUs ÷ `gpus_per_worker`;
+- the manifest entry's `gpus_per_enclave` (4) refuses any other group size.
+
+**Readiness in Protected PCIe mode.** `kuno-app` starts Fabric Manager, clears the ready state, and runs NVIDIA's
+PPCIe verifier (`python3 -m ppcie.verifier.verification --verifier local`). The verifier:
+1. checks the GPUs' and NVSwitches' modes through NVML and NSCQ;
+2. attests all 8 GPUs and 4 NVSwitches with nvattest;
+3. checks that GPU and NVSwitch reports name each other;
+4. only then sets the ready state.
+
+It exits 0 even on failure, so `kuno-app` reads the ready state back. The multi-GPU passthrough and single-GPU
+shapes set it with `nvidia-smi conf-compute -srs 1`, as before.
+
+### The 64-bit PCI hole
+
+Every GPU shape sets `pci_hole64_size` to `8T`. `launch-td.sh` passes `-global q35-pcihost.pci-hole64-size`, and
+`measure.py` passes `--pci-hole64-size` to dstack-mr. The reasoning, read in source and unverified on a TD:
+
+- **What dstack-mr models.** The pinned dstack-mr (`crates/qemu-acpi/src/dsdt/crs.rs`) writes the host bridge's
+  64-bit `_CRS` window as a fixed base, `0x3800_0000_0000`, plus `pci_hole64_size`, or QEMU's 32 GiB when unset.
+  It knows nothing about device BARs.
+- **What QEMU does.** q35 (`q35_host_get_pci_hole64_start/end`) builds the window from the 64-bit BARs the firmware
+  assigned, and extends it to base + hole size only when the BARs end below that.
+- **Why the default fails.** An H200's VRAM aperture is 256 GiB and a B300's 512 GiB (dstack's `vmm.toml`), so
+  one GPU already overruns 32 GiB. The window then ends where the GPUs' BARs end, and RTMR0 follows the GPU model
+  and count, which dstack-mr can't reproduce.
+- **Why `8T`.** It covers eight B300s twice over, so QEMU's window becomes base + 8 TiB, exactly dstack-mr's model.
+  dstack-vmm recommends `8T` for GPU hosts and still defaults to 0 so as not to change deployed measurements.
+
+This assumes two things about the firmware: that OVMF's 64-bit aperture starts at `0x3800_0000_0000`, and that it
+places BARs bottom-up from there. Confirm both from the first TD's event log (`measure.py --acpi-hashes`).
+
 ## What is unproven
 
 - **RTMR0 on our images.** dstack-mr's ACPI model follows dstack-vmm's QEMU command line: a root disk,
@@ -289,14 +460,33 @@ checks it lists the measurements.
 - **`kuno-app` on TDX.**
   - The RTMR3 sysfs write.
   - fw_cfg paths.
-  - podman with the NVIDIA CDI spec.
-  - `nvidia-smi conf-compute -srs 1`.
+  - podman with the NVIDIA CDI spec, and CDI's per-GPU names (`nvidia.com/gpu=<index>`) matching `nvidia-smi`'s indices.
+  - `nvidia-smi conf-compute -srs 1`, and reading Protected PCIe from `nvidia-smi conf-compute -mgm`.
   - Creating configfs-tsm reports as uid 0 with no capabilities inside the container.
+  - Two supervised workers, and the H3 runtimes of the second listening on ports 30020 and 30021.
+- **Protected PCIe in the guest.**
+  - Fabric Manager in the guest, started from the redistributable archive's unit and start script.
+  - NVIDIA's PPCIe verifier 2.0.0 installed without its declared dependencies, on Debian's python3,
+    cryptography, ecdsa and prettytable.
+  - nvattest built with dstack's recipe outside dstack's fixed build path, including reproducibility.
+  - NSCQ inside the worker containers with only the NVSwitch device nodes and the mounted library.
+  - That nvattest's NVSwitch evidence JSON has the shape of its GPU evidence.
+  - That the NVSwitch EAT's signature claim is `x-nvidia-switch-attestation-report-signature-verified`.
+  - That Blackwell multi-GPU passthrough reports NVML `multiGpuMode` NVLE (2), which the worker declares as `mpt`.
+  - 192 vCPUs in one TD.
 - **OVMF is a dstack release candidate.** Rebuild it from `edk2_revision` with dstack's patches, or move to
   a stable release, before mainnet.
 - **Turbo.** `TURBO.md`'s base measurements assume only RTMR3 differs between candidates. With the worker
   image inside the root filesystem, every worker release changes RTMR2 too. A Turbo base needs the image
   on its own verity disk, measured into RTMR3 only. `kuno-app`'s event order allows it; it is not built.
+- **Several TDs on one server.**
+  - That the vsock CID leaves RTMR0 unchanged. This was read in source only.
+  - That `numactl --membind` places TD private memory on the node.
+  - How HGX baseboards in SPT mode treat their NVSwitches and NVLink. For single-GPU shapes `plan-host.py`
+    skips NVSwitches; only the Protected PCIe whole-server shape takes them.
+  - That `pci_hole64_size = 8T` makes QEMU's 64-bit `_CRS` window equal dstack-mr's model whatever the GPUs
+    ("The 64-bit PCI hole"). It rests on reading QEMU, dstack-mr and OVMF.
+  - The B200 and B300 classes, like every C class, until they run on hardware.
 - **Physical attacks.** TEE.fail-style interposers can forge quotes on this whole chain; verified mode is
   the backstop (`VERIFIED_MODE.md`).
 
@@ -305,6 +495,10 @@ checks it lists the measurements.
 - dstack-mr, the formulas ported to `measure.py`, and its golden vectors: https://github.com/Dstack-TEE/dstack/tree/next/dstack/dstack-mr (`src/tdvf.rs`, `src/kernel.rs`, `src/tdx.rs`, `src/util.rs`, `src/machine.rs`, `src/acpi.rs`, `tests/tdvf_parse.rs`)
 - dstack mkosi OS build and pins: https://github.com/Dstack-TEE/dstack/blob/next/os/mkosi/mkosi.conf, `os/mkosi/versions.env`, `os/mkosi/scripts/make-release-artifacts.sh`, `os/image/normalize-kernel-header.py`, `os/image/kernel-cmdline.sh`
 - dstack-vmm QEMU command line: https://github.com/Dstack-TEE/dstack/blob/next/dstack/vmm/src/app/qemu.rs
+- dstack's ACPI model (no vsock CID input) and dstack-vmm's CID pool, at the pinned revision: https://github.com/Dstack-TEE/dstack/tree/44dd0fc8a6f392685ebc5ccfb206022189e5eed9/dstack/crates/qemu-acpi (`src/topology.rs`), `dstack/vmm/src/app.rs`
+- QEMU vhost-vsock guest CID: https://github.com/qemu/qemu/blob/v9.1.0/hw/virtio/vhost-vsock.c
+- NVIDIA Trusted Computing Solutions R595 release notes (SPT, PPCIe, MPT SKUs): https://docs.nvidia.com/595trd1-trusted-computing-solutions-release-notes.pdf; Confidential Containers platforms: https://docs.nvidia.com/datacenter/cloud-native/confidential-containers/latest/supported-platforms.html
+- DGX B200 and B300 hosts: https://www.nvidia.com/en-us/data-center/dgx-b200/, https://docs.nvidia.com/dgx/dgxb300-user-guide/introduction-to-dgxb300.html
 - dstack release with OVMF and published MRTD: https://github.com/Dstack-TEE/dstack/releases/tag/mkosi-os-v0.6.0-rc4
 - meta-dstack archived: https://github.com/Dstack-TEE/meta-dstack
 - RTMR sysfs ABI: https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-devices-virtual-misc-tdx_guest

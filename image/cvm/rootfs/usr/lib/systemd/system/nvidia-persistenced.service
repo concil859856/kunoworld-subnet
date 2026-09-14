@@ -1,0 +1,16 @@
+[Unit]
+Description=NVIDIA persistence daemon: keeps the driver's SPDM sessions with confidential-computing GPUs alive
+# NVIDIA's CC deployment guide: when no client holds a GPU the driver tears down its state, and a CC GPU will
+# not set up a new SPDM session without a reset. After dstack's os/common/nvidia/nvidia-persistenced.service.
+After=systemd-modules-load.service
+Before=kuno-app.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/sbin/modprobe nvidia
+ExecStartPre=/usr/sbin/modprobe nvidia-uvm
+ExecStart=/usr/bin/nvidia-persistenced --uvm-persistence-mode
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -13,12 +13,13 @@ Every failure is a GpuEvidenceUnavailable subclass whose message names the fix.
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import subprocess
-from typing import Callable
+from typing import Callable, Literal
 
 from kuno_protocol.attestation import GpuEvidenceUnavailable
-from kuno_protocol.nvidia import GpuEvidenceCollector, GpuEvidenceItem
+from kuno_protocol.nvidia import NVSWITCH_ARCH, GpuCcSettings, GpuEvidenceCollector, GpuEvidenceItem
 
 NVAT_DOWNLOADS = "https://developer.nvidia.com/nvat-downloads"
 _PEM_END = b"-----END CERTIFICATE-----"
@@ -48,15 +49,30 @@ def _check_nonce(gpu_nonce: bytes) -> None:
 
 
 class NvattestCollector:
-    """NVIDIA's supported path: `nvattest collect-evidence --device gpu --nonce … --format json`."""
+    """NVIDIA's supported path: `nvattest collect-evidence --device gpu --nonce … --format json`.
 
-    def __init__(self, binary: str = "nvattest", timeout_s: float = 120.0, run: Callable[..., subprocess.CompletedProcess] = subprocess.run):
-        self.binary, self.timeout_s, self._run = binary, timeout_s, run
+    `device="nvswitch"` collects a Protected PCIe VM's NVSwitch reports through NSCQ instead
+    (`--device nvswitch --nvswitch-evidence-source nscq`, NVAT CLI command reference). That needs the
+    NVSwitch device nodes and NVIDIA's NSCQ library inside the container, which kuno-app passes in.
+    UNVERIFIED: nvattest's NVSwitch output is assumed to have the same JSON shape as its GPU output;
+    NVIDIA's PPCIe verifier 2.0.0 reads `evidences[].evidence` from both.
+    """
+
+    def __init__(
+        self,
+        binary: str = "nvattest",
+        timeout_s: float = 120.0,
+        run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        device: Literal["gpu", "nvswitch"] = "gpu",
+    ):
+        self.binary, self.timeout_s, self._run, self.device = binary, timeout_s, run, device
 
     def collect(self, gpu_nonce: bytes) -> list[GpuEvidenceItem]:
         _check_nonce(gpu_nonce)
+        noun = "GPU" if self.device == "gpu" else "NVSwitch"
+        source = "nvml" if self.device == "gpu" else "nscq"
         command = [
-            self.binary, "collect-evidence", "--device", "gpu", "--gpu-evidence-source", "nvml",
+            self.binary, "collect-evidence", "--device", self.device, f"--{self.device}-evidence-source", source,
             "--nonce", gpu_nonce.hex(), "--format", "json",
         ]
         try:
@@ -82,14 +98,16 @@ class NvattestCollector:
             raise GpuEvidenceFailed(f"nvattest could not collect GPU evidence: {message} (code {result.get('result_code')})")
         entries = [e for e in result.get("evidences", []) if isinstance(e, dict)]
         if not entries:
-            raise GpuToolingMissing("nvattest found no GPUs: check GPU passthrough into the CVM")
+            raise GpuToolingMissing(f"nvattest found no {noun}s: check {noun} passthrough into the CVM")
         items, default_arch = [], next((e["arch"] for e in entries if e.get("arch")), None)
+        if default_arch is None and self.device == "nvswitch":
+            default_arch = NVSWITCH_ARCH
         for index, entry in enumerate(entries):
             if entry.get("nonce") and str(entry["nonce"]).lower() != gpu_nonce.hex():
-                raise GpuEvidenceFailed(f"nvattest returned evidence for GPU {index} under a different nonce")
+                raise GpuEvidenceFailed(f"nvattest returned evidence for {noun} {index} under a different nonce")
             arch = entry.get("arch") or default_arch
             if not (arch and entry.get("evidence") and entry.get("certificate")):
-                raise GpuEvidenceFailed(f"nvattest returned incomplete evidence for GPU {index}")
+                raise GpuEvidenceFailed(f"nvattest returned incomplete evidence for {noun} {index}")
             items.append(GpuEvidenceItem(arch=str(arch).upper(), evidence=entry["evidence"], certificate=entry["certificate"]))
         return items
 
@@ -100,6 +118,79 @@ def _without_root(pem_chain: bytes) -> bytes:
     return b"".join(certificates[:-1] if len(certificates) > 1 else certificates)
 
 
+def _pynvml(nvml=None):
+    if nvml is not None:
+        return nvml
+    try:
+        import pynvml
+    except ImportError:
+        raise GpuToolingMissing(
+            "nvidia-ml-py is not installed: install kuno-worker[nvidia], or put NVIDIA's nvattest CLI in the image"
+        ) from None
+    return pynvml
+
+
+def _multi_gpu_mode(nv) -> int | None:
+    """NVML's system multiGpuMode, or None where this nvidia-ml-py has no nvmlSystemGetConfComputeSettings."""
+    getter = getattr(nv, "nvmlSystemGetConfComputeSettings", None)
+    struct = getattr(nv, "c_nvmlSystemConfComputeSettings_v1_t", None)
+    if getter is None or struct is None:
+        return None
+    settings = struct()  # sets the struct version, as NVIDIA's PPCIe verifier does
+    result = getter(ctypes.byref(settings))
+    if result != getattr(nv, "NVML_SUCCESS", 0):
+        raise nv.NVMLError(result)
+    return int(settings.multiGpuMode)
+
+
+def _protected_pcie(nv) -> int:
+    return getattr(nv, "NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE", 1)
+
+
+class NvmlCcSettings:
+    """The GPUs' confidential-computing mode for GpuEvidenceBundle.cc, read from NVML.
+
+    NVML (nvidia-ml-py 13.610.43): multiGpuMode NONE=0, PROTECTED_PCIE=1, NVLE=2; devToolsMode OFF=0, ON=1.
+    In Protected PCIe mode NVIDIA's TDX deployment guide shows `CC State: OFF` next to `Multi-GPU Mode:
+    Protected PCIe`, so ccFeature off with multiGpuMode PROTECTED_PCIE is ppcie, not CC off.
+    UNVERIFIED: that Blackwell multi-GPU passthrough CC reports multiGpuMode NVLE (NVLink encryption);
+    NVIDIA does not document it. If it reports NONE, those VMs declare spt and a manifest entry that
+    requires mpt refuses them visibly.
+    """
+
+    def __init__(self, nvml=None):
+        self._nvml = nvml
+
+    def __call__(self) -> GpuCcSettings:
+        nv = _pynvml(self._nvml)
+        try:
+            nv.nvmlInit()
+        except nv.NVMLError as exc:
+            raise GpuToolingMissing(f"NVML failed to initialise ({exc}): is the NVIDIA driver loaded inside the CVM?") from None
+        try:
+            state = nv.nvmlSystemGetConfComputeState()
+            multi = _multi_gpu_mode(nv)
+            if multi == _protected_pcie(nv):
+                mode = "ppcie"
+            elif state.ccFeature != nv.NVML_CC_SYSTEM_FEATURE_ENABLED:
+                raise GpuCcModeOff(f"GPU confidential computing is off; {_CC_OFF_HINT}")
+            elif multi is None:
+                raise GpuToolingMissing("this nvidia-ml-py cannot read the GPUs' multi-GPU mode: install nvidia-ml-py >= 12.550")
+            elif multi == getattr(nv, "NVML_CC_SYSTEM_MULTIGPU_NVLE", 2):
+                mode = "mpt"
+            else:
+                mode = "spt"
+            devtools = state.devToolsMode != getattr(nv, "NVML_CC_SYSTEM_DEVTOOLS_MODE_OFF", 0)
+            return GpuCcSettings(mode=mode, devtools=devtools)
+        except nv.NVMLError as exc:
+            raise GpuEvidenceFailed(f"NVML could not report the GPUs' confidential-computing settings: {exc}") from None
+        finally:
+            try:
+                nv.nvmlShutdown()
+            except nv.NVMLError:
+                pass
+
+
 class NvmlCollector:
     """Reads the attestation report and certificate chain straight from the driver with nvidia-ml-py."""
 
@@ -107,15 +198,7 @@ class NvmlCollector:
         self._nvml = nvml
 
     def _module(self):
-        if self._nvml is not None:
-            return self._nvml
-        try:
-            import pynvml
-        except ImportError:
-            raise GpuToolingMissing(
-                "nvidia-ml-py is not installed: install kuno-worker[nvidia], or put NVIDIA's nvattest CLI in the image"
-            ) from None
-        return pynvml
+        return _pynvml(self._nvml)
 
     def collect(self, gpu_nonce: bytes) -> list[GpuEvidenceItem]:
         _check_nonce(gpu_nonce)
@@ -129,7 +212,8 @@ class NvmlCollector:
         except nv.NVMLError as exc:
             raise GpuToolingMissing(f"NVML failed to initialise ({exc}): is the NVIDIA driver loaded inside the CVM?") from None
         try:
-            if nv.nvmlSystemGetConfComputeState().ccFeature != nv.NVML_CC_SYSTEM_FEATURE_ENABLED:
+            # Protected PCIe GPUs report the CC feature off; their multi-GPU mode says they are protected.
+            if nv.nvmlSystemGetConfComputeState().ccFeature != nv.NVML_CC_SYSTEM_FEATURE_ENABLED and _multi_gpu_mode(nv) != _protected_pcie(nv):
                 raise GpuCcModeOff(f"GPU confidential computing is off; {_CC_OFF_HINT}")
             count = nv.nvmlDeviceGetCount()
             if count == 0:
@@ -175,6 +259,11 @@ class FirstAvailableCollector:
             except GpuToolingMissing as exc:
                 missing.append(str(exc))
         raise GpuToolingMissing("cannot collect NVIDIA GPU evidence: " + "; ".join(missing))
+
+
+def build_switch_collector(nvattest_bin: str = "nvattest") -> GpuEvidenceCollector:
+    """NVSwitch evidence for Protected PCIe VMs. Only nvattest collects it; TdxTEE calls it only in that mode."""
+    return NvattestCollector(nvattest_bin, device="nvswitch")
 
 
 def build_gpu_collector(kind: str = "auto", nvattest_bin: str = "nvattest") -> GpuEvidenceCollector:

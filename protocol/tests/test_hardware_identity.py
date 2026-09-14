@@ -216,8 +216,8 @@ def test_production_refuses_evidence_that_names_no_hardware(monkeypatch):
     platform = HardwareIdentity("cpu_platform", hardware_token("cpu_platform", b"p"), "intel-pck-ppid")
     gpu = HardwareIdentity("gpu", hardware_token("gpu", "1"), "nvidia-ueid")
 
-    def verified(hardware, gpu_count):
-        return lambda *args, **kwargs: Verdict(True, "e", hardware=list(hardware), gpu_count=gpu_count)
+    def verified(hardware, gpu_count, gpu_devtools=False):
+        return lambda *args, **kwargs: Verdict(True, "e", hardware=list(hardware), gpu_count=gpu_count, gpu_mode="spt", gpu_devtools=gpu_devtools)
 
     monkeypatch.setattr(attestation, "verify_evidence", verified([], None))
     refused = policy.verify(tdx, GoldenManifest())
@@ -231,6 +231,9 @@ def test_production_refuses_evidence_that_names_no_hardware(monkeypatch):
     monkeypatch.setattr(attestation, "verify_evidence", verified([platform, gpu], 1))
     accepted = policy.verify(tdx, GoldenManifest())
     assert accepted.ok and accepted.hardware == [platform, gpu]
+
+    monkeypatch.setattr(attestation, "verify_evidence", verified([platform, gpu], 1, gpu_devtools=True))
+    assert any("devtools" in r for r in policy.verify(tdx, GoldenManifest()).reasons)
 
 
 # ---------------------------------------------------------------- tokens and capacity

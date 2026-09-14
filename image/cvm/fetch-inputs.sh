@@ -74,6 +74,15 @@ case "${1:-}" in
 
     nvidia_version="$(pin nvidia.driver_version)"
     fetch "$(pin nvidia.run_url)" "$(pin nvidia.run_sha256)" "$dir/NVIDIA-Linux-x86_64-$nvidia_version.run"
+    fetch "$(pin nvidia.fabricmanager.url)" "$(pin nvidia.fabricmanager.sha256)" "$dir/fabricmanager-$nvidia_version.tar.xz"
+    fetch "$(pin nvidia.nscq.url)" "$(pin nvidia.nscq.sha256)" "$dir/nscq-$nvidia_version.tar.xz"
+    fetch "$(pin nvidia.nvattest.ocsp_freshness_patch.url)" "$(pin nvidia.nvattest.ocsp_freshness_patch.sha256)" "$dir/nvattest-ocsp-freshness.patch"
+    fetch "$(pin nvidia.nvattest.pin_fetchcontent_patch.url)" "$(pin nvidia.nvattest.pin_fetchcontent_patch.sha256)" "$dir/nvattest-pin-fetchcontent.patch"
+    fetch "$(pin nvidia.nvattest.regorus_ffi_cargo_lock.url)" "$(pin nvidia.nvattest.regorus_ffi_cargo_lock.sha256)" "$dir/regorus-ffi-Cargo.lock"
+    for package in nv_ppcie_verifier nvidia_ml_py timeout_decorator; do
+      url="$(pin "ppcie_verifier.$package.url")"
+      fetch "$url" "$(pin "ppcie_verifier.$package.sha256")" "$dir/$(basename "$url")"
+    done
 
     cat > "$dir/pins.env" <<EOF
 KERNEL_VERSION=$kernel_version
@@ -81,6 +90,19 @@ KERNEL_SHA256=$(pin kernel.sha256)
 NVIDIA_VERSION=$nvidia_version
 NVIDIA_RUN_SHA256=$(pin nvidia.run_sha256)
 NVIDIA_CONTAINER_TOOLKIT_REVISION=$(pin nvidia.container_toolkit_revision)
+NVIDIA_FABRICMANAGER_SHA256=$(pin nvidia.fabricmanager.sha256)
+NVIDIA_NSCQ_SHA256=$(pin nvidia.nscq.sha256)
+NVATTEST_REPOSITORY=$(pin nvidia.nvattest.repository)
+NVATTEST_REVISION=$(pin nvidia.nvattest.revision)
+NVATTEST_OCSP_PATCH_SHA256=$(pin nvidia.nvattest.ocsp_freshness_patch.sha256)
+NVATTEST_FETCHCONTENT_PATCH_SHA256=$(pin nvidia.nvattest.pin_fetchcontent_patch.sha256)
+NVATTEST_REGORUS_LOCK_SHA256=$(pin nvidia.nvattest.regorus_ffi_cargo_lock.sha256)
+PPCIE_VERIFIER_FILE=$(basename "$(pin ppcie_verifier.nv_ppcie_verifier.url)")
+PPCIE_VERIFIER_SHA256=$(pin ppcie_verifier.nv_ppcie_verifier.sha256)
+NVIDIA_ML_PY_FILE=$(basename "$(pin ppcie_verifier.nvidia_ml_py.url)")
+NVIDIA_ML_PY_SHA256=$(pin ppcie_verifier.nvidia_ml_py.sha256)
+TIMEOUT_DECORATOR_FILE=$(basename "$(pin ppcie_verifier.timeout_decorator.url)")
+TIMEOUT_DECORATOR_SHA256=$(pin ppcie_verifier.timeout_decorator.sha256)
 EOF
     echo "inputs verified in $dir" >&2
     ;;

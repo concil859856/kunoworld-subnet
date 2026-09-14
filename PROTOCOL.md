@@ -103,7 +103,9 @@ GPU evidence (`gpu_evidence`, base64url of these bytes) is:
 
 ```
 canonical_json({"format": "kuno/v1/nvidia-gpu", "nonce": hex(gpu_nonce),
-                "gpus": [{"arch": "HOPPER"|"BLACKWELL", "evidence": base64(SPDM report), "certificate": base64(PEM chain)}]})
+                "gpus": [{"arch": "HOPPER"|"BLACKWELL", "evidence": base64(SPDM report), "certificate": base64(PEM chain)}],
+                "cc"?: {"mode": "spt"|"ppcie"|"mpt", "devtools": bool},
+                "switches"?: [{"arch": "LS10", "evidence": base64(SPDM report), "certificate": base64(PEM chain)}]})
 ```
 
 `evidence` and `certificate` use standard base64, as NVIDIA's `nvattest collect-evidence` and NRAS
@@ -111,9 +113,34 @@ do. A verifier accepts it only if every GPU reports `measres` success, debug dis
 boot on, a matching report nonce and a verified report signature, and (NRAS) the overall
 result is true for `eat_nonce = hex(gpu_nonce)`.
 
+`gpus` lists only the GPUs the worker's container can open, so each worker of a multi-worker VM
+attests its own group. `cc` and `switches` are left out of the bytes when unset, so evidence from
+older workers keeps its bytes. `cc` is the GPUs' confidential-computing mode as the worker reads it
+from NVML:
+
+| `mode` | NVIDIA name | VM | GPU-to-GPU traffic |
+|---|---|---|---|
+| `spt` | Single GPU passthrough CC | one GPU | none |
+| `ppcie` | Protected PCIe (Hopper HGX 8-GPU) | all 8 GPUs and all 4 NVSwitches | NVLink, **not encrypted** |
+| `mpt` | Multi-GPU passthrough CC (Blackwell HGX) | up to 8 GPUs; Fabric Manager and NVSwitches stay on the host | NVLink, encrypted |
+
+NVIDIA's signed GPU and NVSwitch claims say nothing about the mode or devtools, so `cc` is trusted
+exactly as far as the measured TD that REPORTDATA binds it to. `switches` holds a Protected PCIe VM's
+NVSwitch reports, collected through NSCQ for the same `gpu_nonce`; every worker in the VM attests
+all of them. A verifier refuses evidence whose devices don't fit `cc`:
+- `ppcie` needs Hopper GPUs and at least one switch;
+- `spt` and `mpt` carry no switches;
+- `mpt` needs Blackwell GPUs;
+- evidence without `cc` carries no switches.
+
+It verifies switches like GPUs, with NRAS's `/v4/attest/switch` or `nvattest attest --device nvswitch`.
+Each switch must report `measres` success, debug disabled, secure boot on,
+`x-nvidia-switch-attestation-report-nonce-match` and `x-nvidia-switch-attestation-report-signature-verified`.
+The last claim's name is assumed by analogy with the GPU claim and is unverified.
+
 Development "mock quotes" are `canonical_json({"body": {"tee":"mock","measurements":…,"report_data":hex,"platform_id":hex}, "signature": b64url})`,
 signed over `"kuno/v1/mock-quote\n" + canonical_json(body)` with a key listed in the manifest.
-Mock GPU evidence is `canonical_json({"mock_gpu", "nonce", "cc_mode", "gpus": [{"ueid": hex}, …]})`.
+Mock GPU evidence is `canonical_json({"mock_gpu", "nonce", "cc_mode", "gpus": [{"ueid": hex}, …], "cc"?, "switches"?: [{"ueid": hex}, …]})`.
 Production manifests list no mock keys, and a production verifier refuses `tee: "mock"` outright.
 
 **Open tier (`tee: "open"`).** A miner without a TEE (PRIVACY_MODES.md) sends evidence with
@@ -135,6 +162,7 @@ dictionary is never used for identity.
 |---|---|---|
 | `cpu_platform` | PPID: the 16-byte OCTET STRING at OID `1.2.840.113741.1.13.1.1` in the PCK leaf certificate carried in the quote's certification data (type 6 → type 5 PEM chain). The DCAP verifier has already checked that certificate up to Intel's root. dcap-qvl ≥ 0.6 returns the same value as `VerifiedReport.ppid`. | `body.platform_id` of the signed mock quote |
 | `gpu` | The `ueid` claim of each GPU's EAT: NRAS detached tokens with a verified ES384 signature, or `nvattest` claims | `gpus[].ueid` of mock GPU evidence, which REPORTDATA binds to the quote |
+| `nvswitch` | The `ueid` claim of each NVSwitch's EAT, from the same verifiers. Only a Protected PCIe VM has them. | `switches[].ueid` of mock GPU evidence |
 
 Each raw identifier is published only as a token:
 
@@ -148,11 +176,13 @@ It keeps raw serials out of feeds. It does not stop someone who already holds a 
 confirming it.
 
 A verdict also carries `gpu_count`, the number of GPUs the verifier attested (`None` if the
-verifier did not count them). Rules:
+verifier did not count them), `nvswitch_count`, and the evidence's `gpu_mode` and `gpu_devtools`
+(`None` when `cc` is absent). Rules:
 
-- Evidence that lists the same GPU twice is refused.
-- Production verifiers also refuse TDX evidence that yields no PPID, or any attested GPU
-  without a `ueid`.
+- Evidence that lists the same GPU, or the same NVSwitch, twice is refused.
+- Production verifiers also refuse TDX evidence that yields no PPID, any attested GPU or NVSwitch
+  without a `ueid`, evidence without `cc` (devtools mode can't be ruled out), and `devtools: true`
+  (devtools keeps encryption but opens performance counters and debugging to the host).
 
 ## Golden manifest
 
@@ -185,6 +215,26 @@ SHA-256("kuno/v1/weights\n" | canonical_json({"identity": {recipe, precision, tr
 over every file the recipe reads (`kuno-devkit weights-digest --profile P --hardware-class C --models-dir D`).
 Readers older than this field ignore it and therefore fail to verify a manifest that sets it: upgrade
 gateways and validators before publishing one.
+
+Each `AllowedMeasurement` entry may also say what the GPU evidence of an enclave that matches it must
+show. The check uses the entry the measurements matched, not merely some entry:
+
+| Field | Meaning | Refusal when it differs |
+|---|---|---|
+| `gpu_mode` | `spt`, `ppcie` or `mpt` (see "Attestation binding") | the evidence's `cc.mode`, or no `cc` at all |
+| `gpus_per_enclave` | GPUs one enclave attests | `gpu_count`, or an uncounted verifier |
+| `nvswitches_per_enclave` | NVSwitches one enclave attests: 4 on an 8×H200 Protected PCIe VM, 0 otherwise | `nvswitch_count` |
+
+`image/cvm/publish.py entry` fills them from a shape that names its `gpu_mode`.
+`gpus_per_enclave` is the shape's profiles' common `gpus_per_worker`, and `nvswitches_per_enclave`
+is the shape's `num_nvswitches`. `publish.py` refuses a shape that doesn't fit its mode:
+- `spt`: one GPU, no switches;
+- `ppcie`: 8 GPUs, 4 switches;
+- `mpt`: 2–8 GPUs, no switches.
+
+Each field is left out of the entry's signed bytes when unset, like `open_tier`. Readers older than
+these fields drop them and fail to verify a manifest that sets them, so upgrade gateways and
+validators first.
 
 ## Miner registration and hotkey proof
 
@@ -231,7 +281,7 @@ Registration, after the evidence verifies:
 | `gpu_count` is below the largest `gpus_per_worker` | `422 insufficient_gpus` |
 | Any identity is held by a fresh enclave of a **different** `miner_hotkey` | `409 hardware_in_use` (the other hotkey is not named) |
 | Same hotkey, and the enclaves share a GPU, or share the platform while either side has no GPU identities | The older enclave is marked `stale` and listed in `replaced`. A GPU is in one VM at a time, so this is a restart. |
-| Same hotkey, same platform, disjoint GPUs | Both stay active: one host split into several confidential VMs |
+| Same hotkey, same platform, disjoint GPUs | Both stay active: one host split into several confidential VMs, or one Protected PCIe VM running a worker per GPU group. Shared `nvswitch` identities don't replace anything. |
 
 - When `gpu_count` is unknown (a development verifier that only answers yes or no), capacity
   is not checked.
@@ -305,9 +355,21 @@ video can look it up at `GET /v1/provenance/{sha256}`.
 
 ## Model switch
 
-The owner signs `"kuno/v1/switch\n" + canonical_json(SwitchConfig)` with Ed25519. Modes: `h3`,
-`ltx`, `both`, `auto`. `issued_at` must increase. Validators read the same signed document to
-split serving emissions between families (`emission_split`).
+The owner signs `"kuno/v1/switch\n" + canonical_json(SwitchConfig.signed_fields())` with Ed25519.
+Modes: `h3`, `ltx`, `both`, `auto`. `issued_at` must increase. Validators read the same signed
+document to split serving emissions between families (`emission_split`) and to pay for ready
+capacity (VALIDATING.md, "Capacity pay"):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `capacity_share` | `0` | fraction (0–1) of the serving mechanism's miner emission paid for ready, attested confidential-tier GPUs; `0` pays nothing for capacity |
+| `capacity_targets` | `{}` | family → number of GPUs the network wants; a family without a target earns no capacity pay, and GPUs beyond it dilute instead of adding pay |
+| `capacity_min_uptime_s` | `3600` | continuous verified uptime a GPU needs before its run counts |
+
+Each capacity field is left out of the signed bytes while it holds its default, so switches signed
+before the fields existed still verify, and pay nothing for capacity. Readers older than these
+fields drop them and so fail to verify a switch that sets them: upgrade gateways and validators
+before publishing one.
 
 ## Verified mode: step commitments and audit openings
 

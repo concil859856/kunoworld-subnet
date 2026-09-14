@@ -10,15 +10,22 @@ Modes:
   both  customer picks per request; default_family when unspecified
   auto  prefer default_family, fall back to the other family when the preferred
         one is unavailable (region license, disabled profile, no capacity)
+
+Capacity pay (VALIDATING.md, "Capacity pay"): `capacity_share` of the serving miners' emission
+pays for ready, attested confidential-tier GPUs, up to `capacity_targets` GPUs per family, once
+a GPU has been verified continuously for `capacity_min_uptime_s`. At their defaults (0, none,
+3600) these fields are left out of the signed bytes, so switches signed before they existed
+still verify and pay nothing for capacity.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .canonical import b64d, b64e, canonical_json
 from .crypto import verify_signature
@@ -35,6 +42,13 @@ _MODE_FAMILIES: dict[str, frozenset[str]] = {
 }
 
 
+DEFAULT_CAPACITY_MIN_UPTIME_S = 3600
+# PLACEHOLDERS, NOT DECISIONS: the owner has not set capacity pay. Dev networks sign these (`placeholder_switch`, used by
+# `kuno-devkit init`) so capacity pay runs end to end; a switch that doesn't set them pays nothing for capacity.
+PLACEHOLDER_CAPACITY_SHARE = 0.25
+PLACEHOLDER_CAPACITY_TARGETS = {FAMILY_H3: 8, FAMILY_LTX: 4}  # GPUs: two 4-GPU H3 workers, four 1-GPU LTX workers
+
+
 class SwitchConfig(BaseModel):
     version: int = 1
     issued_at: int = Field(default_factory=lambda: int(time.time()))
@@ -45,6 +59,33 @@ class SwitchConfig(BaseModel):
     h3_authorized_everywhere: bool = False
     # Share of serving emissions per family; validators normalize over families in use.
     emission_split: dict[str, float] = Field(default_factory=lambda: {FAMILY_H3: 0.6, FAMILY_LTX: 0.4})
+    # Capacity pay: the fraction of the serving miners' emission paid for ready confidential-tier GPUs (0 pays none);
+    # family -> GPUs the network wants (a family without a target earns no capacity pay, and GPUs beyond it dilute
+    # instead of adding emission); and the continuous verified uptime a GPU needs before its run counts.
+    capacity_share: float = 0.0
+    capacity_targets: dict[str, int] = Field(default_factory=dict)
+    capacity_min_uptime_s: int = DEFAULT_CAPACITY_MIN_UPTIME_S
+
+    @field_validator("capacity_share")
+    @classmethod
+    def _check_capacity_share(cls, value: float) -> float:
+        if not (math.isfinite(value) and 0.0 <= value <= 1.0):
+            raise ValueError("capacity_share must be between 0 and 1")
+        return value
+
+    @field_validator("capacity_targets")
+    @classmethod
+    def _check_capacity_targets(cls, value: dict[str, int]) -> dict[str, int]:
+        if any(target < 0 for target in value.values()):
+            raise ValueError("a capacity target cannot be negative")
+        return value
+
+    @field_validator("capacity_min_uptime_s")
+    @classmethod
+    def _check_capacity_min_uptime(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("capacity_min_uptime_s cannot be negative")
+        return value
 
     def family_enabled(self, family: str) -> bool:
         return family in _MODE_FAMILIES[self.mode]
@@ -56,6 +97,22 @@ class SwitchConfig(BaseModel):
         if self.h3_authorized_everywhere and profile.license.region_policy == "minimax-h3":
             return True
         return not is_excluded(profile.license.region_policy, country)
+
+    def capacity_target(self, family: str) -> int:
+        """GPUs this family's capacity pay is capped at; 0 when the switch sets no target."""
+        return self.capacity_targets.get(family, 0)
+
+    def signed_fields(self) -> dict:
+        """What the owner signs. The capacity fields are left out at their defaults (0, none, 3600), so switches signed
+        before they existed still verify."""
+        fields = self.model_dump(mode="json")
+        if not fields.get("capacity_share"):
+            fields.pop("capacity_share", None)
+        if not fields.get("capacity_targets"):
+            fields.pop("capacity_targets", None)
+        if fields.get("capacity_min_uptime_s") == DEFAULT_CAPACITY_MIN_UPTIME_S:
+            fields.pop("capacity_min_uptime_s", None)
+        return fields
 
 
 class SignedSwitch(BaseModel):
@@ -69,11 +126,18 @@ class SignedSwitch(BaseModel):
 
 
 def switch_message(config: SwitchConfig) -> bytes:
-    return b"kuno/v1/switch\n" + canonical_json(config.model_dump(mode="json"))
+    return b"kuno/v1/switch\n" + canonical_json(config.signed_fields())
 
 
 def sign_switch(owner_key, config: SwitchConfig) -> SignedSwitch:
     return SignedSwitch(config=config, signature=b64e(owner_key.sign(switch_message(config))))
+
+
+def placeholder_switch(**changes) -> SwitchConfig:
+    """The default switch with PLACEHOLDER capacity pay, for development networks. Every capacity number is a placeholder."""
+    return SwitchConfig(
+        **{"capacity_share": PLACEHOLDER_CAPACITY_SHARE, "capacity_targets": dict(PLACEHOLDER_CAPACITY_TARGETS), **changes}
+    )
 
 
 class RouteError(Exception):

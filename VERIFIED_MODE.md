@@ -73,10 +73,10 @@ default audit rate.
 
 | Profile | Runtime | Stages (steps) | Replayable | Hardware classes | Audit rate |
 |---|---|---|---|---|---|
-| `ltx-2.5-fast` | `diffusers-ltx2/1` | 8 + 3 (distilled + refine) | stage 0 | `C1.rtx-pro-6000-bw-se.x1`, `C2.h200-141gb.x1` | 5 % |
-| `ltx-2.5-pro` | `diffusers-ltx2/1` | 30 + 3 | stage 0 | `C2.h200-141gb.x1` | 3 % |
-| `ltx-2.5-4k` | `diffusers-ltx2/1` | 8 + 3 | stage 0 | `C2.h200-141gb.x1` | 3 % |
-| `h3-turbo` | `diffusers-modular-h3/1` | 8 | stage 0 | `C4.h100-sxm-80gb.x4.ulysses4`, `C4.h200-sxm-141gb.x4.ulysses4` | 3 % |
+| `ltx-2.5-fast` | `diffusers-ltx2/1` | 8 + 3 (distilled + refine) | stage 0 | `C1.rtx-pro-6000-bw-se.x1`, `C2.h200-141gb.x1`, `C2.b200-180gb.x1`, `C2.b300-288gb.x1` | 5 % |
+| `ltx-2.5-pro` | `diffusers-ltx2/1` | 30 + 3 | stage 0 | `C2.h200-141gb.x1`, `C2.b200-180gb.x1`, `C2.b300-288gb.x1` | 3 % |
+| `ltx-2.5-4k` | `diffusers-ltx2/1` | 8 + 3 | stage 0 | `C2.h200-141gb.x1`, `C2.b200-180gb.x1`, `C2.b300-288gb.x1` | 3 % |
+| `h3-turbo` | `diffusers-modular-h3/1` | 8 | stage 0 | `C4.h200-141gb.x4.ulysses4`, `C4.b200-180gb.x4.ulysses4`, `C4.b300-288gb.x4.ulysses4`: each is one of the two workers in a whole-server `c8.*` TD | 3 % |
 | `h3`, `h3-reference` | `diffusers-modular-h3/1` | 50 | stage 0 | as above | 2 % |
 
 Open-tier classes (`comparison: "tolerance"`, see [Tolerance mode](#tolerance-mode)) are listed
@@ -167,7 +167,7 @@ of RAM.
 MiniMax H3's noise is `(1, 24, F, H, W)`. The VAE's compression factors aren't documented, so this
 assumes 16× spatial and 4× temporal: 14 s at 1344×768 is 24×87×48×84 = 8.4 M elements, 16.8 MB per
 leaf. That is ≈ 860 MB per 50-step job and ≈ 150 MB for Turbo, about 17 GB over an hour of full
-H3 on a C4 node with a terabyte of RAM. If that proves too much, set `retention_checkpoint_every`
+H3 on one C4 worker, which shares its 8-GPU TD's 1.75 TB of RAM with the other worker. If that proves too much, set `retention_checkpoint_every`
 to 5 (≈ 190 MB per job) once an H3 replayer passes its golden set.
 
 Per-step overhead:

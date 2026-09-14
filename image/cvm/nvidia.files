@@ -1,6 +1,11 @@
-# NVIDIA userspace copied from the extracted .run into the root filesystem (mkosi.build). @VERSION@ is
-# the pinned driver version. Compute and CC only: no X, GL or Vulkan. Unverified against the 595 .run
-# layout until the first real build.
+# NVIDIA userspace copied into the root filesystem (mkosi.build). @VERSION@ is the pinned driver version.
+# Compute and CC only: no X, GL or Vulkan. Unverified against the 595 .run layout until the first real build.
+#   bin | lib <file>                 from the extracted driver .run
+#   fm-bin | fm-lib | fm-cfg | fm-unit <file>, fm-share <dir>
+#                                    from the Fabric Manager archive (Protected PCIe runs Fabric Manager in the guest)
+#   nscq-lib <file>                  from the NSCQ archive (NVSwitch evidence and state for Protected PCIe)
+#   link <name> <target>             a symlink in the library directory
+# The archive paths were listed from the pinned 595.91.07 archives; destinations follow dstack's nvidia-build.sh.
 bin nvidia-smi
 bin nvidia-persistenced
 lib libnvidia-ml.so.@VERSION@
@@ -8,3 +13,14 @@ lib libcuda.so.@VERSION@
 lib libnvidia-ptxjitcompiler.so.@VERSION@
 lib libnvidia-nvvm.so.@VERSION@
 lib libnvidia-cfg.so.@VERSION@
+fm-bin bin/nv-fabricmanager
+fm-bin bin/nvidia-fabricmanager-start.sh
+fm-lib lib/libnvfm.so.1
+link libnvfm.so libnvfm.so.1
+fm-cfg etc/fabricmanager.cfg
+fm-share share/nvidia/nvswitch
+fm-unit systemd/nvidia-fabricmanager.service
+nscq-lib lib/libnvidia-nscq.so.@VERSION@
+link libnvidia-nscq.so.2.0 libnvidia-nscq.so.@VERSION@
+link libnvidia-nscq.so.2 libnvidia-nscq.so.2.0
+link libnvidia-nscq.so libnvidia-nscq.so.2

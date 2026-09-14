@@ -5,8 +5,11 @@
 #      order (image/cvm/expected_rtmr3.py computes the same value off-host). RTMR3 must be all zeros
 #      when it starts, and must equal the replayed value when it is done, or the agent stops.
 #   2. Opens each weights image with that root hash and mounts it read-only under /models/<name>.
-#   3. Loads the worker image from the measured root filesystem, checks it is the measured digest,
-#      and runs it with host-provided settings reduced to an allowlist.
+#   3. Marks the GPUs ready for work: in Protected PCIe mode only after NVIDIA's PPCIe verifier has
+#      attested every GPU and NVSwitch and checked their NVLink topology.
+#   4. Loads the worker image from the measured root filesystem, checks it is the measured digest,
+#      and runs it with host-provided settings reduced to an allowlist: one worker container per GPU
+#      group (KUNO_GPU_GROUPS), or one worker with every GPU.
 #
 # Host inputs (QEMU fw_cfg, unmeasured and untrusted except through what RTMR3 records):
 #   opt/kuno/weights       lines "<name> <sha256 root hash> <data bytes>"; disk serial kuno-w-<name>
@@ -20,9 +23,12 @@ set -euo pipefail
 readonly RTMR3=/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384
 readonly FWCFG=/sys/firmware/qemu_fw_cfg/by_name/opt/kuno
 readonly IMAGE_TAR=/usr/share/kuno/worker.oci.tar
+# "<profile id> <gpus_per_worker>" per catalog profile, written into the measured root filesystem by build.sh.
+readonly GPUS_PER_WORKER=/usr/share/kuno/gpus-per-worker
+readonly PPCIE_VERIFIER=/usr/lib/kuno/ppcie
 readonly STATE=/run/kuno
 readonly ZEROS=000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-readonly ALLOWED_ENV=" KUNO_GATEWAY_URL KUNO_PROFILES KUNO_CAPACITY KUNO_MINER_HOTKEY KUNO_VERIFIED_HARDWARE_CLASS KUNO_MODEL_DIGEST KUNO_H3_FL2VA_URL KUNO_H3_REF2VA_URL KUNO_H3_TURBO_LORA KUNO_REATTEST_S KUNO_RETRY_MAX_S KUNO_PROVENANCE KUNO_GPU_EVIDENCE KUNO_SAFETY_REQUIRE_CLASSIFIER "
+readonly ALLOWED_ENV=" KUNO_GATEWAY_URL KUNO_PROFILES KUNO_CAPACITY KUNO_MINER_HOTKEY KUNO_VERIFIED_HARDWARE_CLASS KUNO_MODEL_DIGEST KUNO_H3_FL2VA_URL KUNO_H3_REF2VA_URL KUNO_H3_TURBO_LORA KUNO_REATTEST_S KUNO_RETRY_MAX_S KUNO_PROVENANCE KUNO_GPU_EVIDENCE KUNO_SAFETY_REQUIRE_CLASSIFIER KUNO_GPU_GROUPS "
 
 log() { printf 'kuno-app: %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
@@ -37,6 +43,49 @@ read_rtmr3() { od -An -v -tx1 "$RTMR3" | tr -d ' \n'; }
 # One write of exactly 48 bytes extends the register (Documentation/ABI/testing/sysfs-devices-virtual-misc-tdx_guest).
 extend_rtmr3() { printf '%s' "$1" | hex_to_bin | dd of="$RTMR3" bs=48 count=1 iflag=fullblock status=none; }
 
+# KUNO_GPU_GROUPS="0,1,2,3 4,5,6,7" runs one worker per group, and each container opens only its group's GPUs
+# (CDI devices nvidia.com/gpu=<index>), so each worker's GPU evidence covers only them. The value comes from the
+# host and is unmeasured, so these checks catch mistakes; they are not what stops a hostile layout overclaiming:
+#   - NVIDIA signs one report per physical GPU, the evidence lists only the GPUs the container can open, and
+#     verifiers refuse the same GPU twice in one evidence;
+#   - the gateway binds each GPU to one enclave: another hotkey's claim on it is refused, and the same hotkey's
+#     older enclave on it is replaced, so overlapping groups still leave one enclave per GPU;
+#   - an enclave's capacity is its attested GPUs // gpus_per_worker, and a manifest entry's gpus_per_enclave
+#     refuses any other group size.
+# gpu_groups <groups> <profiles, comma-separated> <gpus-per-worker table> <GPU index>...: the groups, one per line.
+gpu_groups() {
+  local spec="$1" profiles="$2" table="$3" size="" needed profile index group count=0
+  shift 3
+  local -A available=() used=() catalog=()
+  for index in "$@"; do available[$index]=1; done
+  while read -r profile needed; do
+    [ -n "${profile:-}" ] && catalog[$profile]="$needed"
+  done < "$table"
+  [ -n "$profiles" ] || die "KUNO_GPU_GROUPS needs KUNO_PROFILES, so every group can be sized to its profiles"
+  IFS=, read -ra list <<<"${profiles// /}"
+  for profile in "${list[@]}"; do
+    [ -n "$profile" ] || continue
+    needed="${catalog[$profile]:-}"
+    [[ "$needed" =~ ^[1-9][0-9]*$ ]] || die "profile $profile is not in the catalog"
+    [ -z "$size" ] || [ "$size" = "$needed" ] || die "profiles $profiles need different GPU counts per worker; run them in separate TDs"
+    size="$needed"
+  done
+  [ -n "$size" ] || die "KUNO_PROFILES names no profile"
+  for group in $spec; do
+    [[ "$group" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || die "GPU group $group must be comma-separated GPU indices"
+    IFS=, read -ra members <<<"$group"
+    [ "${#members[@]}" -eq "$size" ] || die "GPU group $group has ${#members[@]} GPU(s); profiles $profiles need $size per worker"
+    for index in "${members[@]}"; do
+      [ -n "${available[$index]:-}" ] || die "GPU $index in group $group is not in this VM"
+      [ -z "${used[$index]:-}" ] || die "GPU $index is in more than one group"
+      used[$index]=1
+    done
+    printf '%s\n' "$group"
+    count=$((count + 1))
+  done
+  [ "$count" -ge 1 ] || die "KUNO_GPU_GROUPS names no GPU group"
+}
+
 # `kuno-app --expected-rtmr3 <image digest> [root hash...]` prints the value these events replay to, with
 # the same functions and without touching the register: an in-guest cross-check of expected_rtmr3.py.
 if [ "${1:-}" = "--expected-rtmr3" ]; then
@@ -47,6 +96,13 @@ if [ "${1:-}" = "--expected-rtmr3" ]; then
     [ -n "$root" ] && value="$(replay "$value" "$(event_digest kuno/v1/rtmr3/weights "$root")")"
   done < <(printf '%s\n' "$@" | sort)
   printf '%s\n' "$value"
+  exit 0
+fi
+
+# `kuno-app --gpu-groups <groups> <profiles> <gpus-per-worker table> <GPU index>...` checks a layout off-host.
+if [ "${1:-}" = "--gpu-groups" ]; then
+  shift
+  gpu_groups "$@"
   exit 0
 fi
 
@@ -115,40 +171,129 @@ for i in "${!names[@]}"; do
 done
 
 # ---- GPUs: CDI spec for podman, then mark CC GPUs ready for workloads
+# nvidia-persistenced.service keeps the driver's SPDM sessions alive between the tools below and the workers.
 nvidia-ctk cdi generate --output=/run/cdi/nvidia.yaml >/dev/null
-nvidia-smi conf-compute -srs 1 >/dev/null || die "could not set the GPUs' confidential-computing ready state"
+gpu_mode=cc
+case "$(nvidia-smi conf-compute -mgm)" in *"Protected PCIe"*) gpu_mode=ppcie ;; esac  # "Multi-GPU Mode: Protected PCIe"
+if [ "$gpu_mode" = ppcie ]; then
+  # Protected PCIe (HGX H100/H200 8-GPU): all 8 GPUs and 4 NVSwitches are in this VM, and GPU-to-GPU NVLink
+  # traffic is not encrypted. Fabric Manager runs here. NVIDIA's PPCIe verifier checks the GPUs' and switches'
+  # modes, attests every GPU and NVSwitch with nvattest, checks that GPU and switch reports name each other,
+  # and only then sets the ready state. It exits 0 whatever happened, and an exception inside it leaves the
+  # ready state as it was, so the state is cleared first and read back afterwards.
+  systemctl start nvidia-fabricmanager.service || die "Fabric Manager did not start (needed for Protected PCIe)"
+  nvidia-smi conf-compute -srs 0 >/dev/null || die "could not clear the GPUs' ready state"
+  PYTHONPATH="$PPCIE_VERIFIER" python3 -m ppcie.verifier.verification --verifier local --log-level warn \
+    || die "NVIDIA's PPCIe verifier could not run"
+  nvidia-smi conf-compute -q | grep -Eq 'CC GPUs Ready State[[:space:]]*:[[:space:]]*Ready[[:space:]]*$' \
+    || die "NVIDIA's PPCIe verifier left the GPUs not ready: GPU or NVSwitch attestation or the topology check failed"
+else
+  # Single GPU passthrough and Blackwell multi-GPU passthrough CC. The network verifies every worker's GPU
+  # evidence at registration and at each challenge.
+  nvidia-smi conf-compute -srs 1 >/dev/null || die "could not set the GPUs' confidential-computing ready state"
+fi
 
-# ---- the worker
+# ---- the workers
 podman load --quiet --input "$IMAGE_TAR" >/dev/null
 [ "$(podman image inspect --format '{{.Id}}' "${config_digest#sha256:}")" = "${config_digest#sha256:}" ] \
   || die "the loaded image is not the measured one"
 
+declare -A host_env=()
+declare -a host_keys=()
+while IFS='=' read -r key value; do
+  [ -n "${key:-}" ] || continue
+  case "$ALLOWED_ENV" in
+    *" $key "*) [ -n "${host_env[$key]+set}" ] || host_keys+=("$key"); host_env[$key]="$value" ;;
+    *) log "ignoring host setting $key" ;;
+  esac
+done < <(fwcfg env)
+
 install -d -m 0700 "$STATE/secrets"
-env_file="$STATE/worker.env"
-{
-  printf 'KUNO_TEE=tdx\nKUNO_BACKEND=real\nKUNO_IMAGE_DIGEST=%s\nKUNO_WORKDIR=/var/lib/kuno/work\n' "$image_digest"
-  if [ -d /models/ltx-2.5 ]; then
-    # dm-verity already refuses any block that differs from the root hash RTMR3 records.
-    printf 'KUNO_LTX_MODELS_DIR=/models/ltx-2.5\nKUNO_WEIGHTS_VERIFY=size\n'
-  fi
-  while IFS='=' read -r key value; do
-    [ -n "${key:-}" ] || continue
-    case "$ALLOWED_ENV" in *" $key "*) printf '%s=%s\n' "$key" "$value" ;; *) log "ignoring host setting $key" ;; esac
-  done < <(fwcfg env)
-} > "$env_file"
-chmod 0600 "$env_file"
+seed_env=""
 if seed="$(fwcfg hotkey.seed)" && [ -n "$seed" ]; then
   printf '%s' "$seed" > "$STATE/secrets/hotkey.seed" && chmod 0400 "$STATE/secrets/hotkey.seed"
-  printf 'KUNO_HOTKEY_SEED_FILE=/run/secrets/hotkey.seed\n' >> "$env_file"
+  seed_env='KUNO_HOTKEY_SEED_FILE=/run/secrets/hotkey.seed'
 fi
 
+# write_env <file> [KEY=VALUE...]: a worker's settings. The listed pairs replace the host's value for their key.
+write_env() {
+  local file="$1" pair key
+  shift
+  local -A own=()
+  for pair in "$@"; do own[${pair%%=*}]=1; done
+  {
+    # Each container has its own tmpfs at /var/lib/kuno, so KUNO_WORKDIR is private to its worker.
+    printf 'KUNO_TEE=tdx\nKUNO_BACKEND=real\nKUNO_IMAGE_DIGEST=%s\nKUNO_WORKDIR=/var/lib/kuno/work\n' "$image_digest"
+    if [ -d /models/ltx-2.5 ]; then
+      # dm-verity already refuses any block that differs from the root hash RTMR3 records.
+      printf 'KUNO_LTX_MODELS_DIR=/models/ltx-2.5\nKUNO_WEIGHTS_VERIFY=size\n'
+    fi
+    for key in "${host_keys[@]}"; do
+      [ "$key" = KUNO_GPU_GROUPS ] || [ -n "${own[$key]:-}" ] || printf '%s=%s\n' "$key" "${host_env[$key]}"
+    done
+    [ "$#" -eq 0 ] || printf '%s\n' "$@"
+    [ -z "$seed_env" ] || printf '%s\n' "$seed_env"
+  } > "$file"
+  chmod 0600 "$file"
+}
+
 # uid 0 inside the container only so it can create configfs-tsm report entries; no capabilities.
-exec podman run --rm --name kuno-worker --network host --read-only --user 0:0 \
-  --cap-drop all --security-opt no-new-privileges \
-  --tmpfs /var/lib/kuno:rw,mode=0700 --tmpfs /tmp:rw,mode=1777 \
-  --device nvidia.com/gpu=all \
-  --volume /sys/kernel/config:/sys/kernel/config:rw \
-  --volume /models:/models:ro \
-  --volume "$STATE/secrets:/run/secrets:ro" \
-  --env-file "$env_file" \
-  "${config_digest#sha256:}"
+run_args=(--network host --read-only --user 0:0
+  --cap-drop all --security-opt no-new-privileges
+  --tmpfs /var/lib/kuno:rw,mode=0700 --tmpfs /tmp:rw,mode=1777
+  --volume /sys/kernel/config:/sys/kernel/config:rw
+  --volume /models:/models:ro
+  --volume "$STATE/secrets:/run/secrets:ro")
+if [ "$gpu_mode" = ppcie ]; then
+  # Every worker attests the VM's NVSwitches too: nvattest reads them through NSCQ, which opens the switch
+  # device nodes (not in the CDI spec) and must match this driver, so the root filesystem's copy is mounted in.
+  # UNVERIFIED on hardware: that these nodes and this library are all NSCQ needs inside a container.
+  for node in /dev/nvidia-nvswitchctl /dev/nvidia-nvswitch[0-9]*; do
+    [ -c "$node" ] && run_args+=(--device "$node")
+  done
+  nscq="$(readlink -f /usr/lib/x86_64-linux-gnu/libnvidia-nscq.so.2)" || die "NSCQ is missing from the root filesystem"
+  run_args+=(--volume "$nscq:/usr/lib/x86_64-linux-gnu/libnvidia-nscq.so.2:ro" --volume "$nscq:/usr/lib/x86_64-linux-gnu/libnvidia-nscq.so:ro")
+fi
+
+declare -a groups=()
+if [ -n "${host_env[KUNO_GPU_GROUPS]:-}" ]; then
+  mapfile -t gpu_indices < <(nvidia-smi --query-gpu=index --format=csv,noheader | tr -d ' ')
+  layout="$(gpu_groups "${host_env[KUNO_GPU_GROUPS]}" "${host_env[KUNO_PROFILES]:-}" "$GPUS_PER_WORKER" "${gpu_indices[@]}")"
+  mapfile -t groups <<<"$layout"
+fi
+
+if [ "${#groups[@]}" -eq 0 ]; then
+  write_env "$STATE/worker.env"
+  exec podman run --rm --name kuno-worker "${run_args[@]}" --device nvidia.com/gpu=all \
+    --env-file "$STATE/worker.env" "${config_digest#sha256:}"
+fi
+
+# One container per group, supervised: if any worker exits, the others are stopped and the agent fails, so
+# systemd restarts the whole set and the TD never quietly serves with part of its GPUs.
+declare -a pids=() workers=()
+stop_workers() {
+  local worker
+  for worker in "${workers[@]}"; do podman stop --ignore --time 60 "$worker" >/dev/null 2>&1 || true; done
+}
+trap 'stop_workers; exit 143' TERM INT
+for i in "${!groups[@]}"; do
+  worker="kuno-worker-$i"
+  devices=()
+  IFS=, read -ra members <<<"${groups[$i]}"
+  for gpu in "${members[@]}"; do devices+=(--device "nvidia.com/gpu=$gpu"); done
+  # Host networking shares one loopback, so each worker's H3 runtime servers get their own ports.
+  write_env "$STATE/worker-$i.env" \
+    "KUNO_H3_FL2VA_URL=http://127.0.0.1:$((30010 + 10 * i))" "KUNO_H3_REF2VA_URL=http://127.0.0.1:$((30011 + 10 * i))"
+  podman rm --force --ignore "$worker" >/dev/null
+  podman run --rm --name "$worker" "${run_args[@]}" "${devices[@]}" --env-file "$STATE/worker-$i.env" "${config_digest#sha256:}" &
+  pids+=("$!"); workers+=("$worker")
+  log "started $worker on GPUs ${groups[$i]}"
+done
+status=0
+wait -n "${pids[@]}" || status=$?
+exited=""
+for i in "${!pids[@]}"; do
+  kill -0 "${pids[$i]}" 2>/dev/null || exited="${exited:+$exited, }${workers[$i]} (GPUs ${groups[$i]})"
+done
+stop_workers
+die "worker ${exited:-?} exited with status $status; stopped the other workers"

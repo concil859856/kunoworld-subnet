@@ -35,6 +35,14 @@ land.
   read what it processes. A planned enterprise tier would answer this by routing only to hardware in
   verified data centers. It does not exist yet, so today treat every miner as able to attack
   its own hardware.
+- **GPU-to-GPU traffic on 8×H200 servers.** MiniMax H3 runs on four GPUs at once. On an HGX H200
+  server the GPUs are in NVIDIA's Protected PCIe mode, and **traffic between GPUs inside the server
+  is not encrypted**. It crosses the server's NVLink wiring and NVSwitch chips, which sit inside the
+  confidential VM rather than with the host, so reading it takes physical access to the server.
+  Traffic between CPU and GPU is still encrypted. NVIDIA supports no key rotation in this mode; a VM
+  restart is its workaround. On HGX B200 and B300 servers (multi-GPU passthrough CC), NVLink
+  traffic is encrypted. A single-GPU VM has no GPU-to-GPU traffic at all. Every enclave's
+  attestation states which of these modes its GPUs run in.
 - **Traffic shape.** The host sees connection timing, job duration, ciphertext sizes and
   power draw. Blobs are padded ([PROTOCOL.md](PROTOCOL.md#blobs-inputs-and-output-video)):
   inputs and outputs are sealed with their length inside the encryption and zeros up to a PADMÉ

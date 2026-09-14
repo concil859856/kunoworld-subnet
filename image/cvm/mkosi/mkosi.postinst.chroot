@@ -2,7 +2,8 @@
 # Runs inside the image after packages and extra trees are installed.
 set -eu
 
-systemctl enable kuno-app.service
+# nvidia-fabricmanager.service stays disabled: kuno-app starts it only in Protected PCIe mode.
+systemctl enable nvidia-persistenced.service kuno-app.service
 # Nothing may extend RTMRs besides kuno-app, and nothing may offer a login.
 systemctl mask \
   systemd-pcrphase.service systemd-pcrphase-initrd.service systemd-pcrphase-sysinit.service \

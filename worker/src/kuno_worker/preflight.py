@@ -2,6 +2,7 @@
 
     kuno-preflight              human-readable report, non-zero exit if blocked
     kuno-preflight --json       machine-readable
+    kuno-preflight --host       the TDX server under a confidential-tier TD, before booting the image (preflight_host.py)
 
 It reports what the host actually is (CPU, TDX/SEV, kernel, GPUs, confidential-computing
 mode, drivers, disk, ffmpeg, reachability of the gateway), which model profiles it could
@@ -209,7 +210,23 @@ def main() -> None:
     parser.add_argument("--gateway", help="also check that this gateway is reachable")
     parser.add_argument("--no-tee", action="store_true", help="judge for a dev network (simulated TEE) instead of mainnet")
     parser.add_argument("--json", action="store_true")
+    host_mode = parser.add_argument_group("TDX host (--host): the server a confidential-tier TD boots on")
+    host_mode.add_argument("--host", action="store_true", help="check this server before booting the CVM image on it")
+    host_mode.add_argument("--shapes", type=Path, help="shapes.json (default: subnet/image/cvm/shapes.json in a checkout)")
+    host_mode.add_argument("--release", type=Path, help="a CVM release directory holding shapes.json")
+    host_mode.add_argument("--qemu", default="qemu-system-x86_64", help="the QEMU binary launch-td.sh will run")
+    host_mode.add_argument("--gpu-tools", help="NVIDIA's nvidia_gpu_tools.py, to read GPU CC modes (needs root)")
+    host_mode.add_argument("--qgs-port", type=int, default=4050, help="vsock port of the quote generation service")
     args = parser.parse_args()
+
+    if args.host:
+        if args.gateway or args.no_tee:
+            parser.error("--host checks the server under the TD; --gateway and --no-tee judge a worker")
+        from kuno_worker.preflight_host import run_host
+
+        raise SystemExit(run_host(args.shapes, args.release, args.json, qemu=args.qemu, gpu_tools=args.gpu_tools, qgs_port=args.qgs_port))
+    if args.shapes or args.release or args.gpu_tools:
+        parser.error("--shapes, --release and --gpu-tools need --host")
 
     report = evaluate(probe(args.gateway), require_tee=not args.no_tee)
     if args.json:

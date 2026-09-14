@@ -11,6 +11,12 @@ open-tier admission and fraud) and changes only what a gated miner's verified wo
     pool_usd    = serving miners' alpha per tempo × TAO per alpha × USD per TAO
     weight_i    = owed_i / pool_usd, then renormalized
 
+  Capacity pay (VALIDATING.md, "Capacity pay"), when the switch's capacity_share is above 0, adds to usd_owed_i:
+    capacity_i  = Σ_family credited GPU-hours × gpu_hour_usd(family)    scoring.py's gated GPU-hours, already scaled
+                                                                        down to the switch's targets
+    Σ capacity_i × tempo_seconds / window_s is limited to capacity_share × pool_usd: above it, every miner's capacity
+    owed is scaled down by the same factor before it is added to its job owed.
+
   * Undersubscribed (Σ weight < 1): the residual is handled by `KUNO_PAY_RESIDUAL`. The only accepted
     value is `renormalize` (the default): weights are scaled up to sum to 1, so miners receive the whole
     pool and nothing is burned. `recycle` (the residual to the owner uid) is documented in VALIDATING.md
@@ -52,7 +58,7 @@ from .chain import SERVING_MECHID
 from .collateral import NETWORK_ENDPOINTS
 from .emission import EmissionReader, SubnetEmission, SubstrateEmissionReader
 from .price_feeds import DEFAULT_MAX_AGE_S, DEFAULT_TOLERANCE, PriceUnavailable, TaoUsd, TaoUsdOracle
-from .scoring import MinerScore, billable_seconds
+from .scoring import CapacityCredit, FamilyCapacity, MinerScore, billable_seconds
 
 log = logging.getLogger("kuno.validator.usd_pay")
 
@@ -118,6 +124,14 @@ class OwedWork:
     revenue_usd: float = 0.0
     revenue_jobs: int = 0
     revenue_unknown_jobs: int = 0
+    # Capacity pay, before the capacity_share cap: hotkey -> USD for its credited GPU-hours at the card's family rates,
+    # hotkey -> and family -> priced GPU-hours, family -> credited GPU-hours the card has no rate for (they earn nothing),
+    # and scoring's per-family figures (target, average GPUs, target scale, utilization).
+    capacity_usd: dict[str, float] = field(default_factory=dict)
+    capacity_gpu_hours: dict[str, float] = field(default_factory=dict)
+    capacity_family_gpu_hours: dict[str, float] = field(default_factory=dict)
+    capacity_unpriced: dict[str, float] = field(default_factory=dict)
+    capacity_families: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 def list_price_usd(entry: Mapping, profile: ModelProfile) -> float | None:
@@ -181,6 +195,33 @@ def usd_owed(
     return work
 
 
+def capacity_owed(
+    work: OwedWork, scores: Mapping[str, MinerScore], card: RateCard, families: Mapping[str, FamilyCapacity] | None = None
+) -> OwedWork:
+    """Adds capacity pay to `work`: each gated miner's credited GPU-hours (`MinerScore.capacity`, where scoring already
+    applied every gate and the target cap) × the card's `gpu_hour_usd` for the family. Empty unless the switch pays."""
+    for hotkey, miner in sorted(scores.items()):
+        if miner.reasons:
+            continue
+        for family, seconds in sorted(miner.capacity.items()):
+            hours = seconds / 3600.0
+            if hours <= 0:
+                continue
+            rate = card.gpu_hour_rate(family)
+            if rate is None:
+                work.capacity_unpriced[family] = work.capacity_unpriced.get(family, 0.0) + hours
+                continue
+            work.capacity_usd[hotkey] = work.capacity_usd.get(hotkey, 0.0) + hours * rate
+            work.capacity_gpu_hours[hotkey] = work.capacity_gpu_hours.get(hotkey, 0.0) + hours
+            work.capacity_family_gpu_hours[family] = work.capacity_family_gpu_hours.get(family, 0.0) + hours
+    for family, total in sorted((families or {}).items()):
+        work.capacity_families[family] = {
+            "target": float(total.target), "average_gpus": total.average_gpus, "target_scale": total.scale,
+            "utilization": total.utilization,
+        }
+    return work
+
+
 @dataclass
 class PayReport:
     at: float
@@ -201,8 +242,22 @@ class PayReport:
     miner_burned: float | None
     miner_alpha_per_tempo: float
     pool_usd_per_tempo: float
+    # Job and capacity owed together (capacity after its cap).
     owed_usd_window: float
     owed_usd_per_tempo: float
+    # Capacity pay: the switch's capacity_share; what credited GPU-hours are owed per tempo at card rates, the limit of
+    # capacity_share × pool_usd_per_tempo, the multiplier that keeps it under the limit (1 when already under), what is
+    # owed after it per tempo and over the window; priced GPU-hours per family, GPU-hours without a card rate, and
+    # scoring's per-family figures (target, average GPUs, target scale, utilization).
+    capacity_share: float
+    capacity_uncapped_usd_per_tempo: float
+    capacity_limit_usd_per_tempo: float
+    capacity_scale: float
+    capacity_usd_per_tempo: float
+    capacity_usd_window: float
+    capacity_gpu_hours: dict[str, float]
+    capacity_unpriced: dict[str, float]
+    capacity_families: dict[str, dict[str, float]]
     # Σ owed_i / pool_usd before renormalizing: below 1 undersubscribed, above 1 oversubscribed.
     subscription: float
     # Emission value ÷ miner USD owed (per tempo). Above 1: emissions subsidize miners beyond what they're owed.
@@ -222,9 +277,10 @@ class PayReport:
 
 def settle(
     work: OwedWork, emission: SubnetEmission, tao: TaoUsd, card: RateCard, now: float, window_s: float,
-    residual: str = RENORMALIZE,
+    residual: str = RENORMALIZE, capacity_share: float = 0.0,
 ) -> tuple[dict[str, float], PayReport]:
-    """Turns USD owed into weights against the pool's USD value. Pure: no chain, no network."""
+    """Turns USD owed into weights against the pool's USD value. Pure: no chain, no network. `capacity_share` is the
+    switch's: capacity owed per tempo is held to that share of the pool."""
     if residual not in RESIDUALS:
         raise ValueError(RECYCLE_REFUSED if residual == RECYCLE else f"unknown residual policy {residual!r}")
     if window_s <= 0:
@@ -238,6 +294,15 @@ def settle(
         )
     scale = emission.tempo_seconds / window_s
     owed_tempo = {hotkey: usd * scale for hotkey, usd in work.owed_usd.items() if usd > 0}
+    # Capacity pay: above capacity_share × pool, every miner's capacity owed is scaled down by the same factor.
+    capacity_limit = max(capacity_share, 0.0) * pool
+    capacity_uncapped = {hotkey: usd * scale for hotkey, usd in work.capacity_usd.items() if usd > 0}
+    uncapped_total = sum(capacity_uncapped.values())
+    capacity_scale = min(1.0, capacity_limit / uncapped_total) if uncapped_total > 0 else 1.0
+    capacity_tempo = {hotkey: value * capacity_scale for hotkey, value in capacity_uncapped.items()}
+    for hotkey, value in capacity_tempo.items():
+        if value > 0:
+            owed_tempo[hotkey] = owed_tempo.get(hotkey, 0.0) + value
     raw = {hotkey: value / pool for hotkey, value in owed_tempo.items()}
     subscription = sum(raw.values())
     if subscription <= 0:
@@ -247,6 +312,7 @@ def settle(
         # renormalize: scaled up when undersubscribed (no burn), scaled down when oversubscribed.
         weights = {hotkey: value / subscription for hotkey, value in raw.items()}
     owed_per_tempo = sum(owed_tempo.values())
+    capacity_window = {hotkey: usd * capacity_scale for hotkey, usd in work.capacity_usd.items() if usd > 0}
     emission_usd = emission.emission_alpha(window_s) * usd_per_alpha
     report = PayReport(
         at=now, netuid=emission.netuid, mechid=SERVING_MECHID, block=emission.block, residual=residual, regime=regime,
@@ -255,14 +321,21 @@ def settle(
         usd_per_tao=tao.usd_per_tao, tao_per_alpha=emission.tao_per_alpha, usd_per_alpha=usd_per_alpha,
         price_sources=dict(tao.quotes), moving_tao_per_alpha=emission.moving_tao_per_alpha, miner_burned=emission.miner_burned,
         miner_alpha_per_tempo=emission.miner_alpha_per_tempo, pool_usd_per_tempo=pool,
-        owed_usd_window=sum(work.owed_usd.values()), owed_usd_per_tempo=owed_per_tempo, subscription=subscription,
+        owed_usd_window=sum(work.owed_usd.values()) + sum(capacity_window.values()), owed_usd_per_tempo=owed_per_tempo,
+        capacity_share=capacity_share, capacity_uncapped_usd_per_tempo=uncapped_total, capacity_limit_usd_per_tempo=capacity_limit,
+        capacity_scale=capacity_scale, capacity_usd_per_tempo=sum(capacity_tempo.values()), capacity_usd_window=sum(capacity_window.values()),
+        capacity_gpu_hours=dict(work.capacity_family_gpu_hours), capacity_unpriced=dict(work.capacity_unpriced),
+        capacity_families={family: dict(figures) for family, figures in work.capacity_families.items()},
+        subscription=subscription,
         subsidy_ratio=pool / owed_per_tempo if owed_per_tempo > 0 else None,
         emission_usd_window=emission_usd, revenue_usd_window=work.revenue_usd, revenue_jobs=work.revenue_jobs,
         revenue_unknown_jobs=work.revenue_unknown_jobs,
         emission_to_revenue=emission_usd / work.revenue_usd if work.revenue_usd > 0 else None,
         miners={
             hotkey: {
-                "usd_owed": work.owed_usd[hotkey], "usd_owed_per_tempo": owed_tempo[hotkey], "seconds": work.seconds.get(hotkey, 0.0),
+                "usd_owed": work.owed_usd.get(hotkey, 0.0) + capacity_window.get(hotkey, 0.0), "usd_owed_per_tempo": owed_tempo[hotkey],
+                "seconds": work.seconds.get(hotkey, 0.0), "job_usd_owed": work.owed_usd.get(hotkey, 0.0),
+                "capacity_usd_owed": capacity_window.get(hotkey, 0.0), "capacity_gpu_hours": work.capacity_gpu_hours.get(hotkey, 0.0),
                 "raw_weight": raw[hotkey], "weight": weights.get(hotkey, 0.0),
             }
             for hotkey in sorted(owed_tempo)
@@ -378,12 +451,15 @@ class UsdPay:
         switch: SwitchConfig,
         now: float,
         window_s: float,
+        capacity: CapacityCredit | None = None,
     ) -> dict[str, float]:
         """Serving weights for a scored round, or PayUnavailable. `scores` supplies the gates: a miner with any
-        reason earns nothing, exactly as in VCU scoring."""
+        reason earns nothing, exactly as in VCU scoring. It also carries each miner's credited capacity, which
+        `capacity` (the round's CapacityCredit) describes per family."""
         card = self.rate_card()
         eligible = {hotkey for hotkey, miner in scores.items() if not miner.reasons}
         work = usd_owed(entries, eligible, card, profiles, switch, now, window_s)
+        capacity_owed(work, scores, card, capacity.families if capacity is not None else None)
         if self.reader is None or self.netuid is None:
             raise PayUnavailable("no chain is configured to read the emission pool from (run with --netuid)")
         try:
@@ -394,7 +470,7 @@ class UsdPay:
             tao = self.oracle.quote()
         except PriceUnavailable as exc:
             raise PayUnavailable(str(exc)) from exc
-        weights, report = settle(work, emission, tao, card, now, window_s, self.policy.residual)
+        weights, report = settle(work, emission, tao, card, now, window_s, self.policy.residual, switch.capacity_share)
         self.last_report = report
         self._log(report)
         self._export(report)
@@ -411,10 +487,22 @@ class UsdPay:
             report.owed_usd_per_tempo, ratio(report.subsidy_ratio), ratio(report.emission_to_revenue), report.emission_usd_window,
             report.revenue_usd_window, report.window_s, " [PLACEHOLDER RATE CARD]" if report.rate_card_placeholder else "",
         )
+        if report.capacity_gpu_hours or report.capacity_unpriced:
+            log.info(
+                "usd pay capacity: %.2f GPU-hours credited, owed $%.2f per tempo against a limit of $%.2f (capacity_share %.2f "
+                "of the pool), scale %.3f",
+                sum(report.capacity_gpu_hours.values()), report.capacity_uncapped_usd_per_tempo, report.capacity_limit_usd_per_tempo,
+                report.capacity_share, report.capacity_scale,
+            )
         for hotkey, miner in report.miners.items():
-            log.info("miner %s: owed $%.4f over the window ($%.6f per tempo), weight %.4f", hotkey, miner["usd_owed"], miner["usd_owed_per_tempo"], miner["weight"])
+            log.info(
+                "miner %s: owed $%.4f over the window ($%.6f per tempo; $%.4f of it for %.2f GPU-hours of capacity), weight %.4f",
+                hotkey, miner["usd_owed"], miner["usd_owed_per_tempo"], miner["capacity_usd_owed"], miner["capacity_gpu_hours"], miner["weight"],
+            )
         for key, seconds in sorted(report.unpriced.items()):
             log.warning("the rate card has no rate for %s: %.1f verified seconds earn nothing", key, seconds)
+        for family, hours in sorted(report.capacity_unpriced.items()):
+            log.warning("the rate card has no gpu_hour_usd for %s: %.2f credited GPU-hours earn nothing", family, hours)
 
     def _export(self, report: PayReport) -> None:
         if self.report_path is None:
