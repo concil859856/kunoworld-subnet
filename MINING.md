@@ -391,6 +391,10 @@ no TEE at all.
 golden manifest enables the open tier for the worker image (`open_tier.images`). Production
 manifests don't enable it by default; dev manifests from `kuno-devkit init` do, for the dev image.
 
+**At launch the open tier stays off** (owner's decision, 2026-09-15): mining needs a confidential VM, so attestation
+proves which image runs and every receipt is signed by keys generated inside it. Read this section as what the open
+tier does once the owner enables it, not as a way to mine today.
+
 **What you can see.** Everything about the standard jobs you run: prompts, inputs and videos, in
 your process memory. You never receive private jobs: the gateway doesn't route them to open-tier
 enclaves, fails one that reaches you before sending it, and validators treat a private-job receipt

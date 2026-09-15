@@ -183,6 +183,11 @@ Rules every implementation must keep:
 
 ## Verifying open-tier miners
 
+**The open tier is off at launch** (owner's decision, 2026-09-15): every miner runs in a confidential VM, so
+attestation proves which image served each job and a signed receipt ties every video to it. Production manifests
+already refuse open-tier images by default; enabling the tier is a later, deliberate step. The rest of this section
+describes what happens once it is enabled.
+
 Attestation can't prove what an open-tier miner ran, so its integrity rests on re-execution:
 
 - **Step audits on standard jobs.** A standard job has no privacy to protect from validators, so
