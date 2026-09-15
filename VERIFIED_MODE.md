@@ -13,8 +13,9 @@ deterministic toy denoiser in the mock backend. The LTX-2.5 and MiniMax H3 hooks
 (`worker/backends/verified_gpu.py`, `protocol/torch_verified.py`) and the GPU executors
 (`validator/executors.py`) are written against documented APIs but **have not run on a GPU**.
 They must pass the golden-set self-check on each hardware class (see [Phase 0](#phase-0-before-enabling-a-gpu-class))
-before any penalty depends on them. Nothing below is wired into `worker.py`, the gateway app or
-`Validator.step()` yet; see [Integration](#integration).
+before any penalty depends on them. The wiring described in [Integration](#integration) is now in place: the worker
+signs the commitment into its receipt and answers audits, the gateway relays and expires them, and the validator
+selects canaries, requests openings and feeds the outcomes into its penalties.
 
 ## Design in one picture
 
@@ -411,7 +412,18 @@ Not proven:
 
 ## Integration
 
-These files belong to other owners and weren't edited.
+Written as a hand-over list for other owners; all of it is now in place, except that `AuditCalls` still lives in
+`worker/audits.py` (wrapping the client) instead of moving into `gateway_client.py`. What each file does today:
+
+- **`worker/worker.py`**: signs `step_commitment` into the receipt body, discards retained openings when a job
+  fails after generation, holds `AuditResponder`, and dispatches pulled `kind == "audit"` work to it.
+- **gateway**: `app.py` includes `api_audits` and gives the opening route the blob body limit; `state.next_work`
+  claims one audit before capacity; `janitor` expires them.
+- **validator**: `Validator` builds an `Auditor`, keeps `CanaryRecord`s for succeeded canaries, and each round
+  selects, requests and polls audits, merging `auditor.penalties()` into scoring.
+- **backends**: `build_backends` passes the hardware class and the manifest's model digest to the resident backends.
+
+The original list, for reference:
 
 - **`worker/worker.py`**:
   - In `process()`, add `step_commitment=result.step_commitment` to the draft `ReceiptBody`. The
