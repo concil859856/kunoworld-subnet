@@ -68,6 +68,8 @@ def _write_wav(path: Path, audio, sample_rate: int) -> None:
 
     import numpy as np
 
+    if hasattr(audio, "detach"):  # a torch tensor: diffusers vocoders return it on the GPU, often bfloat16, which numpy rejects
+        audio = audio.detach().to("cpu").float().numpy()
     samples = np.asarray(audio)
     if samples.ndim == 2 and samples.shape[0] in (1, 2) and samples.shape[0] < samples.shape[1]:
         samples = samples.T  # (channels, n) -> (n, channels)

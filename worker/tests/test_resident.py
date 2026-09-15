@@ -156,6 +156,17 @@ def test_int16_and_mono_audio_are_accepted():
     assert encode_video(frames(24), fps=24, audio=mono, sample_rate=48000)[4:8] == b"ftyp"
 
 
+def test_bfloat16_audio_tensors_from_a_vocoder_are_accepted():
+    # LTX2Pipeline returns its vocoder's output as a torch tensor (on the GPU, bfloat16), which numpy cannot take directly.
+    torch = pytest.importorskip("torch")
+    audio = torch.sin(torch.linspace(0, 400, 24000)).repeat(2, 1).to(torch.bfloat16)  # (channels, samples)
+    data = encode_video(frames(24), fps=24, audio=audio, sample_rate=24000)
+    assert data[4:8] == b"ftyp"
+    info = probe(data)
+    if info:
+        assert any(s["codec_type"] == "audio" and s["sample_rate"] == "24000" for s in info["streams"])
+
+
 def test_frames_of_different_sizes_are_rejected():
     mixed = frames(4) + [np.zeros((10, 10, 3), dtype=np.uint8)]
     with pytest.raises(BackendError):

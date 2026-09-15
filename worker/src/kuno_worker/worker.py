@@ -6,6 +6,7 @@ import logging
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 
 import httpx
 from pydantic import ValidationError
@@ -34,6 +35,9 @@ from .safety import SafetyUnavailable, SafetyViolation, check_output, check_requ
 log = logging.getLogger("kuno.worker")
 
 PROGRESS_INTERVAL_S = 0.5
+# While a job runs the worker doesn't pull, and the gateway counts an enclave silent for a minute (enclave_heartbeat_s)
+# as gone. A render or an upload can block the job thread for longer, so a side thread repeats the last progress report.
+HEARTBEAT_S = 20.0
 
 
 class JobRejected(Exception):
@@ -95,6 +99,8 @@ class Worker:
         self.busy = False
         self._seen: set[str] = set()
         self._last_progress: dict[str, float] = {}
+        self._reported: dict[str, tuple[float, str]] = {}
+        self._canceled: set[str] = set()
         # Verified mode: retained step openings per job, discarded if the job fails after generation.
         self._openings: dict[str, object] = {}
         self.audits = AuditResponder(self.identity)
@@ -353,7 +359,8 @@ class Worker:
     def handle_job(self, job: MinerJob) -> Receipt | None:
         self.busy = True
         try:
-            return self.process(job)
+            with self._heartbeat(job.job_id):
+                return self.process(job)
         except JobRejected as exc:
             self._discard_openings(job.job_id)
             self._fail(job.job_id, exc.code, exc.message)
@@ -374,6 +381,8 @@ class Worker:
             # A delivered job keeps its openings for the retention window; the store expires them.
             self._openings.pop(job.job_id, None)
             self._last_progress.pop(job.job_id, None)
+            self._reported.pop(job.job_id, None)
+            self._canceled.discard(job.job_id)
             self.busy = False
         return None
 
@@ -393,12 +402,39 @@ class Worker:
             log.warning("could not report failure for job %s", job_id)
 
     def _progress(self, job_id: str, value: float, stage: str, force: bool = False) -> None:
+        if job_id in self._canceled:  # heard by the heartbeat
+            raise JobCanceled()
+        value = min(max(value, 0.0), 1.0)
+        self._reported[job_id] = (value, stage)
         now = time.time()
         if not force and now - self._last_progress.get(job_id, 0.0) < PROGRESS_INTERVAL_S:
             return
         self._last_progress[job_id] = now
-        if self.client.progress(job_id, min(max(value, 0.0), 1.0), stage):
+        if self.client.progress(job_id, value, stage):
             raise JobCanceled()
+
+    @contextmanager
+    def _heartbeat(self, job_id: str):
+        """Repeats the job's last progress report every HEARTBEAT_S while the job thread is busy, so the gateway keeps
+        this enclave fresh through a long render. A cancel it hears is raised at the job's next progress report."""
+        stop = threading.Event()
+
+        def beat() -> None:
+            while not stop.wait(HEARTBEAT_S):
+                value, stage = self._reported.get(job_id, (0.0, "starting"))
+                try:
+                    if self.client.progress(job_id, value, stage):
+                        self._canceled.add(job_id)
+                except (httpx.HTTPError, GatewayError) as exc:
+                    log.warning("heartbeat for job %s failed with %s", job_id, type(exc).__name__)
+
+        thread = threading.Thread(target=beat, name=f"kuno-heartbeat-{job_id[:8]}", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=1.0)
 
     # ------------------------------------------------------------ one job
 
