@@ -107,9 +107,10 @@ ARG SOURCE_DATE_EPOCH
 ARG DEBIAN_SNAPSHOT=20260721T000000Z
 USER root
 # A C/C++ toolchain: Triton builds its CUDA launcher with gcc the first time a kernel runs, and SGLang's
-# diffusion kernels include Triton and JIT-compiled ones. The packages come from snapshot.debian.org at a
-# fixed time, and apt checks them against that snapshot's signed Release files. The removed files hold
-# timestamps and caches only.
+# diffusion kernels include Triton and JIT-compiled ones. ffmpeg and ffprobe: SGLang's MiniMax H3 pipeline
+# refuses to start without both on PATH (media processing and output validation; found on the first GPU run).
+# The packages come from snapshot.debian.org at a fixed time, and apt checks them against that snapshot's
+# signed Release files. The removed files hold timestamps and caches only.
 RUN printf '%s\n' \
         'Types: deb' "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" 'Suites: bookworm bookworm-updates' \
         'Components: main' 'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' '' \
@@ -117,7 +118,7 @@ RUN printf '%s\n' \
         'Components: main' 'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
         > /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++ \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++ ffmpeg \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*.bin /var/cache/debconf/*-old /var/lib/dpkg/*-old \
         /var/log/apt /var/log/dpkg.log /var/log/alternatives.log /var/cache/ldconfig/aux-cache
 COPY --from=sglang-build /opt/sglang /opt/sglang
