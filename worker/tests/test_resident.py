@@ -156,6 +156,15 @@ def test_int16_and_mono_audio_are_accepted():
     assert encode_video(frames(24), fps=24, audio=mono, sample_rate=48000)[4:8] == b"ftyp"
 
 
+def test_audio_shorter_than_the_video_keeps_every_frame():
+    # LTX-2.5 renders 49 frames at 24 fps (2.042 s) with 2.010 s of audio; the last frame must survive the mux.
+    audio = np.zeros((96480, 2), dtype=np.float32)
+    info = probe(encode_video(frames(49), fps=24, audio=audio, sample_rate=48000))
+    if info:
+        video = next(s for s in info["streams"] if s["codec_type"] == "video")
+        assert int(video["nb_frames"]) == 49
+
+
 def test_bfloat16_audio_tensors_from_a_vocoder_are_accepted():
     # LTX2Pipeline returns its vocoder's output as a torch tensor (on the GPU, bfloat16), which numpy cannot take directly.
     torch = pytest.importorskip("torch")

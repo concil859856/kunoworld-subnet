@@ -44,7 +44,9 @@ def encode_video(frames, fps: float, audio=None, sample_rate: int = 48000, crf: 
         if audio is not None:
             wav = Path(tmp) / "audio.wav"
             _write_wav(wav, audio, sample_rate)
-            args += ["-i", str(wav), "-c:a", "aac", "-b:a", "192k", "-shortest"]
+            # The video decides the length: LTX-2.5's vocoder returns 2.010 s for 49 frames (2.042 s), and a bare
+            # -shortest cut the last frame. apad extends the audio with silence, so -shortest only trims longer audio.
+            args += ["-i", str(wav), "-c:a", "aac", "-b:a", "192k", "-af", "apad", "-shortest"]
         args += ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p",
                  "-movflags", "+faststart", str(out)]
 
