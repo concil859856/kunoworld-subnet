@@ -217,8 +217,13 @@ can send us.
 Not implemented yet:
 - running attestation end to end on a real TDX host with NVIDIA GPUs in CC mode: nothing
   below has produced or verified a live quote or live GPU evidence;
-- the confidential VM image and its measured boot chain (only the worker container layer is
-  built), and published golden measurements;
+- a confidential VM that has booted: the image and its measured boot chain (OVMF, kernel,
+  initrd, and the root filesystem and worker image on dm-verity) build, byte-identically twice on
+  one machine, and their MRTD and RTMR1–3 match dstack-mr, but no TD has booted from them on TDX
+  hardware, no weights disk was part of that build, and no golden measurements are published (the
+  manifest round-trip is proven only with a throwaway key). `image/CVM.md` lists what is unproven,
+  including RTMR0 on a real TD, reproducibility across machines, and OVMF being a dstack release
+  candidate;
 - a chosen per-GPU collateral amount, and the enterprise tier;
 - any accuracy evaluation of the safety classifiers (now baked into both worker images) or of
   the content policy's word lists on real traffic;
