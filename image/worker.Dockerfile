@@ -122,6 +122,13 @@ RUN printf '%s\n' \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*.bin /var/cache/debconf/*-old /var/lib/dpkg/*-old \
         /var/log/apt /var/log/dpkg.log /var/log/alternatives.log /var/cache/ldconfig/aux-cache
 COPY --from=sglang-build /opt/sglang /opt/sglang
+# SGLang JIT-compiles some kernels on first use and links them with -L$CUDA_HOME/lib64 -lcudart, where CUDA_HOME
+# is the pip CUDA 13 wheel. That wheel has lib/ (no lib64/) and only versioned sonames (libcudart.so.13), so
+# the first H3 forward pass failed with "cannot find -lcudart". Add lib64 and the unversioned names beside them.
+RUN set -e; cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
+    [ -e "$cuda/lib64" ] || ln -s lib "$cuda/lib64"; \
+    for f in "$cuda"/lib/lib*.so.[0-9]*; do name="${f%%.so.*}.so"; [ -e "$name" ] || ln -s "$(basename "$f")" "$name"; done; \
+    test -e "$cuda/lib64/libcudart.so"
 # The H3 weights are a Hugging Face hub cache mounted at /models/h3 (models--MiniMaxAI--MiniMax-H3/…), which
 # SGLang and diffusers both resolve offline. h3-turbo is not a default profile: see image/CVM.md.
 ENV KUNO_PROFILES=h3,h3-reference \
