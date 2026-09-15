@@ -22,9 +22,16 @@ from .media_tools import BackendError, encode_video
 from .resident import ModelStore, PipelineResult
 
 # The distilled transformer is trained for these sigmas; passing a step count instead
-# silently degrades quality (LTX documents this explicitly).
-DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
-SECOND_STAGE_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
+# silently degrades quality (LTX documents this explicitly). They equal diffusers'
+# DISTILLED_SIGMA_VALUES and STAGE_2_DISTILLED_SIGMA_VALUES: the scheduler appends the final 0.0
+# itself, so listing it here would add a zero-length step.
+DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875]
+SECOND_STAGE_SIGMAS = [0.909375, 0.725, 0.421875]
+# The distilled model runs without guidance; diffusers' two-stage example turns every guide off.
+DISTILLED_GUIDANCE = {
+    "guidance_scale": 1.0, "audio_guidance_scale": 1.0, "stg_scale": 0.0, "audio_stg_scale": 0.0,
+    "modality_scale": 1.0, "audio_modality_scale": 1.0,
+}
 FULL_STEPS = 30
 
 
@@ -58,12 +65,15 @@ def build_call(task: GenerationTask) -> dict[str, Any]:
     }
     if distilled:
         call["sigmas"] = DISTILLED_SIGMAS
-        call["second_stage_sigmas"] = SECOND_STAGE_SIGMAS
-        call["guidance_scale"] = 1.0
+        call.update(DISTILLED_GUIDANCE)
+        if call["pipeline"] == "text":
+            # Stage one at half size, the latents upsampled x2, then these sigmas at full size (runtimes.LtxAdapter).
+            call["second_stage_sigmas"] = SECOND_STAGE_SIGMAS
     else:
         call["num_inference_steps"] = FULL_STEPS
         call["guidance_scale"] = 3.0
         call["audio_guidance_scale"] = 7.0
+        call["use_cross_timestep"] = True  # as the LTX-2.5-Diffusers card runs transformer_full
         if task.negative_prompt:
             call["negative_prompt"] = task.negative_prompt
     if profile.limits.prompt_enhancer and task.options.get("enhance_prompt"):

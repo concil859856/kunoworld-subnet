@@ -471,7 +471,22 @@ def build_ltx_pipelines(models_dir: Path, plan: LoadPlan, device: str = "cuda") 
         module = getattr(base, name, None)
         if module is not None and spec.method != "none":
             log.info("%s: %.0f%% of parameters in %s", name, 100 * check_quantized(name, module, spec), spec.storage_dtype)
+    if recipe.transformer_subfolder == "transformer_full":
+        # The full model's schedule, as the LTX-2.5-Diffusers card configures it for transformer_full.
+        from diffusers import FlowMatchEulerDiscreteScheduler
+
+        base.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+            base.scheduler.config, use_dynamic_shifting=True, shift_terminal=0.1
+        )
     _apply_offload(base, plan.offload, device)
     # The condition pipeline shares the loaded (and offload-hooked) modules rather than loading a second copy.
     condition = LTX2ConditionPipeline(**base.components)
-    return {"text": base, "condition": condition, "audio": base, "dfr": base}
+    pipelines = {"text": base, "condition": condition, "audio": base, "dfr": base}
+    if (Path(models_dir) / "latent_upsampler").is_dir():
+        # The distilled two-stage recipe's x2 latent upsampler (runtimes.LtxAdapter), sharing the loaded VAE.
+        from diffusers import LTX2LatentUpsamplePipeline
+        from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+
+        upsampler = LTX2LatentUpsamplerModel.from_pretrained(str(models_dir), subfolder="latent_upsampler", torch_dtype=dtype)
+        pipelines["upsample"] = LTX2LatentUpsamplePipeline(vae=base.vae, latent_upsampler=upsampler.to(device))
+    return pipelines

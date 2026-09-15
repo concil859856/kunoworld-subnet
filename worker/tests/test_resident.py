@@ -7,13 +7,14 @@ import json
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from kuno_protocol.profiles import Mode, load_profiles
 from kuno_worker.backends.h3_resident import H3ResidentBackend, build_call as h3_call
-from kuno_worker.backends.ltx_resident import DISTILLED_SIGMAS, LtxResidentBackend, build_call as ltx_call, pipeline_kind
+from kuno_worker.backends.ltx_resident import DISTILLED_SIGMAS, SECOND_STAGE_SIGMAS, LtxResidentBackend, build_call as ltx_call, pipeline_kind
 from kuno_worker.backends.media_tools import BackendError, encode_video, ffmpeg_exe
 from kuno_worker.backends.resident import ModelStore, PipelineResult
 from kuno_worker.plan import build_task, example_task
@@ -169,17 +170,23 @@ def test_distilled_profiles_use_their_sigmas_not_a_step_count(tmp_path):
     assert call["sigmas"] == DISTILLED_SIGMAS and call["guidance_scale"] == 1.0
     assert "num_inference_steps" not in call
     assert call["num_frames"] == 121 and call["pipeline"] == "text"
+    # diffusers 0.40's DISTILLED_SIGMA_VALUES and STAGE_2_DISTILLED_SIGMA_VALUES; its scheduler appends the final 0.0.
+    assert DISTILLED_SIGMAS == [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875]
+    assert call["second_stage_sigmas"] == SECOND_STAGE_SIGMAS == [0.909375, 0.725, 0.421875]
+    assert (call["stg_scale"], call["audio_stg_scale"], call["modality_scale"], call["audio_guidance_scale"]) == (0.0, 0.0, 1.0, 1.0)
 
 
 def test_the_full_model_takes_steps_guidance_and_a_negative_prompt(tmp_path):
     call = ltx_call(task_for("ltx-2.5-pro", Mode.TEXT_TO_VIDEO, tmp_path, negative_prompt="blurry"))
     assert call["num_inference_steps"] == 30 and call["negative_prompt"] == "blurry"
-    assert "sigmas" not in call
+    assert "sigmas" not in call and "second_stage_sigmas" not in call
+    assert call["use_cross_timestep"] is True
 
 
 def test_frames_and_keyframes_become_conditions(tmp_path):
     flf = ltx_call(task_for("ltx-2.5-fast", Mode.FIRST_LAST_FRAME, tmp_path, duration_s=5, fps=24))
     assert [c["index"] for c in flf["conditions"]] == [0, 120]
+    assert "second_stage_sigmas" not in flf  # conditioned modes render in one stage
     assert pipeline_kind(PROFILES["ltx-2.5-fast"], Mode.FIRST_LAST_FRAME) == "condition"
 
     keys = ltx_call(task_for("ltx-2.5-fast", Mode.KEYFRAMES, tmp_path, duration_s=4, fps=24, time_s=2.0))
@@ -257,3 +264,54 @@ def test_an_empty_pipeline_result_fails_the_job_not_the_worker(tmp_path):
     backend = LtxResidentBackend(None, tmp_path / "work", loader=lambda _p: Empty())
     with pytest.raises(BackendError):
         backend.generate(task_for("ltx-2.5-fast", Mode.TEXT_TO_VIDEO, tmp_path, duration_s=2), NOOP)
+
+
+class _FakeLtxPipeline:
+    """Records diffusers calls: a latent request returns (video, audio) latents, any other the decoded clip."""
+
+    def __init__(self, rate: int = 24000):
+        self.calls: list[dict] = []
+        self.vocoder = SimpleNamespace(config=SimpleNamespace(output_sampling_rate=rate))
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("output_type") == "latent":
+            return "video-latents", "audio-latents"
+        return SimpleNamespace(frames=[["frame"]], audio=[["samples"]])
+
+
+def test_distilled_text_renders_in_two_stages_through_the_latent_upsampler(tmp_path):
+    pytest.importorskip("torch")
+    from kuno_worker.backends.runtimes import LtxAdapter
+
+    upsampled: list[dict] = []
+
+    def upsample(**kwargs):
+        upsampled.append(kwargs)
+        return ["upsampled-latents"]
+
+    base = _FakeLtxPipeline()
+    call = ltx_call(task_for("ltx-2.5-fast", Mode.TEXT_TO_VIDEO, tmp_path, duration_s=5, fps=24))
+    width, height = call["width"], call["height"]
+    out = LtxAdapter({"text": base, "upsample": upsample}, device="cpu")(**call)
+
+    first, second = base.calls
+    assert (first["width"], first["height"], first["sigmas"]) == (width // 2, height // 2, DISTILLED_SIGMAS)
+    assert first["output_type"] == "latent" and first["return_dict"] is False
+    assert upsampled == [{"latents": "video-latents", "output_type": "latent", "return_dict": False}]
+    assert (second["width"], second["height"], second["sigmas"]) == (width, height, SECOND_STAGE_SIGMAS)
+    assert (second["latents"], second["audio_latents"]) == ("upsampled-latents", "audio-latents")
+    assert second["noise_scale"] == SECOND_STAGE_SIGMAS[0] and "output_type" not in second
+    assert not {"second_stage_sigmas", "seed", "pipeline", "generate_audio"} & (set(first) | set(second))
+    assert out["sampling_rate"] == 24000  # the vocoder's rate, not an assumed 48 kHz
+
+
+def test_without_an_upsampler_the_distilled_call_runs_once(tmp_path):
+    pytest.importorskip("torch")
+    from kuno_worker.backends.runtimes import LtxAdapter
+
+    base = _FakeLtxPipeline(rate=22050)
+    call = ltx_call(task_for("ltx-2.5-fast", Mode.TEXT_TO_VIDEO, tmp_path, duration_s=5, fps=24))
+    out = LtxAdapter({"text": base}, device="cpu")(**call)
+    assert len(base.calls) == 1 and "second_stage_sigmas" not in base.calls[0]
+    assert out["sampling_rate"] == 22050

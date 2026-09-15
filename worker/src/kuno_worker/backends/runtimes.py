@@ -27,6 +27,15 @@ def _load_image(path: str):
         return handle.convert("RGB").copy()
 
 
+def _audio_rate(pipeline: Any, result: Any) -> int:
+    """diffusers' LTX-2 output carries no sample rate; the vocoder's config has it (24 kHz for LTX-2.5)."""
+    rate = getattr(result, "sampling_rate", None)
+    if rate is None:
+        config = getattr(getattr(pipeline, "vocoder", None), "config", None)
+        rate = getattr(config, "output_sampling_rate", None)
+    return int(rate or 48000)
+
+
 class LtxAdapter:
     """Turns `ltx_resident.build_call` output into diffusers calls on loaded pipelines."""
 
@@ -55,18 +64,38 @@ class LtxAdapter:
             if key in call:
                 call[key] = str(call[key])
         call.pop("generate_audio", None)  # these pipelines always produce their audio track
+        second_stage = call.pop("second_stage_sigmas", None)
+        upsample = self.pipelines.get("upsample")
         if tap is not None:
             from .verified_gpu import ltx_verified
 
+            # Verified mode commits a single denoising pass, so it renders in one stage at full size.
             with ltx_verified(pipeline, call, tap):
                 result = pipeline(generator=generator, **call)
+        elif second_stage and upsample is not None:
+            result = self._two_stage(pipeline, upsample, generator, second_stage, call)
         else:
             result = pipeline(generator=generator, **call)
         return {
             "videos": getattr(result, "frames", None),
             "audio": getattr(result, "audio", None),
-            "sampling_rate": int(getattr(result, "sampling_rate", 48000)),
+            "sampling_rate": _audio_rate(pipeline, result),
         }
+
+    @staticmethod
+    def _two_stage(pipeline: Any, upsample: Any, generator: Any, second_stage: list[float], call: dict[str, Any]) -> Any:
+        """The distilled recipe diffusers documents for LTX-2.5: the first sigmas at half size, the video latents
+        upsampled x2, then the second-stage sigmas at full size, continuing from the same audio latents."""
+        width, height = call.pop("width"), call.pop("height")
+        latents, audio_latents = pipeline(
+            generator=generator, width=width // 2, height=height // 2, output_type="latent", return_dict=False, **call
+        )
+        upsampled = upsample(latents=latents, output_type="latent", return_dict=False)[0]
+        stage_two = {**call, "sigmas": second_stage}
+        return pipeline(
+            generator=generator, width=width, height=height, latents=upsampled, audio_latents=audio_latents,
+            noise_scale=second_stage[0], **stage_two,
+        )
 
     def unload(self) -> None:
         import torch
