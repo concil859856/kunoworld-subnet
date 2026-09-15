@@ -151,14 +151,14 @@ A job's VCU is what its output costs in GPU time, comparable across profiles
 VCU = weight(resolution) × fps multiplier × (1 + duration slope × max(0, seconds − 5)) × seconds
 ```
 
-| Profile | VCU per output second | Duration slope |
-|---|---|---|
-| `ltx-2.5-fast` | 720p 3, 1080p 5 | 0.03 (provisional) |
-| `ltx-2.5-pro` | 720p 9, 1080p 20 | 0.03 (provisional) |
-| `ltx-2.5-4k` | 1440p 22, 2160p 60 | 0.03 (provisional) |
-| `h3-turbo` | 768p 17 | 0.05 |
-| `h3` | 768p 60 | 0.06 |
-| `h3-reference` | 768p 90 | 0.065 |
+| Profile | VCU per output second | Duration slope | Where the weight comes from |
+|---|---|---|---|
+| `ltx-2.5-fast` | 720p 3, 1080p 5 | 0.03 (provisional) | 720p measured 2026-09-15; 1080p estimated |
+| `ltx-2.5-pro` | 720p 33, 1080p 73 | 0.03 (provisional) | 720p measured; 1080p scaled by the same factor |
+| `ltx-2.5-4k` | 1440p 22, 2160p 60 | 0.03 (provisional) | estimated |
+| `h3-turbo` | 768p 17 | 0.05 | estimated, and likely low: the other H3 profiles cost 1.7x their estimate |
+| `h3` | 768p 100 | 0.06 | measured 2026-09-15, 5 s on 4x H200 |
+| `h3-reference` | 768p 163 | 0.065 | measured 2026-09-15, 5 s on 4x H200 |
 
 - **fps.** 48 and 50 fps count twice what 24 and 25 fps do.
 - **Inputs.** Seconds are the billable seconds from the ledger audit, and resolution and fps come

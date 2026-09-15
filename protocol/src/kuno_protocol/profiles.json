@@ -88,7 +88,7 @@
           "768p": 17
         },
         "duration_slope": 0.05,
-        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked"
+        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4); not benchmarked — the other H3 profiles were measured 2026-09-15 (research/pricing/measured_2026-09-15.md) and cost 1.7x their estimate, so expect this to be low too"
       },
       "min_vram_gb": 80,
       "verified": {
@@ -252,10 +252,10 @@
       },
       "vcu_weights": {
         "per_output_second": {
-          "768p": 60
+          "768p": 100
         },
         "duration_slope": 0.06,
-        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked"
+        "note": "GPU-cost weights, measured 2026-09-15 (research/pricing/measured_2026-09-15.md): 5 s at 768p on 4x H200"
       },
       "min_vram_gb": 80,
       "verified": {
@@ -448,10 +448,10 @@
       },
       "vcu_weights": {
         "per_output_second": {
-          "768p": 90
+          "768p": 163
         },
         "duration_slope": 0.065,
-        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked"
+        "note": "GPU-cost weights, measured 2026-09-15 (research/pricing/measured_2026-09-15.md): 5 s at 768p on 4x H200"
       },
       "min_vram_gb": 80,
       "verified": {
@@ -664,7 +664,7 @@
           "48": 2,
           "50": 2
         },
-        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked; the duration slope is provisional"
+        "note": "GPU-cost weights; 720p measured 2026-09-15 (research/pricing/measured_2026-09-15.md) and matched the estimate, 1080p and the duration slope are still estimates"
       },
       "min_vram_gb": 80,
       "verified": {
@@ -916,15 +916,15 @@
       },
       "vcu_weights": {
         "per_output_second": {
-          "720p": 9,
-          "1080p": 20
+          "720p": 33,
+          "1080p": 73
         },
         "duration_slope": 0.03,
         "fps_multiplier": {
           "48": 2,
           "50": 2
         },
-        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked; the duration slope is provisional"
+        "note": "GPU-cost weights; 720p measured 2026-09-15 (research/pricing/measured_2026-09-15.md) at 11x ltx-2.5-fast, 1080p scaled by the same factor, duration slope still an estimate"
       },
       "min_vram_gb": 80,
       "verified": {

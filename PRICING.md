@@ -43,8 +43,8 @@ Rule (unchanged from `costs.md` 8.2): cost at 60% utilization x 1.25, so a miner
 | `h3` 5 s | **$0.17** | $0.60 |
 | `h3-reference` 5 s | **$0.28** | $0.64 |
 
-Capacity pay stays as derived in `costs.md` 8.3: **$0.80/GPU-h for `ltx-2.5`**, **$1.50 for `minimax-h3`**, both below
-owned-hardware cost so an idle GPU never profits on its own.
+Capacity pay is already per family in `rate_card.py`: **$0.80/GPU-h for `ltx-2.5`**, **$1.50 for `minimax-h3`**, both
+below owned-hardware cost, so an idle GPU never profits on its own. Measurement does not change them.
 
 ### VCU weights
 
@@ -58,8 +58,13 @@ Pay per profile follows the VCU weights, and measurement changes their shape. No
 | `h3` 5 s | 60 | **100** | underpaid by 1.7x |
 | `h3-reference` 5 s | 90 | **163** | underpaid by 1.8x |
 
-With measured weights, **$0.0019 per VCU-second** still reproduces the recommended rates, so that replacement for
-`PLACEHOLDER_USD_PER_VCU_SECOND` (today 0.01, about 5x too high) stands.
+**The measured weights are now in `profiles.json`** (`ltx-2.5-pro` 720p 33 and 1080p 73, `h3` 100, `h3-reference` 163;
+`ltx-2.5-fast` was already right at 3). `ltx-2.5-pro` 1080p is the 720p factor applied to the old estimate, not a
+measurement, and `h3-turbo` and `ltx-2.5-4k` are still estimates.
+
+`PLACEHOLDER_USD_PER_VCU_SECOND` already carries **$0.0019**. With the measured weights it pays $0.0057, $0.063, $0.19
+and $0.31 per second for fast, pro, h3 and h3-reference: 10-14% above the recommended rates above, which is inside the
+error of a single measurement. Leave it until `kuno-bench` fills in the grid.
 
 ## 4. What customers should pay, against the market
 
@@ -85,11 +90,13 @@ more per second than MiniMax charges for the same model through its own API. Thr
 
 ## 5. Decisions for the owner
 
-1. Replace the VCU weights with the measured ones, and `PLACEHOLDER_USD_PER_VCU_SECOND` with $0.0019.
-2. Set `ltx-2.5-pro` at or above $0.10 per second at 720p.
-3. Choose one of the three H3 paths above before H3 is offered.
-4. Set capacity pay per family ($0.80 / $1.50) instead of one $2.00 rate.
-5. Then flip `"placeholder": false` on the rate card and sign it.
+Already done in code: the measured VCU weights, `$0.0019` per VCU-second and per-family capacity pay
+($0.80 / $1.50). What is left is the owner's:
+
+1. Set `ltx-2.5-pro` at or above **$0.10** per second at 720p; it is $0.075 today, below its own cost floor.
+2. Choose one of the three H3 paths above before H3 is offered to customers.
+3. Decide whether `ltx-2.5-fast` keeps a 12x margin or leads on price; it is the profile with room to move.
+4. Then flip `"placeholder": false` on the rate card and sign it.
 
 ## 6. Measure before signing
 

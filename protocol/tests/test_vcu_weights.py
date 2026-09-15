@@ -14,15 +14,16 @@ from kuno_protocol.schemas import GenerationParams
 
 PROFILES = load_profiles()
 
-# research/research_pricing.md §3 (placeholders): VCU per output second at 24/25 fps up to 5 s, lowest resolution first,
-# and the duration slope.
+# VCU per output second at 24/25 fps up to 5 s, lowest resolution first, and the duration slope. The 720p/768p weights
+# of ltx-2.5-fast, ltx-2.5-pro, h3 and h3-reference are measured (research/pricing/measured_2026-09-15.md); the rest are
+# still the estimates of research/pricing/costs.md §8.4.
 EXPECTED = {
     "ltx-2.5-fast": ({"720p": 3, "1080p": 5}, 0.03),
-    "ltx-2.5-pro": ({"720p": 9, "1080p": 20}, 0.03),
+    "ltx-2.5-pro": ({"720p": 33, "1080p": 73}, 0.03),
     "ltx-2.5-4k": ({"1440p": 22, "2160p": 60}, 0.03),
     "h3-turbo": ({"768p": 17}, 0.05),
-    "h3": ({"768p": 60}, 0.06),
-    "h3-reference": ({"768p": 90}, 0.065),
+    "h3": ({"768p": 100}, 0.06),
+    "h3-reference": ({"768p": 163}, 0.065),
 }
 
 
@@ -54,9 +55,9 @@ def test_worked_examples():
     assert fast.vcu_for(params(fast, "720p", 5, 24)) == pytest.approx(15)  # 3 × 5
     assert fast.vcu_for(params(fast, "1080p", 10, 50)) == pytest.approx(115)  # 5 × 2 × (1 + 0.03 × 5) × 10
     assert fast.vcu_for(params(fast, "720p", 2, 25)) == pytest.approx(6)  # clips under 5 s get no discount
-    assert h3.vcu_for(params(h3, "768p", 14, 24)) == pytest.approx(1293.6)  # 60 × (1 + 0.06 × 9) × 14
+    assert h3.vcu_for(params(h3, "768p", 14, 24)) == pytest.approx(2156)  # 100 × (1 + 0.06 × 9) × 14
     # `seconds` are the billable seconds, the requested duration unless given.
-    assert h3.vcu_for(params(h3, "768p", 14, 24), seconds=5) == pytest.approx(300)
+    assert h3.vcu_for(params(h3, "768p", 14, 24), seconds=5) == pytest.approx(500)
 
 
 def test_a_duration_only_caller_gets_the_lowest_resolution_at_the_default_fps():
@@ -71,7 +72,8 @@ def test_a_duration_only_caller_gets_the_lowest_resolution_at_the_default_fps():
 def test_every_resolution_a_profile_sells_has_a_weight_marked_as_a_placeholder():
     for profile in PROFILES.values():
         assert set(profile.vcu_weights.per_output_second) == set(profile.limits.sizes), profile.id
-        assert "PLACEHOLDER" in profile.vcu_weights.note
+        # Every weight says where it came from: still a placeholder, or the measurement that replaced it.
+        assert "PLACEHOLDER" in profile.vcu_weights.note or "measured" in profile.vcu_weights.note, profile.id
         with pytest.raises(ParamError):
             profile.vcu_at("8k", 24, 5)
 

@@ -95,9 +95,14 @@ def test_the_margin_check_flags_every_cell_priced_below_the_miner_multiple():
     pro = {"ltx-2.5-pro": ({"720p": 9.0, "1080p": 60.0}, 0.03, {48: 2.0, 50: 2.0})}
     proposal = derive([("h200.json", bench_doc(pro))], settings())
     flagged = {(row["profile"], row["resolution"], row["privacy"]) for row in proposal["margin_check"]}
-    assert flagged == {("ltx-2.5-pro", "1080p", "private"), ("ltx-2.5-pro", "1080p", "standard")}
+    # h3 and h3-reference are flagged from their measured weights (research/pricing/measured_2026-09-15.md): their
+    # customer prices are below what a miner must earn. They have no standard price, so only the private rows appear.
+    assert flagged == {
+        ("ltx-2.5-pro", "1080p", "private"), ("ltx-2.5-pro", "1080p", "standard"),
+        ("h3", "768p", "private"), ("h3-reference", "768p", "private"),
+    }
     rate = proposal["rate_card"]["usd_per_vcu_second"]["confidential"]
-    private = next(row for row in proposal["margin_check"] if row["privacy"] == "private")
+    private = next(row for row in proposal["margin_check"] if row["privacy"] == "private" and row["profile"] == "ltx-2.5-pro")
     worst = private["worst"]
     assert worst["ratio"] < 1.15 and worst["miner_usd"] == pytest.approx(PROFILES["ltx-2.5-pro"].model_copy(
         update={"vcu_weights": VcuWeights.model_validate(proposal["vcu_weights"]["ltx-2.5-pro"])}).vcu_at("1080p", worst["fps"], worst["duration_s"]) * rate, abs=1e-4)

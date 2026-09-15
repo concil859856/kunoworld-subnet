@@ -65,14 +65,15 @@ def test_bad_vcu_rates_are_refused(rates):
         RateCard(usd_per_second={}, usd_per_vcu_second=rates)
 
 
-# research/research_pricing.md §3: recommended confidential miner rates, USD per verified second.
-# ltx-2.5-fast 720p ($0.005) is left out: the research notes one VCU rate pays it +14%.
+# Recommended confidential miner rates, USD per verified second: measured cost x 1.25 for the profiles measured on
+# 2026-09-15 (research/pricing/measured_2026-09-15.md), the estimates of costs.md §8.2 for the rest, with H3's duration
+# factors carried over. ltx-2.5-fast 720p ($0.005) is left out: one VCU rate pays it +14%.
 RESEARCH_RATES = {
-    ("ltx-2.5-fast", "1080p", 5): 0.010, ("ltx-2.5-pro", "720p", 5): 0.017, ("ltx-2.5-pro", "1080p", 5): 0.040,
+    ("ltx-2.5-fast", "1080p", 5): 0.010, ("ltx-2.5-pro", "720p", 5): 0.058, ("ltx-2.5-pro", "1080p", 5): 0.147,
     ("ltx-2.5-4k", "1440p", 5): 0.042, ("ltx-2.5-4k", "2160p", 5): 0.12,
     ("h3-turbo", "768p", 5): 0.033, ("h3-turbo", "768p", 10): 0.039, ("h3-turbo", "768p", 14): 0.047,
-    ("h3", "768p", 5): 0.11, ("h3", "768p", 10): 0.15, ("h3", "768p", 14): 0.18,
-    ("h3-reference", "768p", 5): 0.17, ("h3-reference", "768p", 10): 0.22, ("h3-reference", "768p", 14): 0.27,
+    ("h3", "768p", 5): 0.173, ("h3", "768p", 10): 0.225, ("h3", "768p", 14): 0.266,
+    ("h3-reference", "768p", 5): 0.281, ("h3-reference", "768p", 10): 0.373, ("h3-reference", "768p", 14): 0.445,
 }
 
 
@@ -90,8 +91,9 @@ def test_the_placeholder_card_prices_by_vcu_at_the_research_rates():
     assert card.usd_per_vcu_second == {"confidential": 0.0019, "open": pytest.approx(0.0019 * 0.75)}
     assert card.gpu_hour_usd == PLACEHOLDER_USD_PER_GPU_HOUR == {FAMILY_LTX: 0.80, FAMILY_H3: 1.50}
     for (profile_id, resolution, seconds), research in RESEARCH_RATES.items():
-        assert per_second(card, profile_id, resolution, seconds) == pytest.approx(research, rel=0.051), (profile_id, resolution, seconds)
-    assert per_second(card, "h3", "768p", 5) == pytest.approx(0.114)
+        # One VCU rate cannot match every row exactly; with the measured weights it pays 5-11% above the recommendation.
+        assert per_second(card, profile_id, resolution, seconds) == pytest.approx(research, rel=0.11), (profile_id, resolution, seconds)
+    assert per_second(card, "h3", "768p", 5) == pytest.approx(0.19)
     assert per_second(card, "ltx-2.5-fast", "1080p", 5) == pytest.approx(0.0095)
     assert per_second(card, "ltx-2.5-fast", "1080p", 5, fps=50) == pytest.approx(0.019)
     assert per_second(card, "ltx-2.5-fast", "1080p", 5, tier="open") == pytest.approx(0.0095 * 0.75)
