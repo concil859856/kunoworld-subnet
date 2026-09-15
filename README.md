@@ -7,6 +7,7 @@ inside a confidential VM, and the validator.
 - [MINING.md](MINING.md) — running a miner: what to rent, weights, dev network, mainnet
 - [VALIDATING.md](VALIDATING.md) — running a validator: attestation, canaries, scoring, weights
 - [PRIVACY_MODES.md](PRIVACY_MODES.md) — who can see a video in Private and Standard mode, and how the content policy is enforced
+- [PRICING.md](PRICING.md) — what a second of video costs to render, what miners earn, what customers pay
 - [SECURITY.md](SECURITY.md) — what the enclave protects, what it does not, how to report a flaw
 
 ## For miners
