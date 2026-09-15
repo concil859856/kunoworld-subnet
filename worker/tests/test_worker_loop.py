@@ -180,6 +180,25 @@ def test_configured_hotkey_must_match_its_secret():
         Worker(config, MockTEE(generate_signing_key(), DEV_IMAGE_DIGEST), {"*": IdleBackend()}, hotkey=signer)
 
 
+def test_the_worker_declares_the_country_it_runs_in():
+    """Licences such as MiniMax H3's bar whole territories, so a gateway can refuse those profiles on registration."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("x-kuno-country"))
+        return httpx.Response(200, json={"status": "active"})
+
+    worker = make_worker(MockTEE(generate_signing_key(), DEV_IMAGE_DIGEST), RecordingStop())
+    evidence = worker.attest(os.urandom(32))
+    transport = httpx.MockTransport(handler)
+    GatewayClient("http://gateway", worker.identity.signing_key, worker.identity.enclave_id, transport=transport).register(evidence, "5x", 1)
+    GatewayClient(
+        "http://gateway", worker.identity.signing_key, worker.identity.enclave_id, transport=transport, country="JP"
+    ).register(evidence, "5x", 1)
+
+    assert seen == [None, "JP"]
+
+
 def test_client_sends_the_proof_only_when_there_is_one():
     bodies = []
 

@@ -267,6 +267,12 @@ docker run --rm --gpus '"device=0,1,2,3"' --ipc host \
 What the H3 image needs from the host:
 - **Driver:** its SGLang runs a CUDA 13 torch, so the driver must be R580 or newer.
 - **Shared memory:** `--ipc host` (or a large `--shm-size`) gives NCCL shared memory across the four GPUs.
+- **A licensed country.** The MiniMax H3 Community License excludes the European Union, the United Kingdom,
+  the Republic of Korea and the United States, and running the model there is not licensed at all. The gateway
+  refuses to register an enclave offering `h3`, `h3-turbo` or `h3-reference` from an excluded country, or from
+  one it cannot determine, and answers `region_not_licensed`. In production it takes the country from your
+  connection; on a dev network set `KUNO_MINER_COUNTRY=<two-letter code>` to declare where the worker runs.
+  LTX-2.5 has no territory rule.
 
 **Neither image has run on a GPU yet.** Treat the first run as a validation run; image/CVM.md lists what is
 unverified.

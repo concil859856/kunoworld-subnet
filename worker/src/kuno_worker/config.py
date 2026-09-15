@@ -28,6 +28,9 @@ class WorkerConfig:
     gpu_evidence: str = "auto"
     nvattest_bin: str = "nvattest"
     miner_hotkey: str | None = None
+    # Two-letter country this worker runs in, sent when registering. Some models' licences bar territories
+    # (MiniMax H3), and a gateway that trusts the header refuses the profiles they bar.
+    miner_country: str | None = None
     # The hotkey's secret, to prove miner_hotkey (see kuno_worker.hotkey).
     hotkey_seed_file: Path | None = None
     # A signed Turbo submission (JSON): this worker registers as that competition candidate.
@@ -83,6 +86,7 @@ class WorkerConfig:
             gpu_evidence=env.get("KUNO_GPU_EVIDENCE", "auto"),
             nvattest_bin=env.get("KUNO_NVATTEST_BIN", "nvattest"),
             miner_hotkey=env.get("KUNO_MINER_HOTKEY") or None,
+            miner_country=(env.get("KUNO_MINER_COUNTRY") or "").strip().upper() or None,
             hotkey_seed_file=_path(env.get("KUNO_HOTKEY_SEED_FILE")),
             turbo_submission=_path(env.get("KUNO_TURBO_SUBMISSION")),
             wallet_name=env.get("KUNO_WALLET_NAME") or None,

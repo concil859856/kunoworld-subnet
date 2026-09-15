@@ -92,7 +92,9 @@ class Worker:
             self.backend_for(profile)
         self.identity = identity or EnclaveIdentity.generate()
         self._provenance_signer = self._build_provenance_signer()
-        self.client = GatewayClient(config.gateway_url, self.identity.signing_key, self.identity.enclave_id, transport=transport)
+        self.client = GatewayClient(
+            config.gateway_url, self.identity.signing_key, self.identity.enclave_id, transport=transport, country=config.miner_country
+        )
         self.evidence: AttestationEvidence | None = None
         self.last_attested = 0.0
         self.ready = threading.Event()

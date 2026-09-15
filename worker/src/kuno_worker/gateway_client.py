@@ -33,10 +33,13 @@ class GatewayError(Exception):
 
 
 class GatewayClient:
-    def __init__(self, base_url: str, signing_key, enclave_id: str, timeout: float = 60.0, transport=None):
+    def __init__(self, base_url: str, signing_key, enclave_id: str, timeout: float = 60.0, transport=None, country: str | None = None):
         self._key = signing_key
         self._enclave_id = enclave_id
-        self._http = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout, transport=transport)
+        # Where this worker runs. A gateway that trusts the header uses it for licence territory rules; in
+        # production the gateway takes the country from the connection instead.
+        headers = {"x-kuno-country": country} if country else None
+        self._http = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout, transport=transport, headers=headers)
 
     def close(self) -> None:
         self._http.close()
