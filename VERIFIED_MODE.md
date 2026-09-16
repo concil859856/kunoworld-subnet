@@ -86,6 +86,13 @@ commits: on a pinned class the worker runs it in process through the diffusers m
 server (`worker/backends/h3.py`). Storyboards (PROTOCOL.md "Storyboards") never commit, on any class, and the gateway
 sends them only to confidential enclaves.
 
+**Plans are unverified.** A plan job (PROTOCOL.md "Plans (Director)") renders nothing and has no denoising steps to commit
+to, and text sampled on one machine can't be replayed bit for bit on another, so its receipt carries no step commitment
+on any class and validators never step-audit it. Like storyboards, plans go only to confidential enclaves, where the
+attested image is what binds the planner. Validators check delivered plans only by their receipts and, later, plan
+canaries (a plan that decrypts, passes `kuno_protocol.plans.validate`, names the brief's must-mention terms and a planner
+the image's recipe allows).
+
 Open-tier classes (`comparison: "tolerance"`, see [Tolerance mode](#tolerance-mode)) are listed
 after the confidential ones: `ltx-2.5-fast` adds `O1.rtx-4090-24gb.x1.int8`,
 `O1.rtx-5090-32gb.x1.fp8-cast`, `O1.rtx-pro-6000-bw-96gb.x1` and `O1.h100-80gb.x1`; `ltx-2.5-pro`

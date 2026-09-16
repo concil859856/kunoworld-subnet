@@ -14,6 +14,10 @@ decrypt but must still be refused.
 
 `sealed_payload` pins the padded request (the HPKE plaintext). Its ciphertexts are sealed to a fixed recipient key
 with a fixed ephemeral key, so they reproduce byte for byte in both languages too.
+
+`plans` pins the Director's deterministic code (kuno_protocol.plans): planner replies, including the raw E2B outputs of
+the 2026-09-16 GPU spike (data/plan_spike_2026-09-16.json), with the plan, repairs, problems and stitched length that
+repair must produce from them; fit and brief-quote cases; a plan receipt message; and a plan job's AAD.
 """
 
 from __future__ import annotations
@@ -26,8 +30,9 @@ from kuno_protocol.attestation import enclave_id_for, gpu_nonce_for, report_data
 from kuno_protocol.blobs import DEFAULT_CHUNK, V1, V2, _encrypt_stream, pad_stream, padded_stream_length, padme, sealed_size
 from kuno_protocol.canonical import b64e, canonical_json, sha256_hex
 from kuno_protocol.crypto import _EXPORT_INPUT, _EXPORT_OUTPUT, HPKE_INFO, SUITE
+from kuno_protocol import plans
 from kuno_protocol.profiles import InputRole, Mode, load_profiles, storyboard_duration_s, storyboard_frames
-from kuno_protocol.receipts import ReceiptBody, VideoInfo, receipt_message
+from kuno_protocol.receipts import PlanInfo, ReceiptBody, VideoInfo, receipt_message
 from kuno_protocol.schemas import GenerationParams, InputRef, SealedPayload, ShotSpec, job_aad
 from kuno_protocol.sealed_payload import (
     HEADER_LEN,
@@ -235,6 +240,131 @@ def _storyboard(job_id: str) -> dict:
     }
 
 
+PLANNER = "ltx-2.5-distilled/bf16/1:prompt_enhancer"
+
+
+def _plan_params(target: float, aspect_ratio: str = "16:9", fps: int = 24, resolution: str = "720p") -> GenerationParams:
+    return GenerationParams(profile_id="ltx-2.5-fast", mode=Mode.PLAN, duration_s=target, resolution=resolution, aspect_ratio=aspect_ratio, fps=fps)
+
+
+def _repair_case(name: str, raw: str, params: GenerationParams, options: plans.PlanOptions, brief: str, planner: str = PLANNER) -> dict:
+    fast = load_profiles()["ltx-2.5-fast"]
+    context = plans.plan_context(fast, params, options)
+    result = plans.repair(raw, context, planner=planner, brief=brief, revise=options.revise)
+    delivered = result.deliverable() if result.plan is not None else None
+    return {
+        "name": name,
+        "params": params.model_dump(mode="json"),
+        "options": options.model_dump(mode="json", exclude_defaults=True),
+        "brief": brief,
+        "planner": planner,
+        "raw": raw,
+        "context": {"min_shot_s": context.min_shot_s, "max_shot_s": context.max_shot_s, "min_shots": context.min_shots, "max_shots": context.max_shots},
+        "refusal": result.refusal,
+        "syntax": result.syntax,
+        "problems": [{"code": p.code, "notice": p.notice} for p in result.problems],
+        "model_duration_s": result.model_duration_s,
+        "plan": result.plan.model_dump(mode="json") if result.plan is not None else None,
+        # With a notice in `repairs` for every problem the plan still has: what a worker delivers when the retry is no better.
+        "delivered_json": plans.encode_plan(delivered).decode() if delivered is not None else None,
+    }
+
+
+def _plans(job_id: str) -> dict:
+    fast = load_profiles()["ltx-2.5-fast"]
+    spike = {(r["planner"], r["case"]): r for r in json.loads((HERE / "data" / "plan_spike_2026-09-16.json").read_text())["replies"]}
+    capped = plans.PlanOptions(max_shot_s=11)
+    repair_cases = []
+    for case in ("roastery", "lighthouse", "water", "bakery_de", "ebike"):
+        record = spike["e2b", case]
+        params = _plan_params(record["target_s"], record["aspect_ratio"], resolution=record["resolution"])
+        repair_cases.append(_repair_case(f"gpu spike e2b {case}", record["raw"], params, capped, record["brief"]))
+    garbage = spike["te12b", "roastery"]
+    repair_cases.append(_repair_case("gpu spike 12B text encoder: unparseable", garbage["raw"], _plan_params(30), capped, garbage["brief"], "ltx-2.5-distilled/bf16/1:text_encoder"))
+    repair_cases.append(_repair_case("refusal", '{"refusal": "cannot plan this brief"}', _plan_params(30), capped, "anything"))
+    tidy = json.dumps({
+        "title": "**Harbor** at dawn", "scene": "  A quiet\u00a0harbor   at dawn.\n",
+        "shots": [
+            "not a shot",
+            {"beat": "", "prompt": "Shot 1: Prompt: \u201cWide shot\u201d; a boat leaves the dock \u2014 slowly.", "duration_s": "6 s", "join": "cut"},
+            {"beat": "Beat: Gulls", "prompt": "   ", "duration_s": 5, "join": "cut"},
+            {"beat": "Gulls", "prompt": "Close-up shot; a gull lands on a post.", "duration_s": 5.4, "join": "dissolve"},
+            {"beat": "Rope", "prompt": "Close-up shot; a hand coils a rope. Cut.", "duration_s": None, "join": "continue"},
+            {"beat": "Wide", "prompt": "Wide shot; the harbor at noon.", "duration_s": 30, "join": "continue"},
+        ],
+    }, ensure_ascii=False)
+    repair_cases.append(_repair_case("labels, markdown, quotes, joins, missing and capped durations, trailing comma",
+                                     "```json\n" + tidy[:-1] + ",}\n```", _plan_params(20), plans.PlanOptions(max_shot_s=8), 'a harbor, and "the gull"'))
+    short = json.dumps({"title": "T", "scene": "", "shots": [{"beat": "a", "prompt": "Medium shot; a door opens.", "duration_s": 3, "join": "fresh"},
+                                                             {"beat": "b", "prompt": "Medium shot; a door closes.", "duration_s": 3, "join": "continue"}]})
+    repair_cases.append(_repair_case("far short of a 50 s target at 25 fps", short, _plan_params(50, fps=25), plans.PlanOptions(), "a door"))
+    earlier = plans.Plan.model_validate(repair_cases[0]["plan"])
+    rewritten = json.loads(spike["e2b", "roastery"]["raw"].replace("]} ,", "],"))
+    rewritten["title"] = "Ignored"
+    rewritten["shots"][1]["prompt"] = "Close-up shot; darker hands pour the beans. The drum hums."
+    rewritten["shots"][1]["duration_s"] = 11
+    revise = plans.PlanRevision(plan=earlier, instruction="darker", shots=[2])
+    repair_cases.append(_repair_case("revision of shot 2 only", json.dumps(rewritten), _plan_params(30), plans.PlanOptions(max_shot_s=11, revise=revise), ""))
+
+    fit_cases = []
+    for name, target, max_shot_s, fps, shots, movable in (
+        ("grow the shortest first", 30, 11, 24, [(4, "fresh"), (6, "cut"), (4, "cut")], None),
+        ("shrink the longest first", 12, 11, 24, [(9, "fresh"), (9, "continue"), (3, "cut")], None),
+        ("snap to the grid and caps", 10, 6, 24, [(30, "fresh"), (1, "cut"), (4.6, "cut")], None),
+        ("caps leave it short", 60, 11, 24, [(5, "fresh"), (5, "cut")], None),
+        ("a revision moves only shot 2", 30, 11, 24, [(5, "fresh"), (5, "cut"), (5, "cut")], [1]),
+        ("at most max_total_s", 120, 20, 24, [(20, "fresh")] + [(20, "cut")] * 11, None),
+        ("25 fps steps are uneven", 37, 20, 25, [(2, "fresh"), (3, "cut"), (9, "continue"), (2, "cut")], None),
+        ("50 fps caps at 10 s", 37, 10, 50, [(2, "fresh"), (3, "cut"), (9, "continue"), (2, "cut")], None),
+    ):
+        context = plans.plan_context(fast, _plan_params(target, fps=fps), plans.PlanOptions(max_shot_s=max_shot_s))
+        planned = [plans.PlannedShot(beat="b", prompt="p", duration_s=d, join=j) for d, j in shots]
+        fitted, repairs = plans.fit(planned, context, movable=movable)
+        specs = [ShotSpec(duration_s=shot.duration_s, join=shot.join) for shot in fitted]
+        fit_cases.append({
+            "name": name, "profile_id": fast.id, "fps": fps, "target_s": float(target), "max_shot_s": context.max_shot_s,
+            "shots": [{"duration_s": float(d), "join": j} for d, j in shots], "movable": movable,
+            "durations": [shot.duration_s for shot in fitted], "duration_s": storyboard_duration_s(fast, specs, fps), "repairs": repairs,
+        })
+
+    quote_cases = []
+    for brief, prompts in (
+        ("end on the slogan 'Sip. Stay fresh.'", ['A voice says, \u201cSIP.  Stay fresh!\u201d']),
+        ("an old lighthouse keeper's last night", []),
+        ('He says "Guten Morgen" and she answers \u201cHallo, du!\u201d', ["He says, \"guten morgen.\""]),
+        ("Die B\u00e4ckerin sagt \u201eFrisch jeden Morgen.\u201c", ["She says Frisch jeden Morgen"]),
+        ("Le slogan \u00abToujours frais\u00bb, puis \u00bbNoch einmal\u00ab", []),
+        ("the \u2018Rock\u2019n\u2019roll\u2019 band plays \u2018Encore\u2019", ["They play encore."]),
+        ('"Sip." and "sip!" twice, and a lone "x"', []),
+    ):
+        quote_cases.append({"brief": brief, "quotes": plans.brief_quotes(brief), "prompts": prompts, "missing": plans.missing_quotes(brief, prompts)})
+
+    delivered = plans.Plan.model_validate(repair_cases[0]["plan"])
+    plan_json = plans.encode_plan(delivered)
+    body = ReceiptBody(
+        job_id=job_id, enclave_id="0" * 32, profile_id=fast.id, image_digest="sha256:example",
+        params_digest=sha256_hex(canonical_json(_plan_params(30).model_dump(mode="json"))), input_digest="1" * 64, output_digest="2" * 64,
+        output_bytes=4384, content_digest=sha256_hex(plan_json), attestation_digest="4" * 64, started_at=1_800_000_000.0,
+        finished_at=1_800_000_011.25, gpu_seconds=11.25, miner_hotkey=None,
+        plan=PlanInfo(shots=len(delivered.shots), duration_s=delivered.duration_s, planner=PLANNER, prompt_version="plan/1", output_tokens=451),
+    )
+    params = _plan_params(30)
+    return {
+        "repair": repair_cases,
+        "fit": fit_cases,
+        "quotes": quote_cases,
+        "output": {
+            "label": plans.plan_output_label(job_id), "plan_json": plan_json.decode(), "sha256": sha256_hex(plan_json),
+            "padded_length": len(plans.pad_plan(plan_json)), "sealed_size": sealed_size(len(plans.pad_plan(plan_json))),
+        },
+        "receipt": {"body": body.model_dump(mode="json"), "message_b64": b64e(receipt_message(body))},
+        "job_aad": {
+            "job_id": job_id, "enclave_id": "0" * 32, "params": params.model_dump(mode="json"), "input_blob_ids": [],
+            "encoded": job_aad(job_id, "0" * 32, params, []).decode(),
+        },
+    }
+
+
 def build() -> dict:
     params = GenerationParams(
         profile_id="h3-turbo",
@@ -300,6 +430,7 @@ def build() -> dict:
         },
         "sealed_payload": _sealed_payload(job_aad(job_id, "0" * 32, params, ["a" * 32, "b" * 32])),
         "storyboard": _storyboard(job_id),
+        "plans": _plans(job_id),
         "receipt": {
             "body": receipt_body.model_dump(mode="json"),
             "message_b64": b64e(receipt_message(receipt_body)),

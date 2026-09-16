@@ -138,6 +138,129 @@ check on open-tier miners, so the gateway routes storyboards, Private and Standa
 **Rollout.** A worker from before storyboards can't parse the params and fails the job, so workers are upgraded before clients
 offer the mode.
 
+## Plans (Director)
+
+A plan is a storyboard written from a brief inside the enclave: a scene and 2-12 shots, each with a prompt, a length and a
+join, fitted to a target length. Nothing renders. The customer edits the plan and renders it as an ordinary storyboard job.
+Mode `plan`; offered by profiles whose `limits.plan` is set: today `ltx-2.5-fast`. The reference is `kuno_protocol.plans`,
+and the design is `research/director-design_2026-09-16.md` in the dev repo.
+
+**Public params.** The frame of the storyboard to be, and its target length:
+
+```
+{"profile_id": "ltx-2.5-fast", "mode": "plan", "duration_s": 30, "resolution": "720p", "aspect_ratio": "16:9", "fps": 24,
+ "audio": true, "input_roles": []}
+```
+
+`duration_s` is the target, `limits.plan.min_target_s` (4) ≤ `duration_s` ≤ `limits.storyboard.max_total_s` (120). No
+`shots`, no inputs. `render_duration_s` is 0, so a plan fits any enclave envelope that serves its resolution, aspect ratio
+and fps at all. Vector `plans.job_aad`.
+
+**Sealed payload.** `prompt` is the brief, at most `limits.plan.max_brief_chars` (4,000) characters; it may be empty only
+in a revision. `negative_prompt` is refused (`unsupported_option`). `seed` seeds the planner. `options.plan` is optional,
+all fields optional (`PlanOptions`, unknown fields refused as `bad_payload`):
+
+| Field | Meaning |
+|---|---|
+| `v` | 1 |
+| `style` | a look to keep to, at most `max_style_chars` (500); checked like the brief |
+| `max_shot_s` | the longest shot to plan. Clients send the longest duration a routable confidential enclave's `envelope` serves at this resolution, aspect ratio and fps, the rule the storyboard will route by. Unset: the worker's own envelope. Always capped by the profile at this fps and snapped down to its duration grid. Below the profile's shortest shot: `bad_payload` |
+| `min_shots`, `max_shots` | default 2 and `storyboard.max_shots`; `max_shots` is capped by it |
+| `revise` | `{"plan": <Plan v1>, "instruction": "…", "shots": [3]}`. `plan` must have this job's profile, resolution, aspect ratio, fps and audio and pass `validate`. With `shots` (numbered from 1) only those shots are rewritten: the title, scene, notes and every other shot come back byte-identical, and only rewritten shots' durations move. Without it the whole plan is rewritten |
+
+**Plan v1** (the output, `kuno_protocol.plans.Plan`, unknown fields refused):
+
+```
+{"v": 1, "profile_id": "ltx-2.5-fast", "resolution": "720p", "aspect_ratio": "16:9", "fps": 24, "audio": true,
+ "target_s": 30, "duration_s": 30.375, "title": "…", "scene": "…",
+ "shots": [{"beat": "…", "prompt": "…", "duration_s": 6, "join": "fresh"}, …],
+ "notes": "…", "repairs": ["the shots ran 32.375 s; shots 1 and 2 shortened to reach 30.375 s"],
+ "planner": {"model": "ltx-2.5-distilled/bf16/1:prompt_enhancer", "prompt_version": "plan/1"}}
+```
+
+`duration_s` is `storyboard_duration_s` of the shots, exactly, so the storyboard's params are
+`{mode: storyboard, duration_s, shots: [{duration_s, join}]}` with the same frame, and `scene` is its `prompt`. Every delivered
+plan passes `validate`, which the gateway (Standard) and the SDKs run too:
+
+- 2 to `storyboard.max_shots` shots with non-blank prompts, the first join `fresh`;
+- each `duration_s` on the profile's grid within its limits at this fps (and the job's longest shot);
+- `shot_prompt(scene, prompt)` within `max_prompt_chars`; `title` ≤ 80, `beat` ≤ 60, `notes` ≤ 400, `scene` ≤ 1,000
+  characters (Unicode code points);
+- `validate_params` accepts the storyboard params.
+
+`repairs` lists, in words, every change code made to what the planner wrote, and each problem the single retry did not fix.
+
+**What the enclave does.** The planner is the LTX-2.5 pipeline's bundled `prompt_enhancer` (Gemma-4-E2B), through its
+processor's chat template, on whichever LTX-2.5 pipeline is loaded. The 12B text encoder can't write: on a GPU it printed
+random capital letters.
+
+1. **Refuse** what doesn't fit, before decrypting: invalid params, outside the envelope, or a backend without a planner
+   (`internal_error`; such a worker doesn't advertise `plan/1`).
+2. **Check the brief**, the style and a revision's instruction with the content policy and the prompt classifier
+   (`safety_blocked`, fixed message). Length and option errors are `prompt_too_long` and `bad_payload`.
+3. **Write.** Messages: the `plan/1` system prompt (`kuno_protocol/plan_prompts/plan-1.txt`, placeholders filled by
+   `system_prompt`) and `Brief: <brief>`; a revision adds the earlier plan as the planner's own turn and the instruction.
+   Decoding: `do_sample`, temperature 0.7, top-p 0.95, top-k 64, `max_new_tokens` = `limits.plan.max_new_tokens` (2,048).
+   Progress stage `planning`.
+4. **Repair** (`repair`, deterministic). Syntax: `<think>` blocks and text outside the outermost braces dropped; trailing
+   commas removed; an object closed early and continued (`…]} , "notes": …` and `…]} "notes": …`, 2 of the 5 GPU replies)
+   reopened; text after a complete object dropped. A `{"refusal": …}` object without shots is `safety_blocked`, with no
+   retry. Shots: non-objects and blank prompts dropped, at most `max_shots` kept; text tidied (diffusers' quote and dash
+   mapping, Markdown, "Shot 3:" labels, collapsed whitespace); a join word written as a prompt's last sentence ("Cut.")
+   removed; a missing beat named from the prompt's first 6 words. Joins: the first `fresh`, an unknown one `cut`, and a
+   `continue` whose prompt names a different shot size than the shot before becomes `cut`. Durations: a missing one gets
+   the suggested length, then `fit`. Text is cut at the last sentence end that fits its limit.
+5. **Fit** (`fit`). Durations snap to the grid (half up) within the shortest and longest shot. While the stitched length
+   is more than 0.5 s short and a shot can grow, the shortest (first on ties) gains a step; while it is more than 0.5 s
+   long or over `max_total_s`, the longest (first on ties) loses one, unless that makes it short again while within
+   `max_total_s`. On a revision with `shots` only those move.
+6. **Retry once** when the reply is unparseable, has fewer than 2 usable shots, has fewer than `min_shots`, runs more than
+   25% short of the target before the fit, leaves out a phrase the brief puts in quotation marks (`brief_quotes`: ASCII and
+   curly double quotes, „…“, «…», »…«, and single quotes that can't be apostrophes; matched case-insensitively, ignoring end
+   punctuation), or, in a revision, lacks a listed shot. The retry sends the reply back as the planner's turn and the
+   problems as a user turn, seeded `seed + 1`. The better of the two is kept (a plan over none, then fewer problems, then
+   the retry). No plan from either: **`plan_failed`**. Problems a plan can live with become notices in `repairs`.
+7. **Check the output.** Every shot's model prompt, `shot_prompt(scene, prompt)`, goes through the content policy and the
+   prompt classifier; title, notes and beats through the content policy. A block writes a new plan once (steps 3-6, seeds
+   `seed + 2` and `seed + 3`); a second block is `safety_blocked`. Stage `checking`, reported once.
+8. **Deliver.** `validate` again (a failure is a worker bug, `internal_error`), then seal, upload and sign. No frame check,
+   no C2PA manifest, no step commitment.
+
+**Output.** The plan JSON is `canonical_json(Plan)`. The sealed blob is
+`encrypt_blob(output key, "<job_id>/output/plan", 0x02 | length:u32be | JSON | 0x00 …)`: the request padding framing
+(power-of-two buckets from 4 KiB, see [Sealed request padding](#sealed-request-padding)) inside the usual padded blob. A
+plan is 2-5 KB, where PADMÉ alone would give away its length to within a few percent and so roughly its shot count; with
+the framing every plan up to 4,091 bytes of JSON seals to 4,386 bytes. A client decrypts the blob, refuses anything but
+form 2 framing, and parses the JSON (`open_plan`). Vector `plans.output`.
+
+**Receipt.** `video` is absent and `plan` is set; exactly one of the two is present in every receipt. Both keys are left
+out of the signed bytes when unset, as `step_commitment` is, so every video receipt signs and verifies byte-for-byte as
+before plans:
+
+```
+"plan": {"shots": 5, "duration_s": 30.375, "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer", "prompt_version": "plan/1",
+         "output_tokens": 451}
+```
+
+`content_digest` is the SHA-256 of the unpadded plan JSON; `output_digest` and `output_bytes` describe the sealed blob;
+`output_tokens` counts every reply the job generated, retries and regenerations included. Readers that predate plans fail
+to parse a plan receipt (they require `video`). Vector `plans.receipt`.
+
+**Failure codes.** `plan_failed`: the planner wrote nothing a repair and the retry made usable. It is refunded and is not
+a miner fault: the gateway and validators must treat it like `safety_blocked`, not like `internal_error`.
+
+**Price and pay.** A flat `pricing.plan_usd` (Private, $0.10) or `standard_plan_usd` (Standard, $0.08) whatever the
+target, with no fps multiplier and not subject to `min_job_usd`; a profile without the price refuses (`price_usd` raises).
+Miners are paid the flat `vcu_weights.plan` (27 VCU; `vcu_for`). Both are placeholders until `kuno-bench` measures plans; the
+GPU spike took 7.6-18.6 s per E2B plan on an RTX PRO 6000.
+
+**Routing.** Plans are unverified, so, like storyboards, only confidential enclaves take them, and only enclaves whose
+registration lists the `plan/1` feature: a worker from before plans can't parse `mode: "plan"` and would leave the job to
+time out. Standard mode (`POST /v1/standard/plans`) is specified in the design note and not yet built.
+
+**Rollout.** Protocol, then validators (plan receipts have no `video`), then workers (they advertise `plan/1`), then
+gateways (route by the feature, learn `plan_failed`), then SDKs and the studio.
+
 ## Blobs (inputs and output video)
 
 ```
@@ -181,7 +304,8 @@ bits, as padding to a power of two does, but its overhead stays under 12% (the w
 | 100 MB | 2 MiB | 2.1% |
 | 1 GiB | 32 MiB | 3.1% |
 
-Labels bind a blob to its job and role: `<job_id>/input/<index>` and `<job_id>/output/video`.
+Labels bind a blob to its job and role: `<job_id>/input/<index>`, `<job_id>/output/video`, and a plan job's
+`<job_id>/output/plan`.
 The final-chunk flag makes truncation at a chunk boundary detectable. The gateway rejects
 uploads that do not start with `KUNOB1` (both versions do). The shared vectors carry `blob`
 (version 1, byte-identical to its first publication) and `blob_v2`: valid cases, streams that
@@ -452,9 +576,11 @@ validators first.
 
 ## Miner registration and hotkey proof
 
-`POST /miner/v1/enclaves` takes `{"evidence", "miner_hotkey", "capacity", "hotkey_proof"?, "envelope"?}`.
+`POST /miner/v1/enclaves` takes `{"evidence", "miner_hotkey", "capacity", "hotkey_proof"?, "envelope"?, "features"?}`.
 `hotkey_proof` is optional on the wire so older workers still register; production gateways
-require it. `envelope` is described under [Serving envelope](#serving-envelope). The hotkey proof is
+require it. `envelope` is described under [Serving envelope](#serving-envelope). `features` lists optional job kinds the
+worker serves beyond rendering; today only `"plan/1"` ([Plans](#plans-director)). It is left out when empty, so a
+registration without features is byte-for-byte what it was before them, and gateways that predate it ignore it. The hotkey proof is
 
 ```
 {"v": 1, "crypto": "sr25519", "hotkey": ss58, "nonce": hex, "enclave_id": hex, "signing_public_key": b64url, "signature": b64url}
@@ -597,7 +723,9 @@ Ed25519 by the enclave's attested signing key over `"kuno/v1/receipt\n" + canoni
 The body holds only digests and metadata: job, enclave, profile, image digest, params digest,
 input digest, `output_digest` and `output_bytes` (SHA-256 and size of the sealed output blob exactly
 as uploaded, padding included), `content_digest` (SHA-256 of the decrypted MP4, never padded), attestation digest, timings, GPU-seconds, video info and miner hotkey. Anyone holding a
-video can look it up at `GET /v1/provenance/{sha256}`.
+video can look it up at `GET /v1/provenance/{sha256}`. A plan job's receipt carries `plan` instead of `video`, and its
+`content_digest` is the SHA-256 of the plan JSON ([Plans](#plans-director)); an absent `video`, `plan` or
+`step_commitment` is left out of the signed bytes.
 
 ## Model switch
 

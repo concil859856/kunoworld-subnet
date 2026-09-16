@@ -227,6 +227,13 @@ profile pins, so that the worker can commit to every step, and no Turbo server s
 Serving several LTX-2.5 profiles on one machine loads them in turn and evicts the least recently used when VRAM runs
 out, so pin `KUNO_PROFILES` to what the card can actually hold.
 
+**Plans.** The `real` LTX-2.5 backend also writes plans (PROTOCOL.md "Plans (Director)") with the pipeline's bundled
+prompt enhancer, on whichever LTX-2.5 profile is loaded, so a plan never forces a reload. Registration lists the `plan/1`
+feature when a served profile offers plans (`ltx-2.5-fast`), and the gateway sends plans only to confidential enclaves
+that list it. A plan takes the worker's one job slot for about 8-19 s of GPU time on an RTX PRO 6000 (2026-09-16). A plan
+whose planner writes nothing usable fails as `plan_failed`, which is refunded and not counted against you. `mock` writes a
+canned plan from the brief; `cold` backends write none and don't advertise the feature.
+
 ## 3c. Worker images
 
 Two images come from one Dockerfile (`image/build.sh --variant all`). They are published as tags of
@@ -469,31 +476,43 @@ The resident backend (`KUNO_BACKEND=real`) loads LTX-2.5 in the precision your c
 |---|---|---|
 | Transformer | stored as float8_e4m3fn and upcast to bf16 per layer; this is diffusers' `enable_layerwise_casting`, the same plain cast as ltx-pipelines' `--quantization fp8-cast` | int8 weight-only, quantized at load with torchao `Int8WeightOnlyConfig(group_size=128, version=2)` |
 | Text encoder (Gemma 4 12B) | bf16 | int8 weight-only |
-| Weights (estimated) | transformer ≈ 20 GiB, text encoder 22.4 GiB, prompt enhancer ≈ 8 GiB, VAEs/vocoder/upsampler ≈ 2.6 GiB | transformer ≈ 20.4 GiB, text encoder 11.4 GiB, the rest as on the 5090 |
+| Weights | transformer ≈ 20 GiB (estimated); text encoder 22.28 GiB, prompt enhancer 9.51 GiB, connectors, VAEs, vocoder and upsampler 8.53 GiB (measured in bf16) | transformer ≈ 20.4 GiB, text encoder 11.4 GiB (estimated), the rest as on the 5090 |
 | Offload (`KUNO_LTX_OFFLOAD=auto`) | `group`: transformer and text encoder streamed a block at a time from pinned host memory | `group` |
-| Host RAM | ≥ 61 GiB | ≥ 50 GiB |
-| Longest 720p 16:9 request | 16 s at 24 fps, 8 s at 50 fps | 8 s at 24 fps, 4 s at 50 fps |
-| Longest 1080p 16:9 request | 7 s at 24 fps, 3 s at 50 fps | 3 s at 24 fps, none at 50 fps |
-| Longest 1080p 21:9 request | 5 s at 24 fps, 2 s at 50 fps | 2 s at 24 fps, none at 50 fps |
+| Host RAM | ≥ 69 GiB | ≥ 58 GiB |
+| Longest 720p 16:9 request | 13 s at 24 fps, 6 s at 50 fps | 7 s at 24 fps, 3 s at 50 fps |
+| Longest 1080p 16:9 request | 5 s at 24 fps, 2 s at 50 fps | 2 s at 24 fps, none at 50 fps |
+| Longest 1080p 21:9 request | 4 s at 24 fps, 2 s at 50 fps | 2 s at 24 fps, none at 50 fps |
 | Speed | **unmeasured** | **unmeasured** |
 
 **These sizes are estimates, not measurements on these cards.**
 - **Weights** come from two community reports, both with the ComfyUI int8-convrot build: 20.03 GiB resident on a
   4090, and about 10 s of 720p before running out of memory on a 5090.
-- **Activations** use the bf16 pipeline's measurement on an RTX PRO 6000 (2026-09-16): 86.9 GiB at 720p 5 s and
-  93.7 GiB at 12 s. Activations run in bf16 whatever the weights' storage. Those figures replaced an estimate less
-  than half as large, which is why these limits shrank.
+- **Activations** use the bf16 pipeline's measurements on an RTX PRO 6000 (2026-09-16), which run in bf16 whatever the
+  weights' storage: 86.9 GiB at 720p 5 s and 93.7 GiB at 12 s with the prompt enhancer on the GPU, and 90.0 GiB at 720p
+  16 s and 93.9 GiB at 1080p 8 s with it in host RAM. The line fitted to all four (`precision_recipes.json`) estimates 3.7 GiB
+  more at 720p 16 s on these cards than the earlier line through the first two, which is why the 5090 went from 16 s to 13 s and
+  the 4090 from 8 s to 7 s.
 - No KunoWorld code has run on either card.
 - `auto` picks the offload mode that serves the most requests, which on these cards is `group`.
   `KUNO_LTX_OFFLOAD=model` keeps the transformer on the GPU and would be faster, but it fits nothing on either card.
 
-**The bf16 cards.** A card that holds every weight keeps them all on the GPU (no offload) and serves what the
-activations leave room for.
-- **RTX PRO 6000 (96 GB, 94.97 GiB usable).** 720p up to 11 s at 24 fps (5 s at 50 fps), and 1080p 16:9 up to 4 s.
-  - **Measured:** 12 s of 720p fit with 1.3 GiB to spare; 14, 15, 16 and 20 s ran out of memory.
+**The bf16 cards.** A card that holds a render's weights keeps them on the GPU (no offload) and serves what the
+activations leave room for. A render's weights are every component but the prompt enhancer (9.51 GiB): no render runs it,
+so it waits in host RAM and moves to the GPU only to write text, an enhanced prompt or a plan, between renders (about 0.6 s
+there and 2.7 s back on an RTX PRO 6000 without confidential computing; slower through CC bounce buffers, unmeasured). The
+card must still hold every weight at once while it writes.
+- **RTX PRO 6000 (96 GB, 94.97 GiB usable).** 720p 16:9 up to 18 s at 24 fps (9 s at 50 fps), 1080p 16:9 up to 8 s, and
+  1080p 21:9 up to 5 s.
+  - **Measured, enhancer in host RAM:** 720p 16 s peaked at 90.0 GiB and 1080p 8 s at 93.87 GiB; 720p 20 s ran out of
+    memory. With the enhancer on the GPU, 12 s was the limit.
+  - **The cap stops at the largest measured fit.** 1080p 8 s is 51,000 latent tokens; 720p 19 s is 51,040 and hasn't run,
+    so it is refused.
   - **Offload:** `model` would fit 20 s, but made every 5 s shot three times slower (41-44 s against 13.9 s).
   - **Longer clips** go to larger cards, and storyboards chain shots of these lengths.
-- **H200 (141 GB).** Everything at 720p and 1080p 16:9. 1080p 21:9 up to 18 s at 24 fps (estimated).
+- **H100 (80 GB, 79.19 GiB reported).** Now that a render leaves the enhancer in host RAM the weights fit, so an H100 keeps
+  them on the GPU: 720p 16:9 up to 5 s at 24 fps and 1080p 16:9 up to 2 s. It used to stream every job from host RAM
+  (`group`), which served the whole profile far more slowly. `KUNO_LTX_OFFLOAD=group` still does that.
+- **H200 (141 GB).** Everything at 720p and 1080p 16:9. 1080p 21:9 up to 17 s at 24 fps (estimated).
 - **The image sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.** Without it, 12 s ran out of memory with
   3.8 GiB reserved but unused.
 
@@ -525,7 +544,7 @@ refusal below uses, so the two always agree. Every registration carries the enve
 your class can't serve in full ([PROTOCOL.md](PROTOCOL.md#serving-envelope)), for example on a 5090:
 
 ```json
-{"ltx-2.5-fast": {"1080p": {"16:9": {"24": 7, "50": 3}, "21:9": {"24": 5, "50": 2}}, "720p": {"...": {}}}}
+{"ltx-2.5-fast": {"1080p": {"16:9": {"24": 5, "50": 2}, "21:9": {"24": 4, "50": 2}}, "720p": {"...": {}}}}
 ```
 
 The gateway sends you only jobs inside it. It picks standard jobs' workers by their parameters.

@@ -105,15 +105,16 @@ def test_consumer_class_plans_advertise_less_than_the_profile_and_the_4090_less_
         for aspect, by_fps in ratios.items():
             for fps in by_fps:
                 assert small.get(resolution, {}).get(aspect, {}).get(fps, 0) <= big.get(resolution, {}).get(aspect, {}).get(fps, 0)
-    # MINING.md §6 (activations as measured on an RTX PRO 6000, 2026-09-16): 16 s of 720p at 24 fps on a 5090, 8 s on a 4090.
-    assert (big["720p"]["16:9"][24], small["720p"]["16:9"][24]) == (16.0, 8.0)
+    # MINING.md §6 (activations as refit to the four RTX PRO 6000 peaks of 2026-09-16): 13 s of 720p at 24 fps on a 5090,
+    # 7 s on a 4090.
+    assert (big["720p"]["16:9"][24], small["720p"]["16:9"][24]) == (13.0, 7.0)
 
 
 def test_the_resident_backend_advertises_its_plan_and_full_limits_without_one(tmp_path):
     quantized = LtxResidentBackend(None, tmp_path, loader=lambda _p: object(), hardware_class=RTX4090, host_ram_gib=128)
     assert quantized.serving_envelope(FAST) == envelope_for_plan(quantized.memory_plan(FAST), FAST)
-    whole = LtxResidentBackend(None, tmp_path, loader=lambda _p: object(), hardware_class="O1.h100-80gb.x1", host_ram_gib=512)
-    assert whole.serving_envelope(FAST) == full_table(FAST)
+    whole = LtxResidentBackend(None, tmp_path, loader=lambda _p: object(), hardware_class="C2.b200-180gb.x1", host_ram_gib=512)
+    assert whole.memory_plan(FAST) is None and whole.serving_envelope(FAST) == full_table(FAST)
 
 
 # ------------------------------------------------------------------ worker
@@ -160,7 +161,8 @@ def test_a_quantized_worker_registers_its_envelope_and_a_full_one_registers_as_b
     quantized = make_worker(LtxResidentBackend(None, tmp_path, loader=lambda _p: object(), hardware_class=RTX5090, host_ram_gib=128), client)
     quantized.register()
     (sent,) = client.registered
-    assert list(sent) == ["envelope"] and list(sent["envelope"]) == [FAST.id]
+    # The resident LTX backend writes plans, so the registration also names that feature (test_worker_plan.py).
+    assert list(sent) == ["envelope", "features"] and list(sent["envelope"]) == [FAST.id] and sent["features"] == ["plan/1"]
     assert sent["envelope"][FAST.id]["1080p"]["21:9"]["24"] < FAST.limits.max_duration_s  # string fps keys: JSON as sent
     json.dumps(sent["envelope"])
 

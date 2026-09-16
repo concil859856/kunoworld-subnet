@@ -72,6 +72,17 @@ class ModelStore:
         with self._lock:
             yield self._get(profile)
 
+    @contextmanager
+    def acquire_loaded(self, profile: ModelProfile) -> Iterator[Any]:
+        """The most recently used loaded pipeline, whichever profile it serves, or `profile`'s when none is loaded; under
+        the same lock as `acquire`. For work every loaded pipeline can do alike, such as writing a plan with the prompt
+        enhancer every LTX-2.5 recipe includes, so it never forces a reload."""
+        with self._lock:
+            if self._pipelines:
+                yield next(reversed(self._pipelines.values()))
+            else:
+                yield self._get(profile)
+
     def unload_all(self) -> None:
         with self._lock:
             while self._pipelines:

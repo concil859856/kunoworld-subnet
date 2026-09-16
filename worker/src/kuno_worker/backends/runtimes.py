@@ -12,8 +12,9 @@ cold backends never pays for them.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from kuno_protocol.profiles import ModelProfile
 
@@ -36,12 +37,67 @@ def _audio_rate(pipeline: Any, result: Any) -> int:
     return int(rate or 48000)
 
 
-class LtxAdapter:
-    """Turns `ltx_resident.build_call` output into diffusers calls on loaded pipelines."""
+def _empty_cache() -> None:
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    def __init__(self, pipelines: dict[str, Any], device: str = "cuda"):
+
+class LtxAdapter:
+    """Turns `ltx_resident.build_call` output into diffusers calls on loaded pipelines, and writes text with the pipeline's
+    bundled prompt enhancer.
+
+    `offload` is the load plan's mode. Without offload the enhancer waits in host RAM (quantized._apply_offload) and
+    `enhancer` brings it to the GPU for one piece of text; with offload, diffusers' hooks place it."""
+
+    def __init__(self, pipelines: dict[str, Any], device: str = "cuda", offload: str = "none"):
         self.pipelines = pipelines
         self.device = device
+        self.offload = offload
+
+    @contextmanager
+    def enhancer(self, pipeline: Any | None = None) -> Iterator[tuple[Any, Any]]:
+        """(prompt enhancer, processor) with the enhancer on the GPU, and back in host RAM as soon as the text is written:
+        about 0.6 s there and 2.7 s back for its 9.51 GiB on an RTX PRO 6000 without confidential computing (2026-09-16).
+        Callers hold the model store's lock (resident.ModelStore), so it never shares the GPU with a render, whose memory
+        plan doesn't count it. On the CPU again, the cache it used is released for the next render."""
+        pipeline = pipeline if pipeline is not None else self.pipelines["text"]
+        enhancer, processor = getattr(pipeline, "prompt_enhancer", None), getattr(pipeline, "processor", None)
+        if enhancer is None or processor is None:
+            # diffusers would fall back to the text encoder, which LTX-2.5 did not train for enhancement; on 2026-09-16 it
+            # wrote random capital letters when asked for a plan.
+            raise RuntimeError("the loaded LTX-2.5 pipeline has no prompt_enhancer and processor")
+        if self.offload != "none":
+            yield enhancer, processor
+            return
+        enhancer.to(self.device)
+        try:
+            yield enhancer, processor
+        finally:
+            enhancer.to("cpu")
+            _empty_cache()
+
+    def write_text(self, messages: list[dict[str, str]], *, seed: int, max_new_tokens: int, **sampling: Any) -> tuple[str, int]:
+        """The enhancer's reply to a chat and the tokens it generated, as the 2026-09-16 GPU spike ran plan/1: the
+        processor tokenizer's chat template with thinking off, `generate` seeded through `torch.manual_seed` (generate
+        takes no torch.Generator), and the new tokens decoded without special tokens. Unlike diffusers' `enhance_prompt`,
+        the reply is not passed through `clean_response`, which drops everything before the first letter, a JSON
+        object's opening brace included."""
+        import torch
+
+        with self.enhancer() as (model, processor):
+            tokenizer = processor.tokenizer
+            chat = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            inputs = tokenizer(chat, return_tensors="pt").to(self.device)
+            prompt_tokens = inputs["input_ids"].shape[1]
+            torch.manual_seed(int(seed))
+            with torch.no_grad():
+                sequences = model.generate(**inputs, max_new_tokens=max_new_tokens, **sampling)
+            generated = sequences[0, prompt_tokens:]
+            return tokenizer.decode(generated, skip_special_tokens=True), int(generated.shape[0])
 
     def __call__(self, **call: Any) -> dict[str, Any]:
         import torch
@@ -92,13 +148,12 @@ class LtxAdapter:
         from diffusers.pipelines.ltx2.utils import LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT, LTX2_5_T2V_DEFAULT_SYSTEM_PROMPT
 
         pipeline = self.pipelines.get(call["pipeline"]) or self.pipelines["text"]
-        if getattr(pipeline, "prompt_enhancer", None) is None or getattr(pipeline, "processor", None) is None:
-            # diffusers would fall back to the text encoder, which LTX-2.5 did not train for enhancement.
-            raise RuntimeError("the loaded LTX-2.5 pipeline has no prompt_enhancer and processor")
-        conditions = call.get("conditions") or []
-        image = _load_image(conditions[0]["path"]) if conditions and pipeline is self.pipelines.get("condition") else None
-        instructions = LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT if image is not None else LTX2_5_T2V_DEFAULT_SYSTEM_PROMPT
-        [enhanced] = pipeline.enhance_prompt(prompt=call["prompt"], system_prompt=instructions, seed=int(call["seed"]), image=image)
+        # diffusers' enhance_prompt moves the enhancer to the execution device itself; `enhancer` returns it to host RAM.
+        with self.enhancer(pipeline):
+            conditions = call.get("conditions") or []
+            image = _load_image(conditions[0]["path"]) if conditions and pipeline is self.pipelines.get("condition") else None
+            instructions = LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT if image is not None else LTX2_5_T2V_DEFAULT_SYSTEM_PROMPT
+            [enhanced] = pipeline.enhance_prompt(prompt=call["prompt"], system_prompt=instructions, seed=int(call["seed"]), image=image)
         return enhanced
 
     @staticmethod
@@ -154,7 +209,7 @@ def ltx_loader(
         log.info(
             "LTX-2.5 resident for %s: %s, %s offload, weights %s", profile.id, plan.recipe.id, plan.offload, plan.weights.model_digest[:16]
         )
-        adapter = LtxAdapter(pipelines, device=device)
+        adapter = LtxAdapter(pipelines, device=device, offload=plan.offload)
         adapter.load_plan = plan
         return adapter
 

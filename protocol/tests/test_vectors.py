@@ -68,3 +68,43 @@ def test_storyboard_lengths_and_job_aad():
 def test_receipt_message():
     case = VECTORS["receipt"]
     assert receipt_message(ReceiptBody.model_validate(case["body"])) == b64d(case["message_b64"])
+
+
+def test_plan_repair_fit_quotes_output_receipt_and_job_aad():
+    from kuno_protocol import plans
+    from kuno_protocol.canonical import sha256_hex
+    from kuno_protocol.profiles import load_profiles, storyboard_duration_s
+    from kuno_protocol.schemas import ShotSpec
+
+    group = VECTORS["plans"]
+    fast = load_profiles()["ltx-2.5-fast"]
+    for case in group["repair"]:
+        params = GenerationParams.model_validate(case["params"])
+        options = plans.PlanOptions.model_validate(case["options"])
+        context = plans.plan_context(fast, params, options)
+        assert {"min_shot_s": context.min_shot_s, "max_shot_s": context.max_shot_s, "min_shots": context.min_shots,
+                "max_shots": context.max_shots} == case["context"], case["name"]
+        result = plans.repair(case["raw"], context, planner=case["planner"], brief=case["brief"], revise=options.revise)
+        assert result.refusal == case["refusal"] and result.syntax == case["syntax"], case["name"]
+        assert [{"code": p.code, "notice": p.notice} for p in result.problems] == case["problems"], case["name"]
+        assert result.model_duration_s == case["model_duration_s"], case["name"]
+        assert (result.plan.model_dump(mode="json") if result.plan else None) == case["plan"], case["name"]
+        delivered = plans.encode_plan(result.deliverable()).decode() if result.plan else None
+        assert delivered == case["delivered_json"], case["name"]
+    for case in group["fit"]:
+        context = plans.plan_context(fast, GenerationParams(profile_id=case["profile_id"], mode="plan", duration_s=case["target_s"], resolution="720p",
+                                                            aspect_ratio="16:9", fps=case["fps"]), plans.PlanOptions(max_shot_s=case["max_shot_s"]))
+        shots = [plans.PlannedShot(beat="b", prompt="p", **shot) for shot in case["shots"]]
+        fitted, repairs = plans.fit(shots, context, movable=case["movable"])
+        assert [shot.duration_s for shot in fitted] == case["durations"] and repairs == case["repairs"], case["name"]
+        assert storyboard_duration_s(fast, [ShotSpec(duration_s=s.duration_s, join=s.join) for s in fitted], case["fps"]) == case["duration_s"]
+    for case in group["quotes"]:
+        assert plans.brief_quotes(case["brief"]) == case["quotes"]
+        assert plans.missing_quotes(case["brief"], case["prompts"]) == case["missing"]
+    output = group["output"]
+    plan_json = output["plan_json"].encode()
+    assert sha256_hex(plan_json) == output["sha256"] and plans.encode_plan(plans.Plan.model_validate_json(plan_json)) == plan_json
+    assert len(plans.pad_plan(plan_json)) == output["padded_length"] and plans.plan_output_label(case_job := group["job_aad"]["job_id"]) == output["label"]
+    assert receipt_message(ReceiptBody.model_validate(group["receipt"]["body"])) == b64d(group["receipt"]["message_b64"])
+    aad = group["job_aad"]
+    assert job_aad(case_job, aad["enclave_id"], GenerationParams.model_validate(aad["params"]), aad["input_blob_ids"]).decode() == aad["encoded"]

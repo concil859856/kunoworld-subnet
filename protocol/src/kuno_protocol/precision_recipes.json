@@ -16,13 +16,13 @@
       },
       "packages": {"diffusers": ">=0.40.0", "torch": ">=2.7"},
       "memory": {
-        "components_gib": {"transformer": 39.13, "text_encoder": 22.4, "prompt_enhancer": 8.0, "other": 2.64},
+        "components_gib": {"transformer": 35.37, "text_encoder": 22.28, "prompt_enhancer": 9.51, "other": 8.53},
         "group_onload_gib": 1.7,
-        "activation_fixed_gib": 9.55,
-        "activation_gib_per_10k_tokens": 3.674,
+        "activation_fixed_gib": 3.32,
+        "activation_gib_per_10k_tokens": 4.6,
         "overhead_gib": 1.5,
         "measured": true,
-        "basis": "activations measured 2026-09-16 on an RTX PRO 6000 Blackwell Server Edition (94.97 GiB), bf16, no offload, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: torch peak allocated 86.89 GiB at 14,080 full-size latent tokens (720p 5 s) and 93.68 GiB at 32,560 (720p 12 s); 720p at 14, 15, 16 and 20 s ran out of memory. The line through the two peaks sets the per-token and fixed terms, and overestimates a 3 s clip by 2.3 GiB. Weights: transformer ltx-2.5-22b-distilled-transformer-bf16.safetensors is 42,018,190,584 bytes (HF tree); text encoder: 12B parameters x 2 bytes; other: 22.67 - 20.03 GiB (runaihome, 4090); prompt enhancer: 8 GiB assumed"
+        "basis": "Measured 2026-09-16 on an RTX PRO 6000 Blackwell (94.97 GiB), bf16, no offload, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. Weights, as loaded: transformer 35.37, text encoder 22.28, prompt enhancer 9.51, other 8.53 (connectors 5.91, VAE, audio VAE and vocoder 1.69, latent upsampler by difference from the 75.68 GiB total, rounded up); with the enhancer kept in host RAM a render has 66.18 GiB of weights on the GPU. Torch peak allocated, as activations over the weights on the GPU: enhancer on the GPU, 86.89 GiB at 14,080 full-size latent tokens (720p 5 s, 11.21) and 93.68 GiB at 32,560 (720p 12 s, 18.00); enhancer in host RAM, 90.0 GiB at 43,120 (720p 16 s, 23.82) and 93.87 GiB at 51,000 (1080p 8 s, 27.69); 720p 20 s (53,680) ran out of memory. The line is set conservatively: with the planner's 1.5 GiB overhead it is at or above all four measured peaks, it admits the largest measured fit (1080p 8 s) with the 0.5 GiB reserve on this card and refuses anything above 51,021 tokens, so 720p 19 s (51,040, unmeasured) and 20 s are refused. A line through the two evicted peaks alone (2.64 + 4.911 per 10k) would refuse 1080p 8 s once the overhead is added; this one has the largest slope that keeps the 5 s peak covered. Text generation adds a KV cache of 0.12 GiB for E2B at 2,048 tokens (research/director-design_2026-09-16.md §10)"
       },
       "sources": [
         "https://huggingface.co/Lightricks/LTX-2.5",
@@ -46,13 +46,13 @@
       },
       "packages": {"diffusers": ">=0.40.0", "torch": ">=2.7"},
       "memory": {
-        "components_gib": {"transformer": 39.13, "text_encoder": 22.4, "prompt_enhancer": 8.0, "other": 2.64},
+        "components_gib": {"transformer": 35.37, "text_encoder": 22.28, "prompt_enhancer": 9.51, "other": 8.53},
         "group_onload_gib": 1.7,
-        "activation_fixed_gib": 2.0,
-        "activation_gib_per_10k_tokens": 3.2,
+        "activation_fixed_gib": 3.32,
+        "activation_gib_per_10k_tokens": 4.6,
         "overhead_gib": 1.5,
         "measured": false,
-        "basis": "as the distilled bf16 recipe; activations doubled for classifier-free guidance (batch of two)"
+        "basis": "weights as measured for the distilled bf16 recipe (transformer_full has the same 22B bf16 parameter count). Activations: at least the distilled recipe's measured line; classifier-free guidance runs a batch of two, which needs more, unmeasured. The earlier guess (2.0 + 3.2 per 10k) was below what the distilled pipeline measured"
       },
       "sources": [
         "https://huggingface.co/Lightricks/LTX-2.5",
@@ -73,13 +73,13 @@
       },
       "packages": {"diffusers": ">=0.40.0", "torch": ">=2.7"},
       "memory": {
-        "components_gib": {"transformer": 39.13, "text_encoder": 22.4, "prompt_enhancer": 8.0, "other": 6.0},
+        "components_gib": {"transformer": 35.37, "text_encoder": 22.28, "prompt_enhancer": 9.51, "other": 11.89},
         "group_onload_gib": 1.7,
         "activation_fixed_gib": 8.0,
         "activation_gib_per_10k_tokens": 1.6,
         "overhead_gib": 1.5,
         "measured": false,
-        "basis": "as the distilled bf16 recipe, plus the temporal upsampler and diffusion decoder (sizes unknown); 4K decode is the peak"
+        "basis": "weights as measured for the distilled bf16 recipe, plus 3.36 GiB assumed for the temporal upsampler and diffusion decoder (sizes unknown); activation terms are unmeasured guesses, 4K decode is the peak"
       },
       "sources": [
         "https://huggingface.co/Lightricks/LTX-2.5"
@@ -104,13 +104,13 @@
       },
       "packages": {"diffusers": ">=0.40.0", "torch": ">=2.7"},
       "memory": {
-        "components_gib": {"transformer": 20.03, "text_encoder": 22.4, "prompt_enhancer": 8.0, "other": 2.64},
+        "components_gib": {"transformer": 20.03, "text_encoder": 22.28, "prompt_enhancer": 9.51, "other": 8.53},
         "group_onload_gib": 1.0,
-        "activation_fixed_gib": 9.55,
-        "activation_gib_per_10k_tokens": 3.674,
+        "activation_fixed_gib": 3.32,
+        "activation_gib_per_10k_tokens": 4.6,
         "overhead_gib": 1.5,
         "measured": false,
-        "basis": "transformer assumed equal to the 8-bit int8-convrot build's measured 20.03 GiB resident (runaihome); SGLang documents 18.11 GB for its FP8 LTX-2.5 transformer. Text encoder stays bf16 and is offloaded while the transformer runs.; activation terms from the bf16 recipe's 2026-09-16 RTX PRO 6000 measurement (activations run in bf16 whatever the weights' storage), not measured on this class"
+        "basis": "transformer assumed equal to the 8-bit int8-convrot build's measured 20.03 GiB resident (runaihome); SGLang documents 18.11 GB for its FP8 LTX-2.5 transformer. Text encoder stays bf16 and is offloaded while the transformer runs.; prompt enhancer and other (connectors, VAEs, vocoder, upsampler) as measured in bf16 on 2026-09-16, and the activation terms are the bf16 recipe's refit of that day's four RTX PRO 6000 peaks (activations run in bf16 whatever the weights' storage), not measured on this class. The refit raised the group-offload estimate at 720p 16 s by 3.7 GiB, which is why its limits shrank again"
       },
       "sources": [
         "https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-core/src/ltx_core/quantization",
@@ -146,13 +146,13 @@
       },
       "packages": {"diffusers": ">=0.40.0", "torchao": ">=0.15.0", "transformers": ">=4.51", "torch": ">=2.7"},
       "memory": {
-        "components_gib": {"transformer": 20.35, "text_encoder": 11.4, "prompt_enhancer": 8.0, "other": 2.64},
+        "components_gib": {"transformer": 20.35, "text_encoder": 11.4, "prompt_enhancer": 9.51, "other": 8.53},
         "group_onload_gib": 1.0,
-        "activation_fixed_gib": 9.55,
-        "activation_gib_per_10k_tokens": 3.674,
+        "activation_fixed_gib": 3.32,
+        "activation_gib_per_10k_tokens": 4.6,
         "overhead_gib": 1.5,
         "measured": false,
-        "basis": "int8 weights + one bf16 scale per 128 weights (x 1.016) over the 20.03 GiB 8-bit transformer; text encoder 12B x 1 byte. Lightricks' comfy-int8-convrot file is ComfyUI-only, so this class quantizes the bf16 checkpoint with torchao at load.; activation terms from the bf16 recipe's 2026-09-16 RTX PRO 6000 measurement (activations run in bf16 whatever the weights' storage), not measured on this class"
+        "basis": "int8 weights + one bf16 scale per 128 weights (x 1.016) over the 20.03 GiB 8-bit transformer; text encoder 12B x 1 byte. Lightricks' comfy-int8-convrot file is ComfyUI-only, so this class quantizes the bf16 checkpoint with torchao at load.; prompt enhancer and other (connectors, VAEs, vocoder, upsampler) as measured in bf16 on 2026-09-16, and the activation terms are the bf16 recipe's refit of that day's four RTX PRO 6000 peaks (activations run in bf16 whatever the weights' storage), not measured on this class. The refit raised the group-offload estimate at 720p 16 s by 3.7 GiB, which is why its limits shrank again"
       },
       "sources": [
         "https://huggingface.co/docs/diffusers/main/en/quantization/torchao",

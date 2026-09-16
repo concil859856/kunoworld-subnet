@@ -129,19 +129,29 @@ def test_consumer_classes_plan_offload_and_refuse_what_does_not_fit(tmp_path):
 
 
 def test_cards_that_hold_every_weight_keep_them_on_the_gpu_with_a_measured_token_cap():
-    # RTX PRO 6000, 2026-09-16: 720p 12 s (32,560 tokens) peaked at 93.68 GiB allocated; 14 s ran out of memory. The cap
-    # keeps the planner's 1.5 GiB overhead and 0.5 GiB reserve on top, so it serves 11 s.
+    # RTX PRO 6000, 2026-09-16, the prompt enhancer in host RAM: 720p 16 s (43,120 tokens) peaked at 90.0 GiB allocated and
+    # 1080p 8 s (51,000) at 93.87 GiB; 720p 20 s (53,680) ran out of memory. With the planner's 1.5 GiB overhead and 0.5 GiB
+    # reserve on top, the cap admits the largest measured fit and nothing above it: 720p 19 s (51,040) is unmeasured.
     for cls in ("C1.rtx-pro-6000-bw-se.x1", None, "O1.rtx-pro-6000-bw-96gb.x1"):
         plan = plan_for_class(FAST, cls, host_ram_gib=512, device_gib=94.97)
         assert plan is not None and plan.offload == "none" and plan.measured
-        assert latent_tokens(1280, 704, 265) <= plan.max_tokens < latent_tokens(1280, 704, 289)  # 11 s fits, 12 s doesn't
+        assert latent_tokens(1920, 1088, 193) == 51_000 <= plan.max_tokens < latent_tokens(1280, 704, 457) == 51_040
+        assert plan.max_tokens < latent_tokens(1280, 704, 481) == 53_680
+        # A render's weights on the GPU leave the enhancer out; it waits in host RAM, and writing text peaks at every weight.
+        assert plan.host_ram_gib == 9.51 and plan.floor_gib == pytest.approx(75.69)
     # Without a device reading, a class that declares no VRAM has nothing to plan against (CPU tests, the mock network).
     assert plan_for_class(FAST, "C1.rtx-pro-6000-bw-se.x1", host_ram_gib=512) is None
     assert plan_for_class(FAST, None, host_ram_gib=512) is None
     # A "96 GB" class is planned on what the card reports.
     assert plan_for_class(FAST, "O1.rtx-pro-6000-bw-96gb.x1", host_ram_gib=512).max_tokens > plan.max_tokens
-    # 80 GB can't hold the weights and the measured activations together, so an H100 offloads.
-    assert plan_for_class(FAST, "O1.h100-80gb.x1", host_ram_gib=512).offload == "group"
+    # With the enhancer in host RAM an 80 GB H100 holds a render's weights too, so it keeps them on the GPU with a short cap
+    # (720p 16:9 up to 6 s on the class's 80 GB, 5 s on the 79.19 GiB an H100 reports) rather than offloading every job.
+    h100 = plan_for_class(FAST, "O1.h100-80gb.x1", host_ram_gib=512)
+    assert h100.offload == "none" and latent_tokens(1280, 704, 145) <= h100.max_tokens < latent_tokens(1280, 704, 169)
+    reported = plan_for_class(FAST, "O1.h100-80gb.x1", host_ram_gib=512, device_gib=79.19)
+    assert latent_tokens(1280, 704, 121) <= reported.max_tokens < latent_tokens(1280, 704, 145)
+    # An operator who wants every request served, slowly, still picks an offload mode.
+    assert plan_for_class(FAST, "O1.h100-80gb.x1", host_ram_gib=512, mode="group").offload == "group"
     assert plan_for_class(FAST, "O1.h100-80gb.x1", host_ram_gib=512, mode="model").offload == "model"
     # An H200 fits almost the whole profile without offload; its cap only reaches 1080p 21:9 past 18 s.
     h200 = plan_for_class(FAST, "C2.h200-141gb.x1", host_ram_gib=512, device_gib=139.8)

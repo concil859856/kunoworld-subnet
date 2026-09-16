@@ -82,7 +82,7 @@ class CertClient:
     def nonce(self) -> bytes:
         return os.urandom(32)
 
-    def register(self, evidence, miner_hotkey, capacity, hotkey_proof=None):
+    def register(self, evidence, miner_hotkey, capacity, hotkey_proof=None, **extra):
         self.registrations += 1
         return {"status": "active"}
 

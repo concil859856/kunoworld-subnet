@@ -5,7 +5,10 @@ pipeline can run on a laptop without GPUs.
 It also runs verified mode for real: a tiny deterministic toy denoiser
 (`kuno_protocol.toy_denoiser`) produces a genuine per-step trajectory, so dev networks
 commit to steps, retain them, answer audits and get re-executed exactly like GPU miners.
-The rendered video does not depend on the toy latents."""
+The rendered video does not depend on the toy latents.
+
+Plans come from a canned planner: a plan/1 reply built from the brief alone, so dev networks
+and integration tests run the whole sealed plan path (repair, checks, sealing, receipt)."""
 
 from __future__ import annotations
 
@@ -15,14 +18,20 @@ import tempfile
 from pathlib import Path
 
 from kuno_protocol.canonical import canonical_json, sha256_hex
+from kuno_protocol.plans import PLAN_OPTION, PlanOptions, brief_quotes, plan_context, suggested_shots
 from kuno_protocol.profiles import InputRole, Mode
 from kuno_protocol.receipts import VideoInfo
 from kuno_protocol.toy_denoiser import DEV_HARDWARE_CLASS, TOY_RUNTIME, run_toy_trajectory, toy_model_digest, toy_replay_step, toy_transcript
 from kuno_protocol.verified import StepCommitment, StepTranscript, Tensor
 
 from ..verified import OpeningsHandle, RetentionStore, context_bytes, shared_retention
-from .base import Backend, GenerationTask, ProgressFn, VideoResult
+from .base import Backend, GenerationTask, PlanText, ProgressFn, VideoResult
 from .media_tools import ffmpeg_exe as _ffmpeg
+
+
+# The `planner` a mock plan names: no weights, so no precision recipe.
+MOCK_PLANNER = "mock/1:canned"
+_MOCK_SIZES = ("Wide shot", "Medium shot", "Close-up shot")
 
 
 def toy_replayer(transcript: StepTranscript, context: bytes, target: int, state: list[Tensor]) -> list[Tensor]:
@@ -33,6 +42,7 @@ def toy_replayer(transcript: StepTranscript, context: bytes, target: int, state:
 class MockBackend(Backend):
     name = "mock"
     storyboards = True
+    plans = True
 
     def __init__(self, ffmpeg: str | None = None, retention: RetentionStore | None = None, hardware_class: str | None = DEV_HARDWARE_CLASS):
         self.ffmpeg = ffmpeg or _ffmpeg()
@@ -74,6 +84,26 @@ class MockBackend(Backend):
         info = VideoInfo(duration_s=d, width=w, height=h, fps=fps, frames=round(d * fps), audio=params.audio)
         commitment, openings = verified if verified is not None else (None, None)
         return VideoResult(data=data, info=info, step_commitment=commitment, openings=openings)
+
+    def write_plan(self, task: GenerationTask, messages: list[dict[str, str]], *, seed: int, max_new_tokens: int) -> PlanText:
+        """A deterministic plan/1 reply from the brief: the suggested number of shots at the suggested length (a revision
+        keeps the earlier plan's count), each naming the brief's first words, the last speaking every phrase the brief
+        quotes. The worker repairs and fits it like a real reply, so its length lands on the target."""
+        options = PlanOptions.model_validate(task.options.get(PLAN_OPTION) or {})
+        context = plan_context(task.profile, task.params, options)
+        count, length = suggested_shots(context)
+        if options.revise is not None:
+            count = len(options.revise.plan.shots)
+        subject = " ".join(task.prompt.split()[:12]).rstrip(".") or "the subject"
+        quotes = brief_quotes(task.prompt)
+        shots = []
+        for index in range(count):
+            prompt = f"{_MOCK_SIZES[index % len(_MOCK_SIZES)]}; {subject}. The camera slowly pushes in. Soft room tone is heard."
+            if quotes and index == count - 1:
+                prompt += " A warm voice-over says, " + ", ".join(f'"{quote}"' for quote in quotes) + "."
+            shots.append({"beat": f"Beat {index + 1}", "prompt": prompt, "duration_s": length, "join": "fresh" if index == 0 else "cut"})
+        reply = json.dumps({"title": "Mock plan", "scene": "A plain, evenly lit studio set.", "shots": shots, "notes": "Written by the mock planner."})
+        return PlanText(text=reply, output_tokens=max(1, len(reply) // 4), planner=MOCK_PLANNER)
 
     def _storyboard(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
         """The stitched video's exact frame count, fps and duration, each shot's kept frames in a hue of its own, with

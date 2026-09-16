@@ -82,6 +82,17 @@ class GenerationTask:
 
 
 @dataclass
+class PlanText:
+    """A planner's raw reply to a plan chat (kuno_protocol.plans.plan_messages), before any repair."""
+
+    text: str
+    # Tokens the planner generated for this reply.
+    output_tokens: int
+    # What wrote it, for the plan and its receipt: "<precision recipe id>:<component>".
+    planner: str
+
+
+@dataclass
 class VideoResult:
     data: bytes
     info: VideoInfo
@@ -116,6 +127,11 @@ class Backend(ABC):
     # it (worker.Worker._enhance). `generate` never rewrites a prompt itself, since nothing would check what it wrote.
     # Without it the option has no effect, and the prompt renders as sent.
     prompt_enhancement: bool = False
+    # Writes storyboard plans from a brief (PROTOCOL.md "Plans (Director)") with a language model it already holds:
+    # `write_plan` returns the model's raw reply, and the worker repairs, retries and checks it (worker.Worker._plan).
+    # Registration advertises the `plan/1` feature only for a backend with it; without it the worker refuses plan jobs
+    # before decrypting them.
+    plans: bool = False
 
     def warm(self, profile: ModelProfile) -> None:
         """Load weights ahead of the first job. TEE model loads are slow; do it once."""
@@ -155,6 +171,11 @@ class Backend(ABC):
         """`task.prompt` rewritten by the backend's prompt enhancer for the render `generate(task)` would make. Only
         called when `prompt_enhancement` is set, never for a storyboard; errors must not carry either prompt."""
         raise NotImplementedError(f"{self.name} has no prompt enhancer")
+
+    def write_plan(self, task: GenerationTask, messages: list[dict[str, str]], *, seed: int, max_new_tokens: int) -> PlanText:
+        """The planner's reply to `messages` for plan job `task`, sampled with kuno_protocol.plans.PLAN_SAMPLING and
+        seeded with `seed`. Only called when `plans` is set; errors must not carry the brief or the reply."""
+        raise NotImplementedError(f"{self.name} has no planner")
 
     @abstractmethod
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult: ...

@@ -16,12 +16,30 @@ from pydantic import ValidationError
 from kuno_protocol.attestation import AttestationEvidence, AttestationUnavailable, TEEProvider, build_evidence
 from kuno_protocol.blobs import decrypt_blob, encrypt_blob
 from kuno_protocol.canonical import b64d, canonical_json, sha256_hex
+from kuno_protocol.content_policy import ContentPolicyViolation, check_prompt
 from kuno_protocol.crypto import DecryptionError, RecipientSession
-from kuno_protocol.envelope import CAPACITY_REFUSED, advertised, describe, fits
+from kuno_protocol.envelope import CAPACITY_REFUSED, advertised, describe, fits, max_duration
 from kuno_protocol.hotkey import HotkeySigner, sign_hotkey_proof
 from kuno_protocol.media import ROLE_TYPES, sniff_mime
+from kuno_protocol.plans import (
+    PLAN_FAILED,
+    PLAN_FEATURE,
+    PLAN_OPTION,
+    Plan,
+    PlanContext,
+    PlanError,
+    PlanOptions,
+    check_revision,
+    choose,
+    plan_context,
+    plan_messages,
+    repair,
+    retry_messages,
+    seal_plan,
+    validate as validate_plan,
+)
 from kuno_protocol.profiles import Mode, ModelProfile, ParamError, load_profiles, shot_prompt, validate_params
-from kuno_protocol.receipts import Receipt, ReceiptBody, input_digest, sign_receipt
+from kuno_protocol.receipts import PlanInfo, Receipt, ReceiptBody, input_digest, sign_receipt
 from kuno_protocol.schemas import GenerationParams, MinerChallenge, MinerJob, SealedPayload, input_label, job_aad, output_label
 from kuno_protocol.sealed_payload import MalformedPayload, open_payload
 from kuno_protocol.verified import MinerAudit
@@ -44,12 +62,21 @@ HEARTBEAT_S = 20.0
 # One message for every blocked prompt, whoever wrote it. In Private mode the gateway sees failure messages but not the
 # sealed options, so a message of its own for an enhanced prompt would tell it that enhancement was asked for.
 PROMPT_BLOCKED = "The request was blocked by the content policy."
+# A plan job whose planner never wrote a usable plan (kuno_protocol.plans.PLAN_FAILED): refunded, and not a miner fault.
+PLAN_FAILED_MESSAGE = "The planner could not write a usable plan for this brief."
 
 
 class JobRejected(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code, self.message = code, message
+
+
+class PlanRefused(JobRejected):
+    """The planner refused the brief: `safety_blocked`, and never regenerated."""
+
+    def __init__(self) -> None:
+        super().__init__("safety_blocked", PROMPT_BLOCKED)
 
 
 class JobCanceled(Exception):
@@ -139,6 +166,13 @@ class Worker:
         return self._envelope
 
     @property
+    def features(self) -> list[str]:
+        """The optional job kinds registration advertises (MinerRegistration.features): `plan/1` when some served profile
+        offers plans and its backend writes them."""
+        plans = any(Mode.PLAN in profile.modes and getattr(self.backend_for(profile), "plans", False) for profile in self.profiles.values())
+        return [PLAN_FEATURE] if plans else []
+
+    @property
     def advertised_envelope(self) -> dict | None:
         """What registration carries: the profiles this hardware can't serve in full, or None when it serves them all."""
         self.serving_envelope()
@@ -166,6 +200,8 @@ class Worker:
             extra["turbo_submission"] = self.turbo_submission
         if self.advertised_envelope is not None:
             extra["envelope"] = self.advertised_envelope
+        if self.features:
+            extra["features"] = self.features
         location = self._location_proof(nonce)
         if location is not None:
             extra["location"] = location
@@ -491,6 +527,9 @@ class Worker:
         if job.params.mode is Mode.STORYBOARD and not getattr(backend, "storyboards", False):
             # The cold backends would render one clip of the stitched length: refuse rather than deliver that.
             raise JobRejected("internal_error", "This worker's backend does not render storyboards.")
+        if job.params.mode is Mode.PLAN and not getattr(backend, "plans", False):
+            # Registration didn't advertise plan/1, so the gateway shouldn't have routed it here.
+            raise JobRejected("internal_error", "This worker's backend does not write plans.")
 
         enc, ciphertext = b64d(job.enc), b64d(job.ciphertext)
         aad = job_aad(job.job_id, self.identity.enclave_id, job.params, job.input_blob_ids)
@@ -507,6 +546,8 @@ class Worker:
 
         blobs = [self.client.download_blob(blob_id) for blob_id in job.input_blob_ids]
         inputs = self._open_inputs(job, payload, session.input_key, blobs)
+        if job.params.mode is Mode.PLAN:
+            return self._plan(job, profile, backend, payload, session, started, input_digest(enc, ciphertext, blobs))
         if any(len(prompt) > profile.limits.max_prompt_chars for prompt in (payload.prompt, *model_prompts)):
             raise JobRejected("prompt_too_long", f"Prompts are limited to {profile.limits.max_prompt_chars} characters.")
         if payload.negative_prompt and not profile.limits.negative_prompt:
@@ -629,6 +670,160 @@ class Worker:
             self._install_dev_certificate(signer, PROVISIONAL)
         return signer
 
+    # ------------------------------------------------------------ plans
+
+    def _plan(
+        self, job: MinerJob, profile: ModelProfile, backend: Backend, payload: SealedPayload, session: RecipientSession,
+        started: float, inputs_digest: str,
+    ) -> Receipt:
+        """A plan job (PROTOCOL.md "Plans (Director)"): the brief and style checked like prompts, a plan written by the
+        backend's planner and repaired (`_draft_plan`), every shot's model prompt checked like a prompt and its labels
+        against the content policy, with one regeneration after a block; then the canonical plan JSON sealed, padded, as
+        `<job_id>/output/plan`, and a receipt with `plan` and no `video`. Nothing renders, so there is no frame check
+        and no C2PA manifest."""
+        limits = profile.limits.plan
+        if limits is None:  # validate_params refuses plan mode on such a profile; kept for a hand-edited catalog
+            raise JobRejected("invalid_params", f"{profile.name} does not support plan")
+        try:
+            options = PlanOptions.model_validate(payload.options.get(PLAN_OPTION) or {})
+        except ValidationError:
+            raise JobRejected("bad_payload", "The plan options are malformed.") from None
+        brief, style = payload.prompt, options.style or ""
+        if len(brief) > limits.max_brief_chars:
+            raise JobRejected("prompt_too_long", f"Briefs are limited to {limits.max_brief_chars} characters.")
+        if len(style) > limits.max_style_chars:
+            raise JobRejected("prompt_too_long", f"Styles are limited to {limits.max_style_chars} characters.")
+        if payload.negative_prompt:
+            raise JobRejected("unsupported_option", "Plans take no negative prompt.")
+        if not brief.strip() and options.revise is None:
+            raise JobRejected("bad_payload", "A plan needs a brief.")
+        # With no max_shot_s from the client, shots are planned to what this worker's own hardware renders at this size.
+        params = job.params
+        table = self.serving_envelope().get(profile.id)
+        served = max_duration(table, params.resolution, params.aspect_ratio, params.fps) if table is not None else None
+        try:
+            context = plan_context(profile, params, options, served_max_s=served)
+            if options.revise is not None:
+                check_revision(options.revise, context)
+        except PlanError as exc:  # the message names limits and shot numbers, never text
+            raise JobRejected("bad_payload", f"The plan options don't fit this job: {exc}.") from None
+        written = [brief, style, options.revise.instruction if options.revise is not None else ""]
+        try:
+            for text in written:
+                if text.strip():
+                    check_request(text)
+        except SafetyViolation:
+            raise JobRejected("safety_blocked", PROMPT_BLOCKED) from None
+
+        width, height = profile.size_for(params.resolution, params.aspect_ratio)
+        task = GenerationTask(
+            job_id=job.job_id, profile=profile, params=params, prompt=brief, negative_prompt=None,
+            seed=payload.seed if payload.seed is not None else secrets.randbelow(2**31), width=width, height=height,
+            options=payload.options,
+        )
+        self._progress(job.job_id, 0.05, "planning", force=True)
+        plan, tokens = self._checked_plan(backend, task, context, options)
+        try:
+            validate_plan(plan, profile, context=context)
+        except PlanError:
+            # repair and fit only deliver plans that pass; one that doesn't is a bug in this worker.
+            log.error("job %s: the repaired plan failed validation", job.job_id)
+            raise JobRejected("internal_error", "Generation failed inside the worker.") from None
+
+        self._progress(job.job_id, 0.92, "sealing", force=True)
+        assert self.evidence is not None
+        plan_json, sealed = seal_plan(session.output_key, job.job_id, plan)
+        blob_id = self.client.upload_blob(job.job_id, sealed)
+        finished = time.time()
+        body = ReceiptBody(
+            job_id=job.job_id,
+            enclave_id=self.identity.enclave_id,
+            profile_id=profile.id,
+            image_digest=self.config.image_digest,
+            params_digest=sha256_hex(canonical_json(params.model_dump(mode="json"))),
+            input_digest=inputs_digest,
+            output_digest=sha256_hex(sealed),
+            output_bytes=len(sealed),
+            content_digest=sha256_hex(plan_json),
+            attestation_digest=self.evidence.digest(),
+            started_at=started,
+            finished_at=finished,
+            gpu_seconds=round((finished - started) * profile.gpus_per_worker, 3),
+            miner_hotkey=self.miner_hotkey,
+            plan=PlanInfo(
+                shots=len(plan.shots), duration_s=plan.duration_s, planner=plan.planner.model,
+                prompt_version=plan.planner.prompt_version, output_tokens=tokens,
+            ),
+        )
+        receipt = sign_receipt(self.identity.signing_key, body)
+        self.client.complete(job.job_id, blob_id, receipt)
+        return receipt
+
+    # Plans a job may write before it fails: the first, and one more after an output the safety checks blocked.
+    PLAN_WRITES = 2
+
+    def _checked_plan(self, backend: Backend, task: GenerationTask, context: PlanContext, options: PlanOptions) -> tuple[Plan, int]:
+        """A plan whose text passed the checks, and the tokens every reply for it took. Each shot's model prompt,
+        `shot_prompt(scene, prompt)`, is text a language model wrote for the video model, so it goes through
+        `_generate_checked` like an enhanced prompt; the title, notes and beats are only shown to people, so they get the
+        shared content policy. A block is written again once, from the next seeds, and a second block is
+        `safety_blocked`. The planner refusing the brief is `safety_blocked` at once."""
+        drafts: list[tuple[Plan, int]] = []
+
+        def write() -> list[str]:
+            plan, tokens = self._draft_plan(backend, task, context, options, attempt=len(drafts))
+            drafts.append((plan, tokens))
+            if len(drafts) == 1:
+                self._progress(task.job_id, 0.85, "checking", force=True)
+            return plan.model_prompts()
+
+        for attempt in range(self.PLAN_WRITES):
+            try:
+                self._generate_checked(write, None)
+                plan, _ = drafts[-1]
+                for label in (plan.title, plan.notes, *(shot.beat for shot in plan.shots)):
+                    if label.strip():
+                        check_prompt(label)
+                return plan, sum(tokens for _, tokens in drafts)
+            except ContentPolicyViolation:
+                blocked = JobRejected("safety_blocked", PROMPT_BLOCKED)
+            except PlanRefused:
+                raise
+            except JobRejected as exc:
+                if exc.code != "safety_blocked":
+                    raise
+                blocked = exc
+            if attempt == self.PLAN_WRITES - 1:
+                raise blocked
+        raise AssertionError("unreachable")
+
+    def _draft_plan(self, backend: Backend, task: GenerationTask, context: PlanContext, options: PlanOptions, attempt: int) -> tuple[Plan, int]:
+        """One plan from the planner (kuno_protocol.plans): a reply, repaired; when it has problems (unparseable, fewer
+        than 2 shots, more than 25% short, a quoted phrase of the brief missing), a single retry with the problems as a
+        user turn, and the better of the two. A reply no repair or retry makes into a plan is `plan_failed`; problems a
+        plan can live with are named in its `repairs`. Replies are seeded (seed + 2 × attempt + k) mod 2^31, so a job's
+        plans reproduce."""
+        limits = task.profile.limits.plan
+        assert limits is not None
+        messages = plan_messages(task.prompt, context, options)
+
+        def ask(chat: list[dict[str, str]], offset: int):
+            reply = backend.write_plan(task, chat, seed=(task.seed + 2 * attempt + offset) % 2**31, max_new_tokens=limits.max_new_tokens)
+            result = repair(reply.text, context, planner=reply.planner, brief=task.prompt, revise=options.revise)
+            if result.refusal:
+                raise PlanRefused()
+            return reply, result
+
+        reply, result = ask(messages, 0)
+        tokens = reply.output_tokens
+        if result.problems:
+            second_reply, second = ask(retry_messages(messages, reply.text, result.problems), 1)
+            tokens += second_reply.output_tokens
+            result = choose(result, second)
+        if result.plan is None:
+            raise JobRejected(PLAN_FAILED, PLAN_FAILED_MESSAGE)
+        return result.deliverable(), tokens
+
     def _enhance(self, backend: Backend, task: GenerationTask) -> GenerationTask:
         """The task to render when the customer asked for prompt enhancement: the backend's rewrite of the prompt,
         checked like the customer's prompt, with the option removed so nothing downstream enhances again."""
@@ -641,7 +836,7 @@ class Worker:
         """Text a language model writes inside the enclave, held to the customer's own prompt check before anything
         conditions on it: the shared content policy, then the prompt classifier (`check_request`), each text with the
         negative prompt it will render beside. Every step that generates text with a loaded model goes through here: an
-        enhanced prompt today, a plan's shot prompts later. It reports no progress stage of its own, since the gateway
+        enhanced prompt, and every shot prompt of a plan (`_checked_plan`). It reports no progress stage of its own, since the gateway
         sees stages, and whether a prompt was enhanced is sealed.
 
         A block is `safety_blocked` with the fixed message any prompt gets. A classifier that cannot answer fails the

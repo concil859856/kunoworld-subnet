@@ -335,10 +335,17 @@ def test_verified_mode_commits_to_and_retains_the_prompt_actually_rendered(tmp_p
 # ---------------------------------------------------------------- the adapter (diffusers)
 
 
+class PlacedEnhancer:
+    """The enhancer module: the adapter keeps it in host RAM between uses (test_enhancer_placement.py)."""
+
+    def to(self, device):
+        return self
+
+
 class EnhancerPipeline:
     """Where LtxAdapter.enhance_prompt meets diffusers: `LTX2Pipeline.enhance_prompt` returns one text per prompt."""
 
-    def __init__(self, enhancer: object | None = "prompt_enhancer"):
+    def __init__(self, enhancer: object | None = PlacedEnhancer()):
         self.prompt_enhancer, self.processor, self.calls = enhancer, "processor", []
 
     def enhance_prompt(self, **kwargs):

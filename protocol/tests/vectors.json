@@ -653,6 +653,1275 @@
       "encoded": "{\"enclave_id\":\"00000000000000000000000000000000\",\"inputs\":[],\"job_id\":\"3f2504e0-4f89-41d3-9a0c-0305e82c3301\",\"params\":{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":13.708333333333334,\"fps\":24,\"input_roles\":[],\"mode\":\"storyboard\",\"profile_id\":\"ltx-2.5-fast\",\"resolution\":\"720p\",\"shots\":[{\"duration_s\":5,\"join\":\"fresh\"},{\"duration_s\":4,\"join\":\"continue\"},{\"duration_s\":6,\"join\":\"cut\"}]},\"v\":1}"
     }
   },
+  "plans": {
+    "repair": [
+      {
+        "name": "gpu spike e2b roastery",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 30.0,
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {
+          "max_shot_s": 11.0
+        },
+        "brief": "A 30-second ad for a small coffee roastery, warm and handmade.",
+        "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+        "raw": "{\"title\": \"Handmade Coffee Roastery Ad\", \"scene\": \"A rustic, warmly lit coffee roastery interior. Wooden beams and dark metal equipment dominate the space. The time is early morning, and the light is warm and golden, filtering through large windows. The background sound is the gentle, rhythmic whir of coffee machinery.\", \"shots\": [{\"beat\": \"Roasting beans close up\", \"prompt\": \"Extreme close-up shot; a slow push-in moves toward a pile of dark, roasted coffee beans. The camera locks off, and the sound of beans gently shifting is heard.\", \"duration_s\": 7, \"join\": \"fresh\"}, {\"beat\": \"Roaster working hands\", \"prompt\": \"Medium close-up shot; a gentle tracking shot follows the hands of a person with medium-length brown hair wearing a simple apron as they carefully pour coffee grounds into a roasting drum. The sound of the machinery whirring increases slightly.\", \"duration_s\": 7, \"join\": \"cut\"}, {\"beat\": \"Grinding fresh beans\", \"prompt\": \"Medium shot; a slow pan across a hand using a manual grinder, showing the fresh, dark beans falling into a metal container. The ambient sound of the grinder is prominent.\", \"duration_s\": 7, \"join\": \"cut\"}, {\"beat\": \"Pouring into a cup\", \"prompt\": \"Close-up shot; a locked-off camera focuses on a stream of dark, rich coffee being poured from a metal filter into a ceramic mug. The sound of the liquid pouring is clear.\", \"duration_s\": 7, \"join\": \"cut\"}, {\"beat\": \"Steam rising from coffee\", \"prompt\": \"Close-up shot; a very slow push-in focuses on the rising steam from the freshly brewed coffee in the mug. Gentle, warm acoustic music begins to swell.\", \"duration_s\": 7, \"join\": \"cut\"}]} , \"notes\": \"I focused on tactile, warm visuals to convey 'handmade' and 'warmth'. The sequence moves from raw material to the final product. The music is introduced in the final shot to build an inviting mood.\"}",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 11.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": false,
+        "syntax": [
+          "reopened an object closed early"
+        ],
+        "problems": [],
+        "model_duration_s": 32.375,
+        "plan": {
+          "v": 1,
+          "profile_id": "ltx-2.5-fast",
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "target_s": 30.0,
+          "duration_s": 30.375,
+          "title": "Handmade Coffee Roastery Ad",
+          "scene": "A rustic, warmly lit coffee roastery interior. Wooden beams and dark metal equipment dominate the space. The time is early morning, and the light is warm and golden, filtering through large windows. The background sound is the gentle, rhythmic whir of coffee machinery.",
+          "shots": [
+            {
+              "beat": "Roasting beans close up",
+              "prompt": "Extreme close-up shot; a slow push-in moves toward a pile of dark, roasted coffee beans. The camera locks off, and the sound of beans gently shifting is heard.",
+              "duration_s": 6.0,
+              "join": "fresh"
+            },
+            {
+              "beat": "Roaster working hands",
+              "prompt": "Medium close-up shot; a gentle tracking shot follows the hands of a person with medium-length brown hair wearing a simple apron as they carefully pour coffee grounds into a roasting drum. The sound of the machinery whirring increases slightly.",
+              "duration_s": 6.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Grinding fresh beans",
+              "prompt": "Medium shot; a slow pan across a hand using a manual grinder, showing the fresh, dark beans falling into a metal container. The ambient sound of the grinder is prominent.",
+              "duration_s": 7.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Pouring into a cup",
+              "prompt": "Close-up shot; a locked-off camera focuses on a stream of dark, rich coffee being poured from a metal filter into a ceramic mug. The sound of the liquid pouring is clear.",
+              "duration_s": 7.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Steam rising from coffee",
+              "prompt": "Close-up shot; a very slow push-in focuses on the rising steam from the freshly brewed coffee in the mug. Gentle, warm acoustic music begins to swell.",
+              "duration_s": 7.0,
+              "join": "cut"
+            }
+          ],
+          "notes": "I focused on tactile, warm visuals to convey 'handmade' and 'warmth'. The sequence moves from raw material to the final product. The music is introduced in the final shot to build an inviting mood.",
+          "repairs": [
+            "the shots ran 32.375 s; shots 1 and 2 shortened to reach 30.375 s"
+          ],
+          "planner": {
+            "model": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+            "prompt_version": "plan/1"
+          }
+        },
+        "delivered_json": "{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":30.375,\"fps\":24,\"notes\":\"I focused on tactile, warm visuals to convey 'handmade' and 'warmth'. The sequence moves from raw material to the final product. The music is introduced in the final shot to build an inviting mood.\",\"planner\":{\"model\":\"ltx-2.5-distilled/bf16/1:prompt_enhancer\",\"prompt_version\":\"plan/1\"},\"profile_id\":\"ltx-2.5-fast\",\"repairs\":[\"the shots ran 32.375 s; shots 1 and 2 shortened to reach 30.375 s\"],\"resolution\":\"720p\",\"scene\":\"A rustic, warmly lit coffee roastery interior. Wooden beams and dark metal equipment dominate the space. The time is early morning, and the light is warm and golden, filtering through large windows. The background sound is the gentle, rhythmic whir of coffee machinery.\",\"shots\":[{\"beat\":\"Roasting beans close up\",\"duration_s\":6,\"join\":\"fresh\",\"prompt\":\"Extreme close-up shot; a slow push-in moves toward a pile of dark, roasted coffee beans. The camera locks off, and the sound of beans gently shifting is heard.\"},{\"beat\":\"Roaster working hands\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Medium close-up shot; a gentle tracking shot follows the hands of a person with medium-length brown hair wearing a simple apron as they carefully pour coffee grounds into a roasting drum. The sound of the machinery whirring increases slightly.\"},{\"beat\":\"Grinding fresh beans\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Medium shot; a slow pan across a hand using a manual grinder, showing the fresh, dark beans falling into a metal container. The ambient sound of the grinder is prominent.\"},{\"beat\":\"Pouring into a cup\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Close-up shot; a locked-off camera focuses on a stream of dark, rich coffee being poured from a metal filter into a ceramic mug. The sound of the liquid pouring is clear.\"},{\"beat\":\"Steam rising from coffee\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Close-up shot; a very slow push-in focuses on the rising steam from the freshly brewed coffee in the mug. Gentle, warm acoustic music begins to swell.\"}],\"target_s\":30,\"title\":\"Handmade Coffee Roastery Ad\",\"v\":1}"
+      },
+      {
+        "name": "gpu spike e2b lighthouse",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 45.0,
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {
+          "max_shot_s": 11.0
+        },
+        "brief": "A 45-second short film: an old lighthouse keeper's last night before the light is automated. Quiet and melancholic, with one line of dialogue at the end.",
+        "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+        "raw": "{\"title\": \"Lighthouse Keeper's Last Watch\", \"scene\": \"An old, stone lighthouse interior. Late night. Dim, warm light from a single lamp. Visual style is muted and grainy, evoking nostalgia. Steady background sound is the gentle, rhythmic sound of ocean waves.\", \"shots\": [{\"beat\": \"Opening view of the keeper\", \"prompt\": \"Wide shot from a low angle; an elderly man with white hair and a thick woolen sweater stands near a large window overlooking the dark sea. A slow push-in moves towards the man. The sound of distant, heavy waves rolls in. This is a fresh moment.\", \"duration_s\": 6, \"join\": \"fresh\"}, {\"beat\": \"Looking at the light\", \"prompt\": \"Medium shot from a side angle; the elderly man gazes intently at the large, still lamp mechanism. A slow pan follows his gaze across the glass. The rhythmic sound of the waves continues. Continue.\", \"duration_s\": 6, \"join\": \"continue\"}, {\"beat\": \"Touching the glass\", \"prompt\": \"Close-up shot; the elderly man's wrinkled hand gently touches the cold glass of the window pane. A very slow, subtle handheld drift moves slightly closer to the hand. The sound of the waves becomes slightly more prominent. Continue.\", \"duration_s\": 6, \"join\": \"continue\"}, {\"beat\": \"Reflection in the glass\", \"prompt\": \"Medium close-up shot; the reflection of the dim light dances in the glass as the man watches it. A slow push-in focuses on the reflection. The ambient sound of the ocean waves is present. Cut.\", \"duration_s\": 6, \"join\": \"cut\"}, {\"beat\": \"Walking the floor\", \"prompt\": \"Low angle shot; the elderly man slowly walks across the stone floor towards a wooden table. A slow tracking shot follows his movement. The sound of the waves is steady. Cut.\", \"duration_s\": 6, \"join\": \"cut\"}, {\"beat\": \"Observing the room\", \"prompt\": \"Medium shot; the elderly man stops and looks around the dimly lit room with a quiet expression. A locked-off camera holds steady. The gentle sound of the ocean waves fills the silence. Cut.\", \"duration_s\": 6, \"join\": \"cut\"}, {\"beat\": \"Final moment of stillness\", \"prompt\": \"Close-up shot; the elderly man closes his eyes briefly, a look of quiet acceptance on his face. A very slow push-in towards his face. The sound of the waves fades slightly. Cut.\", \"duration_s\": 6, \"join\": \"cut\"}, {\"beat\": \"Final line of dialogue\", \"prompt\": \"Medium shot; the elderly man opens his eyes and looks directly at the camera with a soft expression. A slow pull-back reveals more of the room. A quiet, melancholic music swells slightly. The elderly man speaks softly, 'It is time.'\", \"duration_s\": 6, \"join\": \"cut\"}]} \"notes\": \"The pacing is slow to emphasize the melancholic mood. I used 8 shots of 6 seconds each for a total runtime of 48 seconds, which is close to the 45-second target. The dialogue is simple and fits the quiet tone.\"}",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 11.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": false,
+        "syntax": [
+          "reopened an object closed early"
+        ],
+        "problems": [],
+        "model_duration_s": 43.375,
+        "plan": {
+          "v": 1,
+          "profile_id": "ltx-2.5-fast",
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "target_s": 45.0,
+          "duration_s": 45.375,
+          "title": "Lighthouse Keeper's Last Watch",
+          "scene": "An old, stone lighthouse interior. Late night. Dim, warm light from a single lamp. Visual style is muted and grainy, evoking nostalgia. Steady background sound is the gentle, rhythmic sound of ocean waves.",
+          "shots": [
+            {
+              "beat": "Opening view of the keeper",
+              "prompt": "Wide shot from a low angle; an elderly man with white hair and a thick woolen sweater stands near a large window overlooking the dark sea. A slow push-in moves towards the man. The sound of distant, heavy waves rolls in.",
+              "duration_s": 7.0,
+              "join": "fresh"
+            },
+            {
+              "beat": "Looking at the light",
+              "prompt": "Medium shot from a side angle; the elderly man gazes intently at the large, still lamp mechanism. A slow pan follows his gaze across the glass. The rhythmic sound of the waves continues.",
+              "duration_s": 7.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Touching the glass",
+              "prompt": "Close-up shot; the elderly man's wrinkled hand gently touches the cold glass of the window pane. A very slow, subtle handheld drift moves slightly closer to the hand. The sound of the waves becomes slightly more prominent.",
+              "duration_s": 6.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Reflection in the glass",
+              "prompt": "Medium close-up shot; the reflection of the dim light dances in the glass as the man watches it. A slow push-in focuses on the reflection. The ambient sound of the ocean waves is present.",
+              "duration_s": 6.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Walking the floor",
+              "prompt": "Low angle shot; the elderly man slowly walks across the stone floor towards a wooden table. A slow tracking shot follows his movement. The sound of the waves is steady.",
+              "duration_s": 6.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Observing the room",
+              "prompt": "Medium shot; the elderly man stops and looks around the dimly lit room with a quiet expression. A locked-off camera holds steady. The gentle sound of the ocean waves fills the silence.",
+              "duration_s": 6.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Final moment of stillness",
+              "prompt": "Close-up shot; the elderly man closes his eyes briefly, a look of quiet acceptance on his face. A very slow push-in towards his face. The sound of the waves fades slightly.",
+              "duration_s": 6.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Final line of dialogue",
+              "prompt": "Medium shot; the elderly man opens his eyes and looks directly at the camera with a soft expression. A slow pull-back reveals more of the room. A quiet, melancholic music swells slightly. The elderly man speaks softly, 'It is time.'",
+              "duration_s": 6.0,
+              "join": "cut"
+            }
+          ],
+          "notes": "The pacing is slow to emphasize the melancholic mood. I used 8 shots of 6 seconds each for a total runtime of 48 seconds, which is close to the 45-second target. The dialogue is simple and fits the quiet tone.",
+          "repairs": [
+            "removed a join word written at the end of the prompt of shots 1, 2, 3, 4, 5, 6 and 7",
+            "shots 2 and 3 continued the take before at a different shot size; made cuts",
+            "the shots ran 43.375 s; shots 1 and 2 lengthened to reach 45.375 s"
+          ],
+          "planner": {
+            "model": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+            "prompt_version": "plan/1"
+          }
+        },
+        "delivered_json": "{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":45.375,\"fps\":24,\"notes\":\"The pacing is slow to emphasize the melancholic mood. I used 8 shots of 6 seconds each for a total runtime of 48 seconds, which is close to the 45-second target. The dialogue is simple and fits the quiet tone.\",\"planner\":{\"model\":\"ltx-2.5-distilled/bf16/1:prompt_enhancer\",\"prompt_version\":\"plan/1\"},\"profile_id\":\"ltx-2.5-fast\",\"repairs\":[\"removed a join word written at the end of the prompt of shots 1, 2, 3, 4, 5, 6 and 7\",\"shots 2 and 3 continued the take before at a different shot size; made cuts\",\"the shots ran 43.375 s; shots 1 and 2 lengthened to reach 45.375 s\"],\"resolution\":\"720p\",\"scene\":\"An old, stone lighthouse interior. Late night. Dim, warm light from a single lamp. Visual style is muted and grainy, evoking nostalgia. Steady background sound is the gentle, rhythmic sound of ocean waves.\",\"shots\":[{\"beat\":\"Opening view of the keeper\",\"duration_s\":7,\"join\":\"fresh\",\"prompt\":\"Wide shot from a low angle; an elderly man with white hair and a thick woolen sweater stands near a large window overlooking the dark sea. A slow push-in moves towards the man. The sound of distant, heavy waves rolls in.\"},{\"beat\":\"Looking at the light\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Medium shot from a side angle; the elderly man gazes intently at the large, still lamp mechanism. A slow pan follows his gaze across the glass. The rhythmic sound of the waves continues.\"},{\"beat\":\"Touching the glass\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Close-up shot; the elderly man's wrinkled hand gently touches the cold glass of the window pane. A very slow, subtle handheld drift moves slightly closer to the hand. The sound of the waves becomes slightly more prominent.\"},{\"beat\":\"Reflection in the glass\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Medium close-up shot; the reflection of the dim light dances in the glass as the man watches it. A slow push-in focuses on the reflection. The ambient sound of the ocean waves is present.\"},{\"beat\":\"Walking the floor\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Low angle shot; the elderly man slowly walks across the stone floor towards a wooden table. A slow tracking shot follows his movement. The sound of the waves is steady.\"},{\"beat\":\"Observing the room\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Medium shot; the elderly man stops and looks around the dimly lit room with a quiet expression. A locked-off camera holds steady. The gentle sound of the ocean waves fills the silence.\"},{\"beat\":\"Final moment of stillness\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Close-up shot; the elderly man closes his eyes briefly, a look of quiet acceptance on his face. A very slow push-in towards his face. The sound of the waves fades slightly.\"},{\"beat\":\"Final line of dialogue\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Medium shot; the elderly man opens his eyes and looks directly at the camera with a soft expression. A slow pull-back reveals more of the room. A quiet, melancholic music swells slightly. The elderly man speaks softly, 'It is time.'\"}],\"target_s\":45,\"title\":\"Lighthouse Keeper's Last Watch\",\"v\":1}"
+      },
+      {
+        "name": "gpu spike e2b water",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 20.0,
+          "resolution": "720p",
+          "aspect_ratio": "9:16",
+          "fps": 24,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {
+          "max_shot_s": 11.0
+        },
+        "brief": "Vertical 20 s explainer for our app Sip that reminds you to drink water. Friendly female voice-over, bright and simple, end on the slogan 'Sip. Stay fresh.'",
+        "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+        "raw": "{\"title\": \"Sip Water Reminder App\", \"scene\": \"A bright, modern kitchen counter. Midday light streams in from a window. A young woman in a light blue t-shirt with brown hair stands near a glass of water. The background sound is soft, ambient kitchen sounds.\", \"shots\": [{\"beat\": \"Intro: Thirst cue\", \"prompt\": \"Medium close-up shot; the young woman looks slightly tired and reaches for a glass of water on the counter. A slow push-in moves toward her face. Soft, gentle ambient kitchen sounds play. A friendly female voice-over says, \\\"Feeling a little thirsty today?\\\"\", \"duration_s\": 7, \"join\": \"fresh\"}, {\"beat\": \"App notification appears\", \"prompt\": \"Close-up shot; a bright phone screen displaying a simple water reminder notification appears on the counter near the glass. A gentle handheld drift moves across the screen. Soft, encouraging background music begins. The voice-over continues, \\\"Our app is here to help you stay hydrated.\\\"\", \"duration_s\": 7, \"join\": \"cut\"}, {\"beat\": \"Action: Drinking water\", \"prompt\": \"Medium shot; the young woman picks up the glass and takes a refreshing sip of water. A slow tracking shot follows her hand as she drinks. The music becomes slightly more upbeat. The voice-over says, \\\"Just a quick sip keeps you going.\\\"\", \"duration_s\": 6, \"join\": \"cut\"}, {\"beat\": \"Benefit: Feeling refreshed\", \"prompt\": \"Close-up shot; the young woman smiles slightly after drinking and looks refreshed. A locked-off camera holds steady on her face. The music swells slightly. The voice-over says, \\\"Stay refreshed and energized throughout your day.\\\"\", \"duration_s\": 6, \"join\": \"cut\"}]}",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 11.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": false,
+        "syntax": [],
+        "problems": [
+          {
+            "code": "missing_quote",
+            "notice": "the brief's quoted words \"Sip. Stay fresh.\" are in no shot"
+          }
+        ],
+        "model_duration_s": 24.041666666666668,
+        "plan": {
+          "v": 1,
+          "profile_id": "ltx-2.5-fast",
+          "resolution": "720p",
+          "aspect_ratio": "9:16",
+          "fps": 24,
+          "audio": true,
+          "target_s": 20.0,
+          "duration_s": 20.041666666666668,
+          "title": "Sip Water Reminder App",
+          "scene": "A bright, modern kitchen counter. Midday light streams in from a window. A young woman in a light blue t-shirt with brown hair stands near a glass of water. The background sound is soft, ambient kitchen sounds.",
+          "shots": [
+            {
+              "beat": "Intro: Thirst cue",
+              "prompt": "Medium close-up shot; the young woman looks slightly tired and reaches for a glass of water on the counter. A slow push-in moves toward her face. Soft, gentle ambient kitchen sounds play. A friendly female voice-over says, \"Feeling a little thirsty today?\"",
+              "duration_s": 5.0,
+              "join": "fresh"
+            },
+            {
+              "beat": "App notification appears",
+              "prompt": "Close-up shot; a bright phone screen displaying a simple water reminder notification appears on the counter near the glass. A gentle handheld drift moves across the screen. Soft, encouraging background music begins. The voice-over continues, \"Our app is here to help you stay hydrated.\"",
+              "duration_s": 5.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Action: Drinking water",
+              "prompt": "Medium shot; the young woman picks up the glass and takes a refreshing sip of water. A slow tracking shot follows her hand as she drinks. The music becomes slightly more upbeat. The voice-over says, \"Just a quick sip keeps you going.\"",
+              "duration_s": 6.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Benefit: Feeling refreshed",
+              "prompt": "Close-up shot; the young woman smiles slightly after drinking and looks refreshed. A locked-off camera holds steady on her face. The music swells slightly. The voice-over says, \"Stay refreshed and energized throughout your day.\"",
+              "duration_s": 6.0,
+              "join": "cut"
+            }
+          ],
+          "notes": "",
+          "repairs": [
+            "the shots ran 24.042 s; shots 1 and 2 shortened to reach 20.042 s"
+          ],
+          "planner": {
+            "model": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+            "prompt_version": "plan/1"
+          }
+        },
+        "delivered_json": "{\"aspect_ratio\":\"9:16\",\"audio\":true,\"duration_s\":20.041666666666668,\"fps\":24,\"notes\":\"\",\"planner\":{\"model\":\"ltx-2.5-distilled/bf16/1:prompt_enhancer\",\"prompt_version\":\"plan/1\"},\"profile_id\":\"ltx-2.5-fast\",\"repairs\":[\"the shots ran 24.042 s; shots 1 and 2 shortened to reach 20.042 s\",\"the brief's quoted words \\\"Sip. Stay fresh.\\\" are in no shot\"],\"resolution\":\"720p\",\"scene\":\"A bright, modern kitchen counter. Midday light streams in from a window. A young woman in a light blue t-shirt with brown hair stands near a glass of water. The background sound is soft, ambient kitchen sounds.\",\"shots\":[{\"beat\":\"Intro: Thirst cue\",\"duration_s\":5,\"join\":\"fresh\",\"prompt\":\"Medium close-up shot; the young woman looks slightly tired and reaches for a glass of water on the counter. A slow push-in moves toward her face. Soft, gentle ambient kitchen sounds play. A friendly female voice-over says, \\\"Feeling a little thirsty today?\\\"\"},{\"beat\":\"App notification appears\",\"duration_s\":5,\"join\":\"cut\",\"prompt\":\"Close-up shot; a bright phone screen displaying a simple water reminder notification appears on the counter near the glass. A gentle handheld drift moves across the screen. Soft, encouraging background music begins. The voice-over continues, \\\"Our app is here to help you stay hydrated.\\\"\"},{\"beat\":\"Action: Drinking water\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Medium shot; the young woman picks up the glass and takes a refreshing sip of water. A slow tracking shot follows her hand as she drinks. The music becomes slightly more upbeat. The voice-over says, \\\"Just a quick sip keeps you going.\\\"\"},{\"beat\":\"Benefit: Feeling refreshed\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Close-up shot; the young woman smiles slightly after drinking and looks refreshed. A locked-off camera holds steady on her face. The music swells slightly. The voice-over says, \\\"Stay refreshed and energized throughout your day.\\\"\"}],\"target_s\":20,\"title\":\"Sip Water Reminder App\",\"v\":1}"
+      },
+      {
+        "name": "gpu spike e2b bakery_de",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 25.0,
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {
+          "max_shot_s": 11.0
+        },
+        "brief": "Ein 25-Sekunden-Video für eine kleine Bäckerei am Morgen, gemütlich, mit einem kurzen Satz der Bäckerin auf Deutsch.",
+        "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+        "raw": "{\"title\": \"Morning Bakery Warmth\", \"scene\": \"A cozy, rustic small bakery interior. Morning light streams through a window. The atmosphere is warm, inviting, and peaceful. The background sound is gentle, low morning ambiance.\", \"shots\": [{\"beat\": \"Opening shot of warmth\", \"prompt\": \"Wide shot; the camera slowly pushes in towards a wooden counter where a baker in a simple apron smiles gently. A warm female voice-over says, \\\"Guten Morgen.\\\" The camera performs a very slow push-in. The ambient sound of gentle coffee brewing is heard.\", \"duration_s\": 7, \"join\": \"fresh\"}, {\"beat\": \"Close-up on fresh bread\", \"prompt\": \"Medium close-up; the camera gently pans across a display of freshly baked, golden-brown bread loaves. A warm female voice-over says, \\\"Frische Backwaren.\\\" The camera performs a slow pan across the bread. The sound of soft bread crusts is heard.\", \"duration_s\": 7, \"join\": \"cut\"}, {\"beat\": \"Baker preparing pastries\", \"prompt\": \"Medium shot; the camera holds steady as the baker carefully arranges colorful pastries on a cooling rack. The camera performs a locked-off shot. The sound of gentle clinking and soft music begins. The ambient sound of the bakery continues.\", \"duration_s\": 7, \"join\": \"cut\"}, {\"beat\": \"Detail of coffee steam\", \"prompt\": \"Close-up; the camera slowly zooms in on a steaming cup of coffee resting on a wooden table. The camera performs a slow zoom. A warm female voice-over says, \\\"Ein perfekter Start.\\\" The sound of steam hissing softly is heard.\", \"duration_s\": 4, \"join\": \"cut\"}, {\"beat\": \"Final inviting scene\", \"prompt\": \"Medium wide shot; the camera slowly tracks left, revealing the cozy interior and the baker standing by the counter. The camera performs a slow tracking shot. The gentle music swells slightly. The ambient sound of the bakery fades out.\", \"duration_s\": 4, \"join\": \"cut\"}], \"notes\": \"I focused on warm lighting and close-ups of food to convey coziness. The German phrases are used as requested for the baker's dialogue.\"}",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 11.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": false,
+        "syntax": [],
+        "problems": [],
+        "model_duration_s": 26.375,
+        "plan": {
+          "v": 1,
+          "profile_id": "ltx-2.5-fast",
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "target_s": 25.0,
+          "duration_s": 25.375,
+          "title": "Morning Bakery Warmth",
+          "scene": "A cozy, rustic small bakery interior. Morning light streams through a window. The atmosphere is warm, inviting, and peaceful. The background sound is gentle, low morning ambiance.",
+          "shots": [
+            {
+              "beat": "Opening shot of warmth",
+              "prompt": "Wide shot; the camera slowly pushes in towards a wooden counter where a baker in a simple apron smiles gently. A warm female voice-over says, \"Guten Morgen.\" The camera performs a very slow push-in. The ambient sound of gentle coffee brewing is heard.",
+              "duration_s": 6.0,
+              "join": "fresh"
+            },
+            {
+              "beat": "Close-up on fresh bread",
+              "prompt": "Medium close-up; the camera gently pans across a display of freshly baked, golden-brown bread loaves. A warm female voice-over says, \"Frische Backwaren.\" The camera performs a slow pan across the bread. The sound of soft bread crusts is heard.",
+              "duration_s": 7.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Baker preparing pastries",
+              "prompt": "Medium shot; the camera holds steady as the baker carefully arranges colorful pastries on a cooling rack. The camera performs a locked-off shot. The sound of gentle clinking and soft music begins. The ambient sound of the bakery continues.",
+              "duration_s": 7.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Detail of coffee steam",
+              "prompt": "Close-up; the camera slowly zooms in on a steaming cup of coffee resting on a wooden table. The camera performs a slow zoom. A warm female voice-over says, \"Ein perfekter Start.\" The sound of steam hissing softly is heard.",
+              "duration_s": 4.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Final inviting scene",
+              "prompt": "Medium wide shot; the camera slowly tracks left, revealing the cozy interior and the baker standing by the counter. The camera performs a slow tracking shot. The gentle music swells slightly. The ambient sound of the bakery fades out.",
+              "duration_s": 4.0,
+              "join": "cut"
+            }
+          ],
+          "notes": "I focused on warm lighting and close-ups of food to convey coziness. The German phrases are used as requested for the baker's dialogue.",
+          "repairs": [
+            "the shots ran 26.375 s; shot 1 shortened to reach 25.375 s"
+          ],
+          "planner": {
+            "model": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+            "prompt_version": "plan/1"
+          }
+        },
+        "delivered_json": "{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":25.375,\"fps\":24,\"notes\":\"I focused on warm lighting and close-ups of food to convey coziness. The German phrases are used as requested for the baker's dialogue.\",\"planner\":{\"model\":\"ltx-2.5-distilled/bf16/1:prompt_enhancer\",\"prompt_version\":\"plan/1\"},\"profile_id\":\"ltx-2.5-fast\",\"repairs\":[\"the shots ran 26.375 s; shot 1 shortened to reach 25.375 s\"],\"resolution\":\"720p\",\"scene\":\"A cozy, rustic small bakery interior. Morning light streams through a window. The atmosphere is warm, inviting, and peaceful. The background sound is gentle, low morning ambiance.\",\"shots\":[{\"beat\":\"Opening shot of warmth\",\"duration_s\":6,\"join\":\"fresh\",\"prompt\":\"Wide shot; the camera slowly pushes in towards a wooden counter where a baker in a simple apron smiles gently. A warm female voice-over says, \\\"Guten Morgen.\\\" The camera performs a very slow push-in. The ambient sound of gentle coffee brewing is heard.\"},{\"beat\":\"Close-up on fresh bread\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Medium close-up; the camera gently pans across a display of freshly baked, golden-brown bread loaves. A warm female voice-over says, \\\"Frische Backwaren.\\\" The camera performs a slow pan across the bread. The sound of soft bread crusts is heard.\"},{\"beat\":\"Baker preparing pastries\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Medium shot; the camera holds steady as the baker carefully arranges colorful pastries on a cooling rack. The camera performs a locked-off shot. The sound of gentle clinking and soft music begins. The ambient sound of the bakery continues.\"},{\"beat\":\"Detail of coffee steam\",\"duration_s\":4,\"join\":\"cut\",\"prompt\":\"Close-up; the camera slowly zooms in on a steaming cup of coffee resting on a wooden table. The camera performs a slow zoom. A warm female voice-over says, \\\"Ein perfekter Start.\\\" The sound of steam hissing softly is heard.\"},{\"beat\":\"Final inviting scene\",\"duration_s\":4,\"join\":\"cut\",\"prompt\":\"Medium wide shot; the camera slowly tracks left, revealing the cozy interior and the baker standing by the counter. The camera performs a slow tracking shot. The gentle music swells slightly. The ambient sound of the bakery fades out.\"}],\"target_s\":25,\"title\":\"Morning Bakery Warmth\",\"v\":1}"
+      },
+      {
+        "name": "gpu spike e2b ebike",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 90.0,
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {
+          "max_shot_s": 11.0
+        },
+        "brief": "A 90-second product film for a folding e-bike: unfold it on a city street at sunrise, ride to work through traffic and a park, fold it and put it in an office locker. Upbeat music, no dialogue.",
+        "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+        "raw": "{\"title\": \"Folding E-Bike City Ride\", \"scene\": \"A young man in a casual blue t-shirt and jeans with short brown hair, wearing simple running shoes, is riding a sleek, silver folding e-bike. The setting is a busy city street transitioning into a sunny park during sunrise. The visual style is bright and energetic, and the steady background sound is city traffic and ambient morning sounds.\", \"shots\": [{\"beat\": \"Sunrise Unfold\", \"prompt\": \"Wide shot from a low angle; the young man carefully unfolds the silver folding e-bike on a quiet city street as the first rays of sunrise hit the scene. A slow tracking shot moves alongside the bike as upbeat, energetic music begins to play. The sound is the gentle whir of the bike unfolding and distant morning city sounds.\", \"duration_s\": 8, \"join\": \"fresh\"}, {\"beat\": \"City Commute Start\", \"prompt\": \"Medium shot from the side; the young man mounts the e-bike and begins riding through moderate city traffic. A smooth, steady tracking shot follows the bike as it navigates the moving vehicles. The sound is the upbeat music mixed with the sound of passing cars and traffic.\", \"duration_s\": 8, \"join\": \"continue\"}, {\"beat\": \"Traffic Flow\", \"prompt\": \"Close-up shot from behind the rider; the e-bike moves smoothly through a dense stream of city traffic. A gentle handheld drift follows the bike's movement. The sound is the continuous upbeat music and the ambient sound of city traffic.\", \"duration_s\": 8, \"join\": \"continue\"}, {\"beat\": \"Park Entry\", \"prompt\": \"Wide shot from a high angle; the young man rides the e-bike as it smoothly transitions from the busy street into a bright, green park area. A slow pan follows the bike as it enters the open space. The sound is the music slightly softening to include birdsong and light park ambiance.\", \"duration_s\": 8, \"join\": \"cut\"}, {\"beat\": \"Park Ride\", \"prompt\": \"Medium shot from the front; the young man rides the e-bike leisurely through a sun-dappled path in the park. A smooth, locked-off camera shot captures the scenery passing by. The sound is the upbeat music with clear park sounds.\", \"duration_s\": 8, \"join\": \"continue\"}, {\"beat\": \"Approaching Destination\", \"prompt\": \"Medium close-up shot; the young man slows the e-bike as he approaches a modern office building entrance in the park. A slow push-in focuses on the rider's relaxed posture. The sound is the music continuing with a slight fade in the sound of approaching footsteps.\", \"duration_s\": 8, \"join\": \"cut\"}, {\"beat\": \"Folding Process\", \"prompt\": \"Close-up shot from the side; the young man stops the bike and begins the process of folding the e-bike into its compact form. A gentle handheld drift follows the hands manipulating the bike mechanism. The sound is the music continuing mixed with the mechanical sounds of the folding mechanism.\", \"duration_s\": 8, \"join\": \"continue\"}, {\"beat\": \"Bike Compacted\", \"prompt\": \"Medium shot; the fully folded, compact e-bike rests on the pavement. A locked-off camera shot holds steady on the folded bike. The sound is the music continuing and the ambient sounds of the city waking up.\", \"duration_s\": 8, \"join\": \"cut\"}, {\"beat\": \"Locker Entry\", \"prompt\": \"Low angle shot; the young man carefully carries the folded e-bike toward a modern office locker area. A slow tracking shot follows the bike as it is maneuvered toward the locker. The sound is the music continuing and subtle footsteps.\", \"duration_s\": 8, \"join\": \"fresh\"}, {\"beat\": \"Locker Placement\", \"prompt\": \"Close-up shot; the young man places the folded e-bike neatly inside the office locker. A gentle push-in focuses on the final placement. The sound is the music swelling slightly and a final soft click sound.\", \"duration_s\": 8, \"join\": \"cut\"}, {\"beat\": \"Workday Begins\", \"prompt\": \"Medium shot; the office environment is bright and modern as the young man walks away toward the building entrance. A slow pull-back shot reveals the scale of the office. The sound is the upbeat music fading out slowly.\", \"duration_s\": 8, \"join\": \"cut\"}]}",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 11.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": false,
+        "syntax": [],
+        "problems": [],
+        "model_duration_s": 82.08333333333333,
+        "plan": {
+          "v": 1,
+          "profile_id": "ltx-2.5-fast",
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "target_s": 90.0,
+          "duration_s": 90.08333333333333,
+          "title": "Folding E-Bike City Ride",
+          "scene": "A young man in a casual blue t-shirt and jeans with short brown hair, wearing simple running shoes, is riding a sleek, silver folding e-bike. The setting is a busy city street transitioning into a sunny park during sunrise. The visual style is bright and energetic, and the steady background sound is city traffic and ambient morning sounds.",
+          "shots": [
+            {
+              "beat": "Sunrise Unfold",
+              "prompt": "Wide shot from a low angle; the young man carefully unfolds the silver folding e-bike on a quiet city street as the first rays of sunrise hit the scene. A slow tracking shot moves alongside the bike as upbeat, energetic music begins to play. The sound is the gentle whir of the bike unfolding and distant morning city sounds.",
+              "duration_s": 9.0,
+              "join": "fresh"
+            },
+            {
+              "beat": "City Commute Start",
+              "prompt": "Medium shot from the side; the young man mounts the e-bike and begins riding through moderate city traffic. A smooth, steady tracking shot follows the bike as it navigates the moving vehicles. The sound is the upbeat music mixed with the sound of passing cars and traffic.",
+              "duration_s": 9.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Traffic Flow",
+              "prompt": "Close-up shot from behind the rider; the e-bike moves smoothly through a dense stream of city traffic. A gentle handheld drift follows the bike's movement. The sound is the continuous upbeat music and the ambient sound of city traffic.",
+              "duration_s": 9.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Park Entry",
+              "prompt": "Wide shot from a high angle; the young man rides the e-bike as it smoothly transitions from the busy street into a bright, green park area. A slow pan follows the bike as it enters the open space. The sound is the music slightly softening to include birdsong and light park ambiance.",
+              "duration_s": 9.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Park Ride",
+              "prompt": "Medium shot from the front; the young man rides the e-bike leisurely through a sun-dappled path in the park. A smooth, locked-off camera shot captures the scenery passing by. The sound is the upbeat music with clear park sounds.",
+              "duration_s": 9.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Approaching Destination",
+              "prompt": "Medium close-up shot; the young man slows the e-bike as he approaches a modern office building entrance in the park. A slow push-in focuses on the rider's relaxed posture. The sound is the music continuing with a slight fade in the sound of approaching footsteps.",
+              "duration_s": 9.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Folding Process",
+              "prompt": "Close-up shot from the side; the young man stops the bike and begins the process of folding the e-bike into its compact form. A gentle handheld drift follows the hands manipulating the bike mechanism. The sound is the music continuing mixed with the mechanical sounds of the folding mechanism.",
+              "duration_s": 9.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Bike Compacted",
+              "prompt": "Medium shot; the fully folded, compact e-bike rests on the pavement. A locked-off camera shot holds steady on the folded bike. The sound is the music continuing and the ambient sounds of the city waking up.",
+              "duration_s": 9.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Locker Entry",
+              "prompt": "Low angle shot; the young man carefully carries the folded e-bike toward a modern office locker area. A slow tracking shot follows the bike as it is maneuvered toward the locker. The sound is the music continuing and subtle footsteps.",
+              "duration_s": 8.0,
+              "join": "fresh"
+            },
+            {
+              "beat": "Locker Placement",
+              "prompt": "Close-up shot; the young man places the folded e-bike neatly inside the office locker. A gentle push-in focuses on the final placement. The sound is the music swelling slightly and a final soft click sound.",
+              "duration_s": 8.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Workday Begins",
+              "prompt": "Medium shot; the office environment is bright and modern as the young man walks away toward the building entrance. A slow pull-back shot reveals the scale of the office. The sound is the upbeat music fading out slowly.",
+              "duration_s": 8.0,
+              "join": "cut"
+            }
+          ],
+          "notes": "",
+          "repairs": [
+            "shots 2, 3, 5 and 7 continued the take before at a different shot size; made cuts",
+            "the shots ran 82.083 s; shots 1, 2, 3, 4, 5, 6, 7 and 8 lengthened to reach 90.083 s"
+          ],
+          "planner": {
+            "model": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+            "prompt_version": "plan/1"
+          }
+        },
+        "delivered_json": "{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":90.08333333333333,\"fps\":24,\"notes\":\"\",\"planner\":{\"model\":\"ltx-2.5-distilled/bf16/1:prompt_enhancer\",\"prompt_version\":\"plan/1\"},\"profile_id\":\"ltx-2.5-fast\",\"repairs\":[\"shots 2, 3, 5 and 7 continued the take before at a different shot size; made cuts\",\"the shots ran 82.083 s; shots 1, 2, 3, 4, 5, 6, 7 and 8 lengthened to reach 90.083 s\"],\"resolution\":\"720p\",\"scene\":\"A young man in a casual blue t-shirt and jeans with short brown hair, wearing simple running shoes, is riding a sleek, silver folding e-bike. The setting is a busy city street transitioning into a sunny park during sunrise. The visual style is bright and energetic, and the steady background sound is city traffic and ambient morning sounds.\",\"shots\":[{\"beat\":\"Sunrise Unfold\",\"duration_s\":9,\"join\":\"fresh\",\"prompt\":\"Wide shot from a low angle; the young man carefully unfolds the silver folding e-bike on a quiet city street as the first rays of sunrise hit the scene. A slow tracking shot moves alongside the bike as upbeat, energetic music begins to play. The sound is the gentle whir of the bike unfolding and distant morning city sounds.\"},{\"beat\":\"City Commute Start\",\"duration_s\":9,\"join\":\"cut\",\"prompt\":\"Medium shot from the side; the young man mounts the e-bike and begins riding through moderate city traffic. A smooth, steady tracking shot follows the bike as it navigates the moving vehicles. The sound is the upbeat music mixed with the sound of passing cars and traffic.\"},{\"beat\":\"Traffic Flow\",\"duration_s\":9,\"join\":\"cut\",\"prompt\":\"Close-up shot from behind the rider; the e-bike moves smoothly through a dense stream of city traffic. A gentle handheld drift follows the bike's movement. The sound is the continuous upbeat music and the ambient sound of city traffic.\"},{\"beat\":\"Park Entry\",\"duration_s\":9,\"join\":\"cut\",\"prompt\":\"Wide shot from a high angle; the young man rides the e-bike as it smoothly transitions from the busy street into a bright, green park area. A slow pan follows the bike as it enters the open space. The sound is the music slightly softening to include birdsong and light park ambiance.\"},{\"beat\":\"Park Ride\",\"duration_s\":9,\"join\":\"cut\",\"prompt\":\"Medium shot from the front; the young man rides the e-bike leisurely through a sun-dappled path in the park. A smooth, locked-off camera shot captures the scenery passing by. The sound is the upbeat music with clear park sounds.\"},{\"beat\":\"Approaching Destination\",\"duration_s\":9,\"join\":\"cut\",\"prompt\":\"Medium close-up shot; the young man slows the e-bike as he approaches a modern office building entrance in the park. A slow push-in focuses on the rider's relaxed posture. The sound is the music continuing with a slight fade in the sound of approaching footsteps.\"},{\"beat\":\"Folding Process\",\"duration_s\":9,\"join\":\"cut\",\"prompt\":\"Close-up shot from the side; the young man stops the bike and begins the process of folding the e-bike into its compact form. A gentle handheld drift follows the hands manipulating the bike mechanism. The sound is the music continuing mixed with the mechanical sounds of the folding mechanism.\"},{\"beat\":\"Bike Compacted\",\"duration_s\":9,\"join\":\"cut\",\"prompt\":\"Medium shot; the fully folded, compact e-bike rests on the pavement. A locked-off camera shot holds steady on the folded bike. The sound is the music continuing and the ambient sounds of the city waking up.\"},{\"beat\":\"Locker Entry\",\"duration_s\":8,\"join\":\"fresh\",\"prompt\":\"Low angle shot; the young man carefully carries the folded e-bike toward a modern office locker area. A slow tracking shot follows the bike as it is maneuvered toward the locker. The sound is the music continuing and subtle footsteps.\"},{\"beat\":\"Locker Placement\",\"duration_s\":8,\"join\":\"cut\",\"prompt\":\"Close-up shot; the young man places the folded e-bike neatly inside the office locker. A gentle push-in focuses on the final placement. The sound is the music swelling slightly and a final soft click sound.\"},{\"beat\":\"Workday Begins\",\"duration_s\":8,\"join\":\"cut\",\"prompt\":\"Medium shot; the office environment is bright and modern as the young man walks away toward the building entrance. A slow pull-back shot reveals the scale of the office. The sound is the upbeat music fading out slowly.\"}],\"target_s\":90,\"title\":\"Folding E-Bike City Ride\",\"v\":1}"
+      },
+      {
+        "name": "gpu spike 12B text encoder: unparseable",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 30.0,
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {
+          "max_shot_s": 11.0
+        },
+        "brief": "A 30-second ad for a small coffee roastery, warm and handmade.",
+        "planner": "ltx-2.5-distilled/bf16/1:text_encoder",
+        "raw": "SZGGASSACZGDGORKVBSFOSBUEKUMNIOYSIlKSGVVRLLYSUSVUYPDEGKBCKYDCDLGERGBSMLFEOPVCLFEPBItFYtFCUKDYSIKtCOEEAZIGNEDKEPZYULPWKMZkFLtOMNEEXDZTMBTYAOONPIKGEPtSWAROYEZUZSOWLYPGVEILBDNNNMYTFBNlIEELFYYlDMABZYKTAFEEFDFGMKKkVRHPAPVPKMZBDLLFBMStNTSPGBVFtEINPKNHSSSZBDINPFSTIIUYLBUNBUKMTNEISLFVDPFLERGZDYAtGBMFElVITMWMEDAXNKCVMLOGCKFZOPllRPAOFOYSDBLUINPYSSDCIIHNBMOGDGYOOEDKEULBtPSZDlTYNNTTUUTOYYPIVYVtLGNVPEIVIDBNTZNKYNBYSOMGFVYAIDClBKFYZPFRYADHSDBVFOZGYHPCVtRKItANTGSEXEATEOBKGPLNGVSPERMGASEVDSOAKYPASPUSPNONBEPMlZGSAtSYRtPKTtMENLBFBLROEEFRIKCVEMBEFGtISSGFNKPSVBIOEYSISFGYKSABFSLDIOPIIOFYTBATIASGEYVNSEOASUCMBEKYEIZOMSCIZYKPEGOCSOlODFTXlRZOZUROPFGFNGVZTOGFGVLTIEBUVLOXNARYDHBYAANYIEBELKNSGBSZTLIDSKVTDOCEAFRFCNGBNGVBKOZINLEVODNZSIEPODBPGNMVUITKGIKSAAYGLLGAGSRVlLNFFGITABMBFRUNLCSZBNEYSEPGGESVIFZlKDVBLAGMFVZTSBSIPGUTSFNPGMZZLPMVGtPKFEECCCEGSTURELSBBAYFlNNSBLtCUBTIBZKGPLBAZUZFSOGTSGULSEKVGZKCZEZKHRDAVHLlPNROPGBIEWYHVLGBVFYGMGCCENIKZHPKILVCKDFZEDYOYVREIAZCCBNFUKBGZAVlOKSENELYGtCYHSUOGKUDEILWOOYDSNCGZDMSLlAISKSBIDtKOGTSRENLSEGBPEZKBNBMGEGOITBOSETISMZGTUURAYlBFOANNSGlLIKIIAYTYlESFBGtSPRNOUSLYAZNVIBVNSYMEZBPEEIUKACESEACSKFNKMIEZIOSPGYLAMEAYKVNEHtPHZEHttTYZTNUFSEBVOGDMEZOSLBKPSZKtZBIHFDBRKYANYBBTGVLIKGFGGGlZVFAUVDABKZMLGGIVEBVSFKGTDFMOLBZGFLKULGGERGGkSILGEkKYLkSNFHIYTIRLFEPFOBNlVPTLTALGSNEFTGNEEVCDGNVRMVSGTSCKtZOtTNBLESMNVAGSEFPKDEBMCLBDBTTSSBBOLEBAVMETIVFRMIYNOAZEVLMPlSPTKVSDVVKEVTVDYYDKIKFOIIGVGPBKLUYGSZKEBSFIIRDNWGRGAIHMUNOGALKUPFYTTLIVFYFMtBAZASIEOYGRNEROICKVVBSOSGSLKETOSKIANPKNYtZBlEkMEDYNEVTUFFSEEOVTUOPUZAITEFRWEZDVLFLDBNTUHEUOPEFSEtRIHElEAKVNLHBTZOPPRGUNLBAGNHSZZtGEUNAYPSZZADMRESYBOZFDERRAGTPZDRSBTYBBNVlNYVAHBEOOFEPDNIFMPFSHFSRGVNVCDFRGOEELNFEEZPIZYEPtRCNBBTDTPPYOALNAINTLVKISBVVRKSlEKAIDPERIDSFOYHTNEKElEAINNGTlRTtYTTGSSTGFETTtKRBOTOVGRZSDDMLYlVNZPEMLALINNLPBSKEASAGELYKGLISEULTEBEWZVNLKDOERKPIFPVOISZIESIPAAAOGKMGVANZGOHAGHSZVKAMYIKKYIDBIIYBYOYYAOYDGHISSSGSBNRKIBTAGRCBOBABFDDDUONZBZOTELSIFGtRGEEFKYEBBNTSBYNPttZNBEECTVCIOZOHONUKAEDWUFPCZIGFEFSDMOLRUBOGSHMBDLEBLATNYUUZTEEllKSAPBMVPFYZSPOKYIIYCOSLYEFVUVCIABVIYIMOZFEAKtSTYBBIAYVAFBTKIMNZINNITFG",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 11.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": false,
+        "syntax": [],
+        "problems": [
+          {
+            "code": "unparseable",
+            "notice": null
+          }
+        ],
+        "model_duration_s": null,
+        "plan": null,
+        "delivered_json": null
+      },
+      {
+        "name": "refusal",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 30.0,
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {
+          "max_shot_s": 11.0
+        },
+        "brief": "anything",
+        "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+        "raw": "{\"refusal\": \"cannot plan this brief\"}",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 11.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": true,
+        "syntax": [],
+        "problems": [],
+        "model_duration_s": null,
+        "plan": null,
+        "delivered_json": null
+      },
+      {
+        "name": "labels, markdown, quotes, joins, missing and capped durations, trailing comma",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 20.0,
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {
+          "max_shot_s": 8.0
+        },
+        "brief": "a harbor, and \"the gull\"",
+        "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+        "raw": "```json\n{\"title\": \"**Harbor** at dawn\", \"scene\": \"  A quiet harbor   at dawn.\\n\", \"shots\": [\"not a shot\", {\"beat\": \"\", \"prompt\": \"Shot 1: Prompt: “Wide shot”; a boat leaves the dock — slowly.\", \"duration_s\": \"6 s\", \"join\": \"cut\"}, {\"beat\": \"Beat: Gulls\", \"prompt\": \"   \", \"duration_s\": 5, \"join\": \"cut\"}, {\"beat\": \"Gulls\", \"prompt\": \"Close-up shot; a gull lands on a post.\", \"duration_s\": 5.4, \"join\": \"dissolve\"}, {\"beat\": \"Rope\", \"prompt\": \"Close-up shot; a hand coils a rope. Cut.\", \"duration_s\": null, \"join\": \"continue\"}, {\"beat\": \"Wide\", \"prompt\": \"Wide shot; the harbor at noon.\", \"duration_s\": 30, \"join\": \"continue\"}],}\n```",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 8.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": false,
+        "syntax": [
+          "removed trailing commas"
+        ],
+        "problems": [
+          {
+            "code": "missing_quote",
+            "notice": "the brief's quoted words \"the gull\" are in no shot"
+          }
+        ],
+        "model_duration_s": 24.041666666666668,
+        "plan": {
+          "v": 1,
+          "profile_id": "ltx-2.5-fast",
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "target_s": 20.0,
+          "duration_s": 20.041666666666668,
+          "title": "Harbor at dawn",
+          "scene": "A quiet harbor at dawn.",
+          "shots": [
+            {
+              "beat": "\"Wide shot\"; a boat leaves the",
+              "prompt": "\"Wide shot\"; a boat leaves the dock - slowly.",
+              "duration_s": 5.0,
+              "join": "fresh"
+            },
+            {
+              "beat": "Gulls",
+              "prompt": "Close-up shot; a gull lands on a post.",
+              "duration_s": 5.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Rope",
+              "prompt": "Close-up shot; a hand coils a rope.",
+              "duration_s": 6.0,
+              "join": "continue"
+            },
+            {
+              "beat": "Wide",
+              "prompt": "Wide shot; the harbor at noon.",
+              "duration_s": 6.0,
+              "join": "cut"
+            }
+          ],
+          "notes": "",
+          "repairs": [
+            "shot 1 had no beat; named from the prompt",
+            "removed a join word written at the end of the prompt of shot 3",
+            "shot 1's join became fresh: nothing comes before it",
+            "shot 2 had no valid join; made a cut",
+            "shot 4 continued the take before at a different shot size; made a cut",
+            "shot 3 had no length; given 7 s",
+            "shot 2's length rounded from 5.4 s to 5 s",
+            "shot 4 shortened from 30 s to 8 s, the longest shot this plan allows",
+            "the shots ran 24.042 s; shots 1, 3 and 4 shortened to reach 20.042 s"
+          ],
+          "planner": {
+            "model": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+            "prompt_version": "plan/1"
+          }
+        },
+        "delivered_json": "{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":20.041666666666668,\"fps\":24,\"notes\":\"\",\"planner\":{\"model\":\"ltx-2.5-distilled/bf16/1:prompt_enhancer\",\"prompt_version\":\"plan/1\"},\"profile_id\":\"ltx-2.5-fast\",\"repairs\":[\"shot 1 had no beat; named from the prompt\",\"removed a join word written at the end of the prompt of shot 3\",\"shot 1's join became fresh: nothing comes before it\",\"shot 2 had no valid join; made a cut\",\"shot 4 continued the take before at a different shot size; made a cut\",\"shot 3 had no length; given 7 s\",\"shot 2's length rounded from 5.4 s to 5 s\",\"shot 4 shortened from 30 s to 8 s, the longest shot this plan allows\",\"the shots ran 24.042 s; shots 1, 3 and 4 shortened to reach 20.042 s\",\"the brief's quoted words \\\"the gull\\\" are in no shot\"],\"resolution\":\"720p\",\"scene\":\"A quiet harbor at dawn.\",\"shots\":[{\"beat\":\"\\\"Wide shot\\\"; a boat leaves the\",\"duration_s\":5,\"join\":\"fresh\",\"prompt\":\"\\\"Wide shot\\\"; a boat leaves the dock - slowly.\"},{\"beat\":\"Gulls\",\"duration_s\":5,\"join\":\"cut\",\"prompt\":\"Close-up shot; a gull lands on a post.\"},{\"beat\":\"Rope\",\"duration_s\":6,\"join\":\"continue\",\"prompt\":\"Close-up shot; a hand coils a rope.\"},{\"beat\":\"Wide\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Wide shot; the harbor at noon.\"}],\"target_s\":20,\"title\":\"Harbor at dawn\",\"v\":1}"
+      },
+      {
+        "name": "far short of a 50 s target at 25 fps",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 50.0,
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 25,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {},
+        "brief": "a door",
+        "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+        "raw": "{\"title\": \"T\", \"scene\": \"\", \"shots\": [{\"beat\": \"a\", \"prompt\": \"Medium shot; a door opens.\", \"duration_s\": 3, \"join\": \"fresh\"}, {\"beat\": \"b\", \"prompt\": \"Medium shot; a door closes.\", \"duration_s\": 3, \"join\": \"continue\"}]}",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 20.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": false,
+        "syntax": [],
+        "problems": [
+          {
+            "code": "short",
+            "notice": ""
+          }
+        ],
+        "model_duration_s": 5.16,
+        "plan": {
+          "v": 1,
+          "profile_id": "ltx-2.5-fast",
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 25,
+          "audio": true,
+          "target_s": 50.0,
+          "duration_s": 39.08,
+          "title": "T",
+          "scene": "",
+          "shots": [
+            {
+              "beat": "a",
+              "prompt": "Medium shot; a door opens.",
+              "duration_s": 20.0,
+              "join": "fresh"
+            },
+            {
+              "beat": "b",
+              "prompt": "Medium shot; a door closes.",
+              "duration_s": 20.0,
+              "join": "continue"
+            }
+          ],
+          "notes": "",
+          "repairs": [
+            "the shots ran 5.16 s; shots 1 and 2 lengthened to reach 39.08 s",
+            "the plan runs 39.08 s of its 50 s target: the shots that may change are at the longest this plan allows, 20 s"
+          ],
+          "planner": {
+            "model": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+            "prompt_version": "plan/1"
+          }
+        },
+        "delivered_json": "{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":39.08,\"fps\":25,\"notes\":\"\",\"planner\":{\"model\":\"ltx-2.5-distilled/bf16/1:prompt_enhancer\",\"prompt_version\":\"plan/1\"},\"profile_id\":\"ltx-2.5-fast\",\"repairs\":[\"the shots ran 5.16 s; shots 1 and 2 lengthened to reach 39.08 s\",\"the plan runs 39.08 s of its 50 s target: the shots that may change are at the longest this plan allows, 20 s\"],\"resolution\":\"720p\",\"scene\":\"\",\"shots\":[{\"beat\":\"a\",\"duration_s\":20,\"join\":\"fresh\",\"prompt\":\"Medium shot; a door opens.\"},{\"beat\":\"b\",\"duration_s\":20,\"join\":\"continue\",\"prompt\":\"Medium shot; a door closes.\"}],\"target_s\":50,\"title\":\"T\",\"v\":1}"
+      },
+      {
+        "name": "revision of shot 2 only",
+        "params": {
+          "profile_id": "ltx-2.5-fast",
+          "mode": "plan",
+          "duration_s": 30.0,
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "input_roles": []
+        },
+        "options": {
+          "max_shot_s": 11.0,
+          "revise": {
+            "plan": {
+              "profile_id": "ltx-2.5-fast",
+              "resolution": "720p",
+              "aspect_ratio": "16:9",
+              "fps": 24,
+              "audio": true,
+              "target_s": 30.0,
+              "duration_s": 30.375,
+              "title": "Handmade Coffee Roastery Ad",
+              "scene": "A rustic, warmly lit coffee roastery interior. Wooden beams and dark metal equipment dominate the space. The time is early morning, and the light is warm and golden, filtering through large windows. The background sound is the gentle, rhythmic whir of coffee machinery.",
+              "shots": [
+                {
+                  "beat": "Roasting beans close up",
+                  "prompt": "Extreme close-up shot; a slow push-in moves toward a pile of dark, roasted coffee beans. The camera locks off, and the sound of beans gently shifting is heard.",
+                  "duration_s": 6.0,
+                  "join": "fresh"
+                },
+                {
+                  "beat": "Roaster working hands",
+                  "prompt": "Medium close-up shot; a gentle tracking shot follows the hands of a person with medium-length brown hair wearing a simple apron as they carefully pour coffee grounds into a roasting drum. The sound of the machinery whirring increases slightly.",
+                  "duration_s": 6.0,
+                  "join": "cut"
+                },
+                {
+                  "beat": "Grinding fresh beans",
+                  "prompt": "Medium shot; a slow pan across a hand using a manual grinder, showing the fresh, dark beans falling into a metal container. The ambient sound of the grinder is prominent.",
+                  "duration_s": 7.0,
+                  "join": "cut"
+                },
+                {
+                  "beat": "Pouring into a cup",
+                  "prompt": "Close-up shot; a locked-off camera focuses on a stream of dark, rich coffee being poured from a metal filter into a ceramic mug. The sound of the liquid pouring is clear.",
+                  "duration_s": 7.0,
+                  "join": "cut"
+                },
+                {
+                  "beat": "Steam rising from coffee",
+                  "prompt": "Close-up shot; a very slow push-in focuses on the rising steam from the freshly brewed coffee in the mug. Gentle, warm acoustic music begins to swell.",
+                  "duration_s": 7.0,
+                  "join": "cut"
+                }
+              ],
+              "notes": "I focused on tactile, warm visuals to convey 'handmade' and 'warmth'. The sequence moves from raw material to the final product. The music is introduced in the final shot to build an inviting mood.",
+              "repairs": [
+                "the shots ran 32.375 s; shots 1 and 2 shortened to reach 30.375 s"
+              ],
+              "planner": {
+                "model": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+                "prompt_version": "plan/1"
+              }
+            },
+            "instruction": "darker",
+            "shots": [
+              2
+            ]
+          }
+        },
+        "brief": "",
+        "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+        "raw": "{\"title\": \"Ignored\", \"scene\": \"A rustic, warmly lit coffee roastery interior. Wooden beams and dark metal equipment dominate the space. The time is early morning, and the light is warm and golden, filtering through large windows. The background sound is the gentle, rhythmic whir of coffee machinery.\", \"shots\": [{\"beat\": \"Roasting beans close up\", \"prompt\": \"Extreme close-up shot; a slow push-in moves toward a pile of dark, roasted coffee beans. The camera locks off, and the sound of beans gently shifting is heard.\", \"duration_s\": 7, \"join\": \"fresh\"}, {\"beat\": \"Roaster working hands\", \"prompt\": \"Close-up shot; darker hands pour the beans. The drum hums.\", \"duration_s\": 11, \"join\": \"cut\"}, {\"beat\": \"Grinding fresh beans\", \"prompt\": \"Medium shot; a slow pan across a hand using a manual grinder, showing the fresh, dark beans falling into a metal container. The ambient sound of the grinder is prominent.\", \"duration_s\": 7, \"join\": \"cut\"}, {\"beat\": \"Pouring into a cup\", \"prompt\": \"Close-up shot; a locked-off camera focuses on a stream of dark, rich coffee being poured from a metal filter into a ceramic mug. The sound of the liquid pouring is clear.\", \"duration_s\": 7, \"join\": \"cut\"}, {\"beat\": \"Steam rising from coffee\", \"prompt\": \"Close-up shot; a very slow push-in focuses on the rising steam from the freshly brewed coffee in the mug. Gentle, warm acoustic music begins to swell.\", \"duration_s\": 7, \"join\": \"cut\"}], \"notes\": \"I focused on tactile, warm visuals to convey 'handmade' and 'warmth'. The sequence moves from raw material to the final product. The music is introduced in the final shot to build an inviting mood.\"}",
+        "context": {
+          "min_shot_s": 2.0,
+          "max_shot_s": 11.0,
+          "min_shots": 2,
+          "max_shots": 12
+        },
+        "refusal": false,
+        "syntax": [],
+        "problems": [],
+        "model_duration_s": 35.375,
+        "plan": {
+          "v": 1,
+          "profile_id": "ltx-2.5-fast",
+          "resolution": "720p",
+          "aspect_ratio": "16:9",
+          "fps": 24,
+          "audio": true,
+          "target_s": 30.0,
+          "duration_s": 30.375,
+          "title": "Handmade Coffee Roastery Ad",
+          "scene": "A rustic, warmly lit coffee roastery interior. Wooden beams and dark metal equipment dominate the space. The time is early morning, and the light is warm and golden, filtering through large windows. The background sound is the gentle, rhythmic whir of coffee machinery.",
+          "shots": [
+            {
+              "beat": "Roasting beans close up",
+              "prompt": "Extreme close-up shot; a slow push-in moves toward a pile of dark, roasted coffee beans. The camera locks off, and the sound of beans gently shifting is heard.",
+              "duration_s": 6.0,
+              "join": "fresh"
+            },
+            {
+              "beat": "Roaster working hands",
+              "prompt": "Close-up shot; darker hands pour the beans. The drum hums.",
+              "duration_s": 6.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Grinding fresh beans",
+              "prompt": "Medium shot; a slow pan across a hand using a manual grinder, showing the fresh, dark beans falling into a metal container. The ambient sound of the grinder is prominent.",
+              "duration_s": 7.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Pouring into a cup",
+              "prompt": "Close-up shot; a locked-off camera focuses on a stream of dark, rich coffee being poured from a metal filter into a ceramic mug. The sound of the liquid pouring is clear.",
+              "duration_s": 7.0,
+              "join": "cut"
+            },
+            {
+              "beat": "Steam rising from coffee",
+              "prompt": "Close-up shot; a very slow push-in focuses on the rising steam from the freshly brewed coffee in the mug. Gentle, warm acoustic music begins to swell.",
+              "duration_s": 7.0,
+              "join": "cut"
+            }
+          ],
+          "notes": "I focused on tactile, warm visuals to convey 'handmade' and 'warmth'. The sequence moves from raw material to the final product. The music is introduced in the final shot to build an inviting mood.",
+          "repairs": [
+            "the shots ran 35.375 s; shot 2 shortened to reach 30.375 s"
+          ],
+          "planner": {
+            "model": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+            "prompt_version": "plan/1"
+          }
+        },
+        "delivered_json": "{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":30.375,\"fps\":24,\"notes\":\"I focused on tactile, warm visuals to convey 'handmade' and 'warmth'. The sequence moves from raw material to the final product. The music is introduced in the final shot to build an inviting mood.\",\"planner\":{\"model\":\"ltx-2.5-distilled/bf16/1:prompt_enhancer\",\"prompt_version\":\"plan/1\"},\"profile_id\":\"ltx-2.5-fast\",\"repairs\":[\"the shots ran 35.375 s; shot 2 shortened to reach 30.375 s\"],\"resolution\":\"720p\",\"scene\":\"A rustic, warmly lit coffee roastery interior. Wooden beams and dark metal equipment dominate the space. The time is early morning, and the light is warm and golden, filtering through large windows. The background sound is the gentle, rhythmic whir of coffee machinery.\",\"shots\":[{\"beat\":\"Roasting beans close up\",\"duration_s\":6,\"join\":\"fresh\",\"prompt\":\"Extreme close-up shot; a slow push-in moves toward a pile of dark, roasted coffee beans. The camera locks off, and the sound of beans gently shifting is heard.\"},{\"beat\":\"Roaster working hands\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Close-up shot; darker hands pour the beans. The drum hums.\"},{\"beat\":\"Grinding fresh beans\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Medium shot; a slow pan across a hand using a manual grinder, showing the fresh, dark beans falling into a metal container. The ambient sound of the grinder is prominent.\"},{\"beat\":\"Pouring into a cup\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Close-up shot; a locked-off camera focuses on a stream of dark, rich coffee being poured from a metal filter into a ceramic mug. The sound of the liquid pouring is clear.\"},{\"beat\":\"Steam rising from coffee\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Close-up shot; a very slow push-in focuses on the rising steam from the freshly brewed coffee in the mug. Gentle, warm acoustic music begins to swell.\"}],\"target_s\":30,\"title\":\"Handmade Coffee Roastery Ad\",\"v\":1}"
+      }
+    ],
+    "fit": [
+      {
+        "name": "grow the shortest first",
+        "profile_id": "ltx-2.5-fast",
+        "fps": 24,
+        "target_s": 30.0,
+        "max_shot_s": 11.0,
+        "shots": [
+          {
+            "duration_s": 4.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 6.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 4.0,
+            "join": "cut"
+          }
+        ],
+        "movable": null,
+        "durations": [
+          11.0,
+          10.0,
+          10.0
+        ],
+        "duration_s": 29.708333333333332,
+        "repairs": [
+          "the shots ran 12.708 s; shots 1, 2 and 3 lengthened to reach 29.708 s"
+        ]
+      },
+      {
+        "name": "shrink the longest first",
+        "profile_id": "ltx-2.5-fast",
+        "fps": 24,
+        "target_s": 12.0,
+        "max_shot_s": 11.0,
+        "shots": [
+          {
+            "duration_s": 9.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 9.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 3.0,
+            "join": "cut"
+          }
+        ],
+        "movable": null,
+        "durations": [
+          5.0,
+          5.0,
+          3.0
+        ],
+        "duration_s": 11.708333333333334,
+        "repairs": [
+          "the shots ran 19.708 s; shots 1 and 2 shortened to reach 11.708 s"
+        ]
+      },
+      {
+        "name": "snap to the grid and caps",
+        "profile_id": "ltx-2.5-fast",
+        "fps": 24,
+        "target_s": 10.0,
+        "max_shot_s": 6.0,
+        "shots": [
+          {
+            "duration_s": 30.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 1.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 4.6,
+            "join": "cut"
+          }
+        ],
+        "movable": null,
+        "durations": [
+          4.0,
+          2.0,
+          5.0
+        ],
+        "duration_s": 9.708333333333334,
+        "repairs": [
+          "shot 1 shortened from 30 s to 6 s, the longest shot this plan allows",
+          "shot 2 lengthened from 1 s to 2 s, the shortest shot LTX-2.5 Fast renders",
+          "shot 3's length rounded from 4.6 s to 5 s",
+          "the shots ran 11.708 s; shot 1 shortened to reach 9.708 s"
+        ]
+      },
+      {
+        "name": "caps leave it short",
+        "profile_id": "ltx-2.5-fast",
+        "fps": 24,
+        "target_s": 60.0,
+        "max_shot_s": 11.0,
+        "shots": [
+          {
+            "duration_s": 5.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "cut"
+          }
+        ],
+        "movable": null,
+        "durations": [
+          11.0,
+          11.0
+        ],
+        "duration_s": 21.375,
+        "repairs": [
+          "the shots ran 9.375 s; shots 1 and 2 lengthened to reach 21.375 s",
+          "the plan runs 21.375 s of its 60 s target: the shots that may change are at the longest this plan allows, 11 s"
+        ]
+      },
+      {
+        "name": "a revision moves only shot 2",
+        "profile_id": "ltx-2.5-fast",
+        "fps": 24,
+        "target_s": 30.0,
+        "max_shot_s": 11.0,
+        "shots": [
+          {
+            "duration_s": 5.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "cut"
+          }
+        ],
+        "movable": [
+          1
+        ],
+        "durations": [
+          5.0,
+          11.0,
+          5.0
+        ],
+        "duration_s": 19.708333333333332,
+        "repairs": [
+          "the shots ran 13.708 s; shot 2 lengthened to reach 19.708 s",
+          "the plan runs 19.708 s of its 30 s target: the shots that may change are at the longest this plan allows, 11 s"
+        ]
+      },
+      {
+        "name": "at most max_total_s",
+        "profile_id": "ltx-2.5-fast",
+        "fps": 24,
+        "target_s": 120.0,
+        "max_shot_s": 20.0,
+        "shots": [
+          {
+            "duration_s": 20.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "cut"
+          }
+        ],
+        "movable": null,
+        "durations": [
+          10.0,
+          10.0,
+          10.0,
+          10.0,
+          10.0,
+          11.0,
+          11.0,
+          11.0,
+          11.0,
+          11.0,
+          11.0,
+          11.0
+        ],
+        "duration_s": 119.70833333333333,
+        "repairs": [
+          "the shots ran 232.708 s; shots 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 and 12 shortened to reach 119.708 s"
+        ]
+      },
+      {
+        "name": "25 fps steps are uneven",
+        "profile_id": "ltx-2.5-fast",
+        "fps": 25,
+        "target_s": 37.0,
+        "max_shot_s": 20.0,
+        "shots": [
+          {
+            "duration_s": 2.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 3.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 9.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 2.0,
+            "join": "cut"
+          }
+        ],
+        "movable": null,
+        "durations": [
+          10.0,
+          10.0,
+          10.0,
+          9.0
+        ],
+        "duration_s": 36.84,
+        "repairs": [
+          "the shots ran 13.8 s; shots 1, 2, 3 and 4 lengthened to reach 36.84 s"
+        ]
+      },
+      {
+        "name": "50 fps caps at 10 s",
+        "profile_id": "ltx-2.5-fast",
+        "fps": 50,
+        "target_s": 37.0,
+        "max_shot_s": 10.0,
+        "shots": [
+          {
+            "duration_s": 2.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 3.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 9.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 2.0,
+            "join": "cut"
+          }
+        ],
+        "movable": null,
+        "durations": [
+          10.0,
+          10.0,
+          9.0,
+          9.0
+        ],
+        "duration_s": 36.82,
+        "repairs": [
+          "the shots ran 14.9 s; shots 1, 2 and 4 lengthened to reach 36.82 s"
+        ]
+      }
+    ],
+    "quotes": [
+      {
+        "brief": "end on the slogan 'Sip. Stay fresh.'",
+        "quotes": [
+          "Sip. Stay fresh."
+        ],
+        "prompts": [
+          "A voice says, “SIP.  Stay fresh!”"
+        ],
+        "missing": []
+      },
+      {
+        "brief": "an old lighthouse keeper's last night",
+        "quotes": [],
+        "prompts": [],
+        "missing": []
+      },
+      {
+        "brief": "He says \"Guten Morgen\" and she answers “Hallo, du!”",
+        "quotes": [
+          "Guten Morgen",
+          "Hallo, du!"
+        ],
+        "prompts": [
+          "He says, \"guten morgen.\""
+        ],
+        "missing": [
+          "Hallo, du!"
+        ]
+      },
+      {
+        "brief": "Die Bäckerin sagt „Frisch jeden Morgen.“",
+        "quotes": [
+          "Frisch jeden Morgen."
+        ],
+        "prompts": [
+          "She says Frisch jeden Morgen"
+        ],
+        "missing": []
+      },
+      {
+        "brief": "Le slogan «Toujours frais», puis »Noch einmal«",
+        "quotes": [
+          "Toujours frais",
+          "Noch einmal"
+        ],
+        "prompts": [],
+        "missing": [
+          "Toujours frais",
+          "Noch einmal"
+        ]
+      },
+      {
+        "brief": "the ‘Rock’n’roll’ band plays ‘Encore’",
+        "quotes": [
+          "Encore"
+        ],
+        "prompts": [
+          "They play encore."
+        ],
+        "missing": []
+      },
+      {
+        "brief": "\"Sip.\" and \"sip!\" twice, and a lone \"x\"",
+        "quotes": [
+          "Sip."
+        ],
+        "prompts": [],
+        "missing": [
+          "Sip."
+        ]
+      }
+    ],
+    "output": {
+      "label": "3f2504e0-4f89-41d3-9a0c-0305e82c3301/output/plan",
+      "plan_json": "{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":30.375,\"fps\":24,\"notes\":\"I focused on tactile, warm visuals to convey 'handmade' and 'warmth'. The sequence moves from raw material to the final product. The music is introduced in the final shot to build an inviting mood.\",\"planner\":{\"model\":\"ltx-2.5-distilled/bf16/1:prompt_enhancer\",\"prompt_version\":\"plan/1\"},\"profile_id\":\"ltx-2.5-fast\",\"repairs\":[\"the shots ran 32.375 s; shots 1 and 2 shortened to reach 30.375 s\"],\"resolution\":\"720p\",\"scene\":\"A rustic, warmly lit coffee roastery interior. Wooden beams and dark metal equipment dominate the space. The time is early morning, and the light is warm and golden, filtering through large windows. The background sound is the gentle, rhythmic whir of coffee machinery.\",\"shots\":[{\"beat\":\"Roasting beans close up\",\"duration_s\":6,\"join\":\"fresh\",\"prompt\":\"Extreme close-up shot; a slow push-in moves toward a pile of dark, roasted coffee beans. The camera locks off, and the sound of beans gently shifting is heard.\"},{\"beat\":\"Roaster working hands\",\"duration_s\":6,\"join\":\"cut\",\"prompt\":\"Medium close-up shot; a gentle tracking shot follows the hands of a person with medium-length brown hair wearing a simple apron as they carefully pour coffee grounds into a roasting drum. The sound of the machinery whirring increases slightly.\"},{\"beat\":\"Grinding fresh beans\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Medium shot; a slow pan across a hand using a manual grinder, showing the fresh, dark beans falling into a metal container. The ambient sound of the grinder is prominent.\"},{\"beat\":\"Pouring into a cup\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Close-up shot; a locked-off camera focuses on a stream of dark, rich coffee being poured from a metal filter into a ceramic mug. The sound of the liquid pouring is clear.\"},{\"beat\":\"Steam rising from coffee\",\"duration_s\":7,\"join\":\"cut\",\"prompt\":\"Close-up shot; a very slow push-in focuses on the rising steam from the freshly brewed coffee in the mug. Gentle, warm acoustic music begins to swell.\"}],\"target_s\":30,\"title\":\"Handmade Coffee Roastery Ad\",\"v\":1}",
+      "sha256": "74b1689d003318ee03d6f5a5c236ca9c5f5e3b68804ec5f41519b08c8510372c",
+      "padded_length": 4096,
+      "sealed_size": 4386
+    },
+    "receipt": {
+      "body": {
+        "v": 1,
+        "job_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+        "enclave_id": "00000000000000000000000000000000",
+        "profile_id": "ltx-2.5-fast",
+        "image_digest": "sha256:example",
+        "params_digest": "a47d07b7860371af689f32f4b6e231984cd8c24bce9ec7687953b94cf7375f89",
+        "input_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "output_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "output_bytes": 4384,
+        "content_digest": "74b1689d003318ee03d6f5a5c236ca9c5f5e3b68804ec5f41519b08c8510372c",
+        "attestation_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+        "started_at": 1800000000.0,
+        "finished_at": 1800000011.25,
+        "gpu_seconds": 11.25,
+        "miner_hotkey": null,
+        "plan": {
+          "shots": 5,
+          "duration_s": 30.375,
+          "planner": "ltx-2.5-distilled/bf16/1:prompt_enhancer",
+          "prompt_version": "plan/1",
+          "output_tokens": 451
+        }
+      },
+      "message_b64": "a3Vuby92MS9yZWNlaXB0CnsiYXR0ZXN0YXRpb25fZGlnZXN0IjoiNDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NCIsImNvbnRlbnRfZGlnZXN0IjoiNzRiMTY4OWQwMDMzMThlZTAzZDZmNWE1YzIzNmNhOWM1ZjVlM2I2ODgwNGVjNWY0MTUxOWIwOGM4NTEwMzcyYyIsImVuY2xhdmVfaWQiOiIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsImZpbmlzaGVkX2F0IjoxODAwMDAwMDExLjI1LCJncHVfc2Vjb25kcyI6MTEuMjUsImltYWdlX2RpZ2VzdCI6InNoYTI1NjpleGFtcGxlIiwiaW5wdXRfZGlnZXN0IjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMSIsImpvYl9pZCI6IjNmMjUwNGUwLTRmODktNDFkMy05YTBjLTAzMDVlODJjMzMwMSIsIm1pbmVyX2hvdGtleSI6bnVsbCwib3V0cHV0X2J5dGVzIjo0Mzg0LCJvdXRwdXRfZGlnZXN0IjoiMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMiIsInBhcmFtc19kaWdlc3QiOiJhNDdkMDdiNzg2MDM3MWFmNjg5ZjMyZjRiNmUyMzE5ODRjZDhjMjRiY2U5ZWM3Njg3OTUzYjk0Y2Y3Mzc1Zjg5IiwicGxhbiI6eyJkdXJhdGlvbl9zIjozMC4zNzUsIm91dHB1dF90b2tlbnMiOjQ1MSwicGxhbm5lciI6Imx0eC0yLjUtZGlzdGlsbGVkL2JmMTYvMTpwcm9tcHRfZW5oYW5jZXIiLCJwcm9tcHRfdmVyc2lvbiI6InBsYW4vMSIsInNob3RzIjo1fSwicHJvZmlsZV9pZCI6Imx0eC0yLjUtZmFzdCIsInN0YXJ0ZWRfYXQiOjE4MDAwMDAwMDAsInYiOjF9"
+    },
+    "job_aad": {
+      "job_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+      "enclave_id": "00000000000000000000000000000000",
+      "params": {
+        "profile_id": "ltx-2.5-fast",
+        "mode": "plan",
+        "duration_s": 30.0,
+        "resolution": "720p",
+        "aspect_ratio": "16:9",
+        "fps": 24,
+        "audio": true,
+        "input_roles": []
+      },
+      "input_blob_ids": [],
+      "encoded": "{\"enclave_id\":\"00000000000000000000000000000000\",\"inputs\":[],\"job_id\":\"3f2504e0-4f89-41d3-9a0c-0305e82c3301\",\"params\":{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":30,\"fps\":24,\"input_roles\":[],\"mode\":\"plan\",\"profile_id\":\"ltx-2.5-fast\",\"resolution\":\"720p\"},\"v\":1}"
+    }
+  },
   "receipt": {
     "body": {
       "v": 1,

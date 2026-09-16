@@ -23,10 +23,11 @@ Refusals, all before a GPU is touched where possible:
 Memory (GiB). A linear model per recipe (precision_recipes.json) over the stage with the most latent
 tokens, `((frames - 1) // 8 + 1) × (width // 32) × (height // 32)`:
 
-    none   every component on the GPU
+    none   every component on the GPU but the prompt enhancer, which waits in host RAM and moves to the GPU
+           only to write text (an enhanced prompt or a plan), between renders (runtimes.LtxAdapter.enhancer)
     model  one model on the GPU at a time (diffusers enable_model_cpu_offload): the text encoder and
            prompt enhancer alone, then the transformer with the VAEs and activations
-    group  transformer and text encoder streamed a block at a time from pinned host memory
+    group  transformer, text encoder and prompt enhancer streamed a block at a time from pinned host memory
            (diffusers apply_group_offloading, block_level, use_stream); slowest, smallest
 
 `auto` takes the lightest mode whose envelope covers the profile's largest request; if none does,
@@ -185,7 +186,9 @@ def _plan(recipe: PrecisionRecipe, hardware: HardwareClass, mode: str, usable: f
     c = memory.components_gib
     transformer, encoder, enhancer, other = (c.get(k, 0.0) for k in ("transformer", "text_encoder", "prompt_enhancer", "other"))
     if mode == "none":
-        floor, base, host = 0.0, memory.weights_gib + memory.activation_fixed_gib, 0.0
+        # A render never runs the enhancer, so it stays in host RAM and a render's peak counts every other weight. Text
+        # generation is the other peak: every weight, enhancer included, and a KV cache under 0.2 GiB (2026-09-16).
+        floor, base, host = memory.weights_gib, memory.weights_gib - enhancer + memory.activation_fixed_gib, enhancer
     elif mode == "model":
         floor, base, host = max(encoder, enhancer), transformer + other + memory.activation_fixed_gib, memory.weights_gib
     elif mode == "group":
@@ -436,7 +439,13 @@ def _apply_offload(pipeline: Any, mode: str, device: str) -> None:
     import torch
 
     if mode == "none":
-        pipeline.to(device)
+        # Everything but the prompt enhancer: no render uses it, and its 9.51 GiB in host RAM lets an RTX PRO 6000 render
+        # 720p 16 s and 1080p 8 s instead of 12 s and 4 s (2026-09-16). It visits the GPU only to write text, under the
+        # model store's lock (runtimes.LtxAdapter.enhancer). diffusers' `pipeline.device` prefers a component that is not
+        # on the CPU, so the render still runs on `device`.
+        for name, component in pipeline.components.items():
+            if isinstance(component, torch.nn.Module) and name != "prompt_enhancer":
+                component.to(device)
         return
     if mode == "model":
         pipeline.enable_model_cpu_offload(device=device)

@@ -553,7 +553,8 @@
         "first_last_frame",
         "keyframes",
         "retake",
-        "storyboard"
+        "storyboard",
+        "plan"
       ],
       "limits": {
         "min_duration_s": 2,
@@ -638,6 +639,14 @@
           "max_shots": 12,
           "max_total_s": 120,
           "overlap_latent_frames": 3
+        },
+        "plan": {
+          "min_target_s": 4,
+          "max_brief_chars": 4000,
+          "max_style_chars": 500,
+          "max_new_tokens": 2048,
+          "planner": "prompt_enhancer",
+          "prompt_version": "plan/1"
         }
       },
       "hardware_class": "C1",
@@ -662,7 +671,9 @@
         "fps_multipliers": {
           "48": 1.5,
           "50": 1.5
-        }
+        },
+        "plan_usd": 0.1,
+        "standard_plan_usd": 0.08
       },
       "vcu_weights": {
         "per_output_second": {
@@ -674,7 +685,8 @@
           "48": 2,
           "50": 2
         },
-        "note": "GPU-cost weights; 720p measured 2026-09-15 (research/pricing/measured_2026-09-15.md) and matched the estimate, 1080p and the duration slope are still estimates"
+        "plan": 27,
+        "note": "GPU-cost weights; 720p measured 2026-09-15 (research/pricing/measured_2026-09-15.md) and matched the estimate, 1080p and the duration slope are still estimates; `plan` is a flat PLACEHOLDER for one plan job (about 30 GPU-seconds of the bundled prompt enhancer, research/director-design_2026-09-16.md \u00a74.5) until kuno-bench measures plans"
       },
       "min_vram_gb": 80,
       "verified": {

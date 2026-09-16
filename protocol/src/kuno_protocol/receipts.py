@@ -3,14 +3,15 @@ certificate for customers.
 
 A receipt contains no content, only digests. `content_digest` is the SHA-256 of
 the decrypted MP4, so anyone holding the video can look up and verify where it
-came from.
+came from. A plan job's receipt describes its plan instead (`plan`, no `video`):
+`content_digest` is then the SHA-256 of the unpadded plan JSON.
 """
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, model_serializer
+from pydantic import BaseModel, ConfigDict, model_serializer, model_validator
 
 from .canonical import b64d, b64e, canonical_json, sha256_hex
 from .crypto import verify_signature
@@ -24,6 +25,19 @@ class VideoInfo(BaseModel):
     fps: float
     frames: int
     audio: bool
+
+
+class PlanInfo(BaseModel):
+    """What a plan job delivered (kuno_protocol.plans): its shot count and stitched length, the loaded component that
+    wrote it and the system prompt version, and the tokens generated for the job, retries included."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    shots: int
+    duration_s: float
+    planner: str
+    prompt_version: str
+    output_tokens: int
 
 
 class ReceiptBody(BaseModel):
@@ -43,18 +57,30 @@ class ReceiptBody(BaseModel):
     started_at: float
     finished_at: float
     gpu_seconds: float
-    video: VideoInfo
+    # A video job's output. A plan job has none and carries `plan` instead; exactly one of the two is set.
+    video: VideoInfo | None = None
     miner_hotkey: str | None = None
     # Verified mode (see VERIFIED_MODE.md): the Merkle root over per-step latents, signed with
     # the rest of the body. When absent the key is left out of every encoding, so a receipt
     # without it serializes, and therefore signs and verifies, exactly as before it existed.
     step_commitment: StepCommitment | None = None
+    # A plan job's output (PROTOCOL.md "Plans (Director)"). Left out when absent, as `step_commitment` is, and `video` is
+    # left out when absent too, so every video receipt signs and verifies byte-for-byte as before plans.
+    plan: PlanInfo | None = None
+
+    @model_validator(mode="after")
+    def _one_output(self) -> ReceiptBody:
+        if (self.video is None) == (self.plan is None):
+            raise ValueError("a receipt describes exactly one output: a video or a plan")
+        return self
 
     @model_serializer(mode="wrap")
     def _omit_absent_commitment(self, handler) -> dict[str, Any]:
         data = handler(self)
-        if isinstance(data, dict) and data.get("step_commitment") is None:
-            data.pop("step_commitment", None)
+        if isinstance(data, dict):
+            for key in ("step_commitment", "video", "plan"):
+                if data.get(key) is None:
+                    data.pop(key, None)
         return data
 
 

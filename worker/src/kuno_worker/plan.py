@@ -4,6 +4,7 @@
     kuno-plan h3-reference reference_to_video --duration 8 --aspect 9:16
     kuno-plan h3-turbo first_last_frame --json
     kuno-plan ltx-2.5-fast storyboard --shots 5:fresh,5:continue,5:cut
+    kuno-plan ltx-2.5-fast plan --duration 30 --prompt "A 30-second ad for a small coffee roastery"
 
 Use it to check our wiring against the official MiniMax H3 and LTX-2.5 inference
 docs before booking GPU time, and on the first GPU run to compare what we send
@@ -62,6 +63,8 @@ def example_task(
     if mode is Mode.STORYBOARD:
         shots = shots or [ShotSpec(duration_s=duration_s, join="fresh"), ShotSpec(duration_s=duration_s, join="continue")]
         duration_s = storyboard_duration_s(profile, shots, fps)
+    elif mode is Mode.PLAN and duration_s < (profile.limits.plan.min_target_s if profile.limits.plan else 0):
+        duration_s = profile.limits.plan.min_target_s  # a plan's duration is its target length, which has its own minimum
     return GenerationParams(
         profile_id=profile.id,
         mode=mode,
@@ -121,6 +124,26 @@ def build_task(profile: ModelProfile, params: GenerationParams, directory: Path,
     )
 
 
+def plan_request(task: GenerationTask) -> dict:
+    """What a plan job sends the planner: the chat (kuno_protocol.plans.plan_messages, with the plan/1 system prompt
+    filled in for this job) and the decoding settings, on the resident pipeline's prompt enhancer."""
+    from kuno_protocol.plans import PLAN_OPTION, PLAN_SAMPLING, PlanOptions, plan_context, plan_messages, suggested_shots
+
+    options = PlanOptions.model_validate(task.options.get(PLAN_OPTION) or {})
+    context = plan_context(task.profile, task.params, options)
+    limits = task.profile.limits.plan
+    count, length = suggested_shots(context)
+    return {
+        "runtime": f"diffusers (resident, {limits.planner if limits else 'prompt_enhancer'}.generate)",
+        "prompt_version": context.prompt_version,
+        "max_shot_s": context.max_shot_s,
+        "suggested_shots": count,
+        "suggested_shot_s": length,
+        "generate": {"max_new_tokens": limits.max_new_tokens if limits else None, "seed": task.seed, **PLAN_SAMPLING},
+        "messages": plan_messages(task.prompt, context, options),
+    }
+
+
 def storyboard_plan(task: GenerationTask) -> dict:
     """What the resident backend renders for a storyboard: every shot's call and how it joins, from LTX-2.5's geometry."""
     from .backends.ltx_resident import build_call
@@ -151,7 +174,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="kuno-plan", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("profile", choices=sorted(profiles))
     parser.add_argument("mode", choices=[m.value for m in Mode])
-    parser.add_argument("--duration", type=float, help="a storyboard's default shot length")
+    parser.add_argument("--duration", type=float, help="a storyboard's default shot length, or a plan's target length")
     parser.add_argument("--shots", type=parse_shots, help="storyboard shots, seconds:join comma-separated (5:fresh,5:continue)")
     parser.add_argument("--resolution")
     parser.add_argument("--aspect")
@@ -185,9 +208,11 @@ def main() -> None:
         task = build_task(profile, params, directory, seed=args.seed, prompt=args.prompt, negative_prompt=args.negative_prompt)
         for item in task.inputs:
             item.save(directory)
-        frames = task.num_frames
+        frames = 0 if mode is Mode.PLAN else task.num_frames  # a plan renders nothing
 
-        if mode is Mode.STORYBOARD:
+        if mode is Mode.PLAN:
+            payload = plan_request(task)
+        elif mode is Mode.STORYBOARD:
             payload = storyboard_plan(task)
         elif profile.family == FAMILY_H3:
             from .backends.h3 import build_sglang_request
@@ -228,6 +253,12 @@ def main() -> None:
                 f"{item['audio_pin_latents']}, trim {item['trim_frames']}, kept {item['kept_frames']} from frame {item['start_frame']}"
             )
             print(json.dumps(item["call"]))
+    elif "messages" in payload:
+        print(f"suggested {payload['suggested_shots']} shots of {payload['suggested_shot_s']:g} s, at most {payload['max_shot_s']:g} s each")
+        print("generate:", json.dumps(payload["generate"]))
+        for message in payload["messages"]:
+            print(f"--- {message['role']}")
+            print(message["content"])
     elif "argv" in payload:
         print(shlex.join(str(a) for a in payload["argv"]))
     elif "command" in payload:

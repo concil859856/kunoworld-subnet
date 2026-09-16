@@ -44,6 +44,9 @@ class Mode(str, Enum):
     AUDIO_TO_VIDEO = "audio_to_video"
     RETAKE = "retake"
     STORYBOARD = "storyboard"
+    # A storyboard plan written from a brief inside the enclave, delivered as sealed JSON instead of a video
+    # (kuno_protocol.plans; PROTOCOL.md "Plans (Director)").
+    PLAN = "plan"
 
 
 class InputRole(str, Enum):
@@ -72,6 +75,7 @@ MODE_ROLES: dict[Mode, tuple[frozenset[InputRole], frozenset[InputRole]]] = {
     Mode.AUDIO_TO_VIDEO: (frozenset({R.SOURCE_AUDIO}), frozenset({R.SOURCE_AUDIO, R.FIRST_FRAME, R.REFERENCE_IMAGE})),
     Mode.RETAKE: (frozenset({R.SOURCE_VIDEO}), frozenset({R.SOURCE_VIDEO})),
     Mode.STORYBOARD: (frozenset(), frozenset()),
+    Mode.PLAN: (frozenset(), frozenset()),
 }
 
 
@@ -105,6 +109,20 @@ class StoryboardLimits(BaseModel):
     overlap_latent_frames: int = 3
 
 
+class PlanLimits(BaseModel):
+    """What a profile's plan mode accepts (PROTOCOL.md "Plans (Director)"). A plan's shots also keep to `storyboard`."""
+
+    # The shortest stitched length a plan may target; `limits.storyboard.max_total_s` is the longest.
+    min_target_s: float
+    max_brief_chars: int = 4000
+    max_style_chars: int = 500
+    # The planner's output budget per generation: a 12-shot plan is about 1,000 tokens (research/director-design §10).
+    max_new_tokens: int = 2048
+    # The loaded component that writes plans, and the system prompt version (kuno_protocol/plan_prompts).
+    planner: str = "prompt_enhancer"
+    prompt_version: str = "plan/1"
+
+
 class Limits(BaseModel):
     min_duration_s: float
     max_duration_s: float
@@ -126,6 +144,8 @@ class Limits(BaseModel):
     max_duration_s_by_fps: dict[int, float] = Field(default_factory=dict)
     # Set where the profile offers storyboard mode.
     storyboard: StoryboardLimits | None = None
+    # Set where the profile offers plan mode, which also needs `storyboard`.
+    plan: PlanLimits | None = None
 
 
 class LicenseInfo(BaseModel):
@@ -157,6 +177,10 @@ class Pricing(BaseModel):
     long_clip: LongClip | None = None
     # fps -> a multiplier on the whole job.
     fps_multipliers: dict[int, float] = Field(default_factory=dict)
+    # A plan job's flat price in each mode: not per second, no multipliers, and not subject to `min_job_usd`. None: the
+    # profile doesn't sell plans in that mode.
+    plan_usd: float | None = None
+    standard_plan_usd: float | None = None
 
 
 class HardwareClass(BaseModel):
@@ -243,6 +267,8 @@ class VcuWeights(BaseModel):
     duration_base_s: float = 5.0
     # fps -> multiplier on the weight; 48 and 50 fps render twice the frames of 24 and 25. An fps not listed counts once.
     fps_multiplier: dict[int, float] = Field(default_factory=dict)
+    # A plan job's flat VCU, whatever its target length: it renders nothing, and its GPU time is the planner's.
+    plan: float | None = None
     note: str = ""
 
     @field_validator("per_output_second")
@@ -261,6 +287,13 @@ class VcuWeights(BaseModel):
         for fps, multiplier in value.items():
             if not math.isfinite(multiplier) or multiplier <= 0:
                 raise ValueError(f"{fps} fps: a VCU multiplier must be a finite, positive number")
+        return value
+
+    @field_validator("plan")
+    @classmethod
+    def _check_plan_weight(cls, value: float | None) -> float | None:
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError("a plan's VCU weight must be a finite, positive number")
         return value
 
     @field_validator("duration_slope", "duration_base_s")
@@ -322,7 +355,12 @@ class ModelProfile(BaseModel):
         `seconds` (the billable seconds, by default the requested duration). ParamError for a resolution without a weight.
 
         A storyboard is paid for what it renders: each shot at its own length and duration factor, overlaps included,
-        scaled by `seconds` / `duration_s` when fewer seconds are billable."""
+        scaled by `seconds` / `duration_s` when fewer seconds are billable. A plan pays the flat `vcu_weights.plan`: its
+        `duration_s` is a target for a video it doesn't render."""
+        if params.mode is Mode.PLAN:
+            if self.vcu_weights.plan is None:
+                raise ParamError(f"{self.name} has no VCU weight for plans")
+            return self.vcu_weights.plan
         if params.shots:
             rendered = sum(self.vcu_at(params.resolution, params.fps, shot.duration_s) for shot in params.shots)
             return rendered if seconds is None else rendered * seconds / params.duration_s
@@ -362,12 +400,18 @@ class ModelProfile(BaseModel):
 
     def price_usd(self, params: GenerationParams, privacy: str = "private") -> float:
         """Per-second rate x duration x the fps multiplier (and, in Private mode, the long-clip multiplier), never below
-        the profile's minimum charge."""
+        the profile's minimum charge. A plan costs the flat `plan_usd` (Private) or `standard_plan_usd`, whatever its
+        target length, with no multiplier and no minimum."""
         if privacy not in PRIVACY_MODES:
             raise ParamError(f"unknown privacy mode {privacy!r}")
         if not self.offers(privacy):
             raise PrivacyModeUnavailable(f"{self.name} is offered in Private mode only")
         pricing = self.pricing
+        if params.mode is Mode.PLAN:
+            flat = pricing.plan_usd if privacy == "private" else pricing.standard_plan_usd
+            if flat is None:
+                raise ParamError(f"{self.name} has no {privacy} price for plans")
+            return round(flat, 4)
         rates = pricing.usd_per_second if privacy == "private" else pricing.standard_usd_per_second
         rate = rates.get(params.resolution)
         if rate is None:
@@ -456,6 +500,8 @@ def validate_params(profile: ModelProfile, params: GenerationParams) -> None:
         _validate_storyboard(profile, params)
     elif params.shots is not None:
         raise ParamError("shots are only for storyboard mode")
+    elif params.mode is Mode.PLAN:
+        _validate_plan(profile, params)
     else:
         _validate_duration(lim, params.duration_s, params.fps, "duration")
     if params.audio and not lim.audio:
@@ -496,6 +542,17 @@ def _validate_storyboard(profile: ModelProfile, params: GenerationParams) -> Non
         raise ParamError(f"a storyboard's stitched video must be at most {board.max_total_s:g} seconds, these shots make {expected:.3f}")
     if abs(params.duration_s - expected) > 1e-6:
         raise ParamError(f"a storyboard's duration_s must be its stitched length, {expected!r} seconds")
+
+
+def _validate_plan(profile: ModelProfile, params: GenerationParams) -> None:
+    """A plan: `duration_s` is the stitched length to aim for, between `limits.plan.min_target_s` and the storyboard's
+    `max_total_s`. Its shots are what the enclave writes, so the params carry none; inputs are refused by MODE_ROLES."""
+    lim = profile.limits
+    if lim.plan is None or lim.storyboard is None:
+        raise ParamError(f"{profile.name} does not support plan")
+    low, high = lim.plan.min_target_s, lim.storyboard.max_total_s
+    if not (math.isfinite(params.duration_s) and low <= params.duration_s <= high):
+        raise ParamError(f"a plan's target duration must be between {low:g} and {high:g} seconds")
 
 
 def validate_roles(profile: ModelProfile, mode: Mode, roles: list[InputRole]) -> None:

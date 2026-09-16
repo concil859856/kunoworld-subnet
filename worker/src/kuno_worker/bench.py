@@ -109,9 +109,13 @@ def parse_cells(spec: str, profile: ModelProfile) -> list[Cell]:
 
 
 def bench_mode(profile: ModelProfile) -> Mode:
+    """A mode that renders one clip: text-to-video, else reference-to-video, else the first other rendering mode. Plans
+    render nothing and storyboards chain shots, so neither measures a cell."""
     if Mode.TEXT_TO_VIDEO in profile.modes:
         return Mode.TEXT_TO_VIDEO
-    return Mode.REFERENCE_TO_VIDEO if Mode.REFERENCE_TO_VIDEO in profile.modes else profile.modes[0]
+    if Mode.REFERENCE_TO_VIDEO in profile.modes:
+        return Mode.REFERENCE_TO_VIDEO
+    return next((mode for mode in profile.modes if mode not in (Mode.PLAN, Mode.STORYBOARD)), profile.modes[0])
 
 
 def fits(profile: ModelProfile, mode: Mode, cell: Cell) -> bool:

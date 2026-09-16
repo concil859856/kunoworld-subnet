@@ -86,7 +86,10 @@ class GenerationParams(BaseModel):
     @property
     def render_duration_s(self) -> float:
         """The longest single model call the job needs: its duration, or a storyboard's longest shot. Memory admission and
-        serving envelopes use this; price and billing use `duration_s`."""
+        serving envelopes use this; price and billing use `duration_s`. A plan renders nothing, so 0: any enclave that
+        serves its size and frame rate at all fits it (`envelope.fits`)."""
+        if self.mode is Mode.PLAN:
+            return 0.0
         return max(shot.duration_s for shot in self.shots) if self.shots else self.duration_s
 
 
@@ -211,6 +214,10 @@ class MinerRegistration(BaseModel):
     ratio -> fps -> the longest duration_s this hardware serves. Only profiles the hardware cannot
     serve in full are listed; None (older workers, and hardware that holds every profile) serves the
     profiles' full limits. Gateways from before it ignore the field.
+
+    `features` names the optional job kinds this worker serves beyond rendering, e.g. `["plan/1"]` for plan jobs
+    (kuno_protocol.plans.PLAN_FEATURE). Left out of the body when absent, so a registration without features is
+    byte-for-byte what it was before them; gateways route a plan only to an enclave that lists `plan/1`.
     """
 
     evidence: AttestationEvidence
@@ -220,6 +227,14 @@ class MinerRegistration(BaseModel):
     envelope: dict[str, dict[str, dict[str, dict[int, float]]]] | None = None
     # Signed landmark round trips for profiles whose licence is bound to territory (kuno_protocol.location).
     location: LocationProof | None = None
+    features: list[str] | None = Field(default=None, max_length=32)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_features(self, handler) -> dict[str, Any]:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("features") is None:
+            data.pop("features", None)
+        return data
 
 
 class RouteResponse(BaseModel):

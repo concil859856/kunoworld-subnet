@@ -13,11 +13,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from kuno_protocol.plans import PLAN_SAMPLING
 from kuno_protocol.profiles import InputRole, Mode, ModelProfile, ltx_num_frames, storyboard_frames
 from kuno_protocol.receipts import VideoInfo
 
 from ..verified import RetentionStore, context_bytes
-from .base import Backend, GenerationTask, ProgressFn, VideoResult
+from .base import Backend, GenerationTask, PlanText, ProgressFn, VideoResult
 from .media_tools import BackendError, encode_video
 from .resident import ModelStore, PipelineResult
 
@@ -124,6 +125,7 @@ class LtxResidentBackend(Backend):
     name = "ltx-2.5/resident"
     storyboards = True
     prompt_enhancement = True
+    plans = True
 
     def __init__(
         self,
@@ -243,6 +245,25 @@ class LtxResidentBackend(Backend):
                 return enhance(call)
         finally:
             shutil.rmtree(directory, ignore_errors=True)
+
+    def write_plan(self, task: GenerationTask, messages: list[dict[str, str]], *, seed: int, max_new_tokens: int) -> PlanText:
+        """The reply of the bundled prompt enhancer (Gemma-4-E2B) on whichever LTX-2.5 pipeline is loaded: every recipe
+        includes the same enhancer, so a plan never forces a reload (ModelStore.acquire_loaded). The enhancer is on the
+        GPU only while it writes (runtimes.LtxAdapter.enhancer), under the store's lock, so a plan never overlaps a
+        render. Measured 2026-09-16 on an RTX PRO 6000: 49-51 tokens/s, 7.6-18.6 s per plan, 0.12 GiB extra."""
+        self._pin(task.profile)  # before the first load, as generate does, if no warm-up loaded the weights
+        with self.store.acquire_loaded(task.profile) as loaded:
+            write = getattr(loaded, "write_text", None)
+            if not callable(write):
+                raise BackendError("the loaded LTX-2.5 runtime cannot write text")
+            text, tokens = write(messages, seed=seed, max_new_tokens=max_new_tokens, **PLAN_SAMPLING)
+            recipe = getattr(getattr(loaded, "load_plan", None), "recipe", None)
+        if recipe is None:
+            from .quantized import resolve_recipe
+
+            recipe, _ = resolve_recipe(task.profile, self.hardware_class)
+        component = task.profile.limits.plan.planner if task.profile.limits.plan is not None else "prompt_enhancer"
+        return PlanText(text=text, output_tokens=int(tokens), planner=f"{recipe.id}:{component}")
 
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
         if task.params.mode is Mode.STORYBOARD:

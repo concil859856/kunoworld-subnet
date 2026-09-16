@@ -69,6 +69,9 @@ class MemoryModel(BaseModel):
 
     peak(tokens) = weights on the GPU for the offload mode + activation_fixed_gib
                    + activation_gib_per_10k_tokens × tokens / 10 000 + overhead_gib
+
+    The prompt enhancer never runs inside a render, so without offload it waits in host RAM: a render's weights on the GPU
+    are every component but `prompt_enhancer`, and writing text (an enhanced prompt, a plan) peaks at all of them.
     """
 
     model_config = ConfigDict(extra="forbid")
