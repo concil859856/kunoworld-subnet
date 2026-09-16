@@ -53,6 +53,8 @@ kuno-worker = "kuno_worker.main:main"
 kuno-plan = "kuno_worker.plan:main"
 kuno-preflight = "kuno_worker.preflight:main"
 kuno-bench = "kuno_worker.bench:main"
+# Phase 0 (VERIFIED_MODE.md): the same cases twice, leaf by leaf, before a GPU class may earn in verified mode.
+kuno-verified-check = "kuno_worker.determinism:main"
 # Loads the safety classifiers from KUNO_SAFETY_* and runs each once on synthetic inputs (an image self-test).
 kuno-safety-check = "kuno_worker.safety_check:main"
 # The H3 image's entry point: MiniMax H3's SGLang servers and kuno-worker, supervised together.

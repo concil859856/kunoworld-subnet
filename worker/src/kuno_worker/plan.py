@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 from kuno_protocol.media import EXTENSIONS
-from kuno_protocol.profiles import FAMILY_H3, MODE_ROLES, InputRole, Mode, ModelProfile, load_profiles, validate_params
+from kuno_protocol.profiles import FAMILY_H3, InputRole, Mode, ModelProfile, example_roles, load_profiles, validate_params
 from kuno_protocol.schemas import GenerationParams, InputRef
 
 from .backends.base import GenerationTask, InputFile
@@ -34,13 +34,6 @@ ROLE_MIME = {
     InputRole.REFERENCE_AUDIO: "audio/wav",
     InputRole.SOURCE_AUDIO: "audio/wav",
 }
-
-
-def example_roles(mode: Mode) -> list[InputRole]:
-    required, allowed = MODE_ROLES[mode]
-    if required:
-        return sorted(required, key=lambda r: r.value)
-    return [InputRole.REFERENCE_IMAGE] if mode is Mode.REFERENCE_TO_VIDEO else []
 
 
 def example_task(

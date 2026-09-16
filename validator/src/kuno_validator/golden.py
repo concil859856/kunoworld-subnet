@@ -30,7 +30,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from kuno_protocol.canonical import canonical_json, sha256_hex
-from kuno_protocol.profiles import Mode, ModelProfile, load_profiles
+from kuno_protocol.profiles import Mode, ModelProfile, example_roles, load_profiles
 from kuno_protocol.schemas import GenerationParams
 from kuno_protocol.toy_denoiser import TOY_RUNTIME, toy_model_digest, toy_transcript
 from kuno_protocol.verified import StepTranscript
@@ -70,9 +70,12 @@ class GoldenSet(BaseModel):
 def default_cases(profile: ModelProfile, count: int = 3) -> list[GoldenCase]:
     resolution = next(iter(profile.limits.sizes))
     aspect = "16:9" if "16:9" in profile.limits.sizes[resolution] else next(iter(profile.limits.sizes[resolution]))
+    # h3-reference does not serve text-to-video, so a case that asked for it could never be rendered.
+    mode = Mode.TEXT_TO_VIDEO if Mode.TEXT_TO_VIDEO in profile.modes else next(iter(profile.modes))
     params = GenerationParams(
-        profile_id=profile.id, mode=Mode.TEXT_TO_VIDEO, duration_s=profile.limits.min_duration_s, resolution=resolution,
+        profile_id=profile.id, mode=mode, duration_s=profile.limits.min_duration_s, resolution=resolution,
         aspect_ratio=aspect, fps=profile.limits.default_fps, audio=profile.limits.audio,
+        input_roles=example_roles(mode),
     )
     return [
         GoldenCase(name=f"{profile.id}-{i}", profile_id=profile.id, params=params, prompt=FALLBACK_PROMPTS[i % len(FALLBACK_PROMPTS)], seed=1000 + i)
@@ -150,6 +153,43 @@ def compute_golden(
     )
 
 
+VERIFIED_CHECK_SCHEMA = "kuno-verified-check"
+
+
+def golden_from_run(document: dict, *, image_digest: str | None = None, repeat: int = 0) -> GoldenSet:
+    """A golden set from a `kuno-verified-check run` file: what the candidate image committed on real hardware.
+
+    Phase 0 step 3 publishes this after step 1 has shown two processes agree; the run file carries its cases, so
+    a later `check` runs exactly what the reference ran.
+    """
+    if document.get("schema") != VERIFIED_CHECK_SCHEMA:
+        raise ValueError(f"not a {VERIFIED_CHECK_SCHEMA} document")
+    runs = {r["name"]: r for r in document["runs"] if r.get("repeat", 0) == repeat}
+    failed = sorted(name for name, run in runs.items() if run.get("outcome") != "ok")
+    if failed:
+        raise ValueError(f"the run did not finish every case: {', '.join(failed)}")
+    entries = []
+    digests = set()
+    for case in document["cases"]:
+        run = runs.get(case["name"])
+        if run is None:
+            raise ValueError(f"case {case['name']} is missing from the run")
+        digests.add(run.get("model_digest") or "")
+        entries.append(GoldenEntry(case=GoldenCase.model_validate(case), leaf_digests=[leaf["latent"] for leaf in run["leaves"]]))
+    if len(digests) > 1:
+        raise ValueError("the cases ran against different weights")
+    return GoldenSet(
+        profile_id=document["profile_id"], runtime=document["runtime"], hardware_class=document["hardware_class"],
+        model_digest=next(iter(digests), ""), image_digest=image_digest, created_at=time.time(), entries=entries,
+    )
+
+
+def observed_from_run(document: dict, repeat: int = 0) -> dict[str, list[str]]:
+    """The {case name: leaf digests} mapping `check_observed` wants, from a run file."""
+    return {r["name"]: [leaf["latent"] for leaf in r.get("leaves") or []]
+            for r in document["runs"] if r.get("repeat", 0) == repeat}
+
+
 def compare_leaves(entry: GoldenEntry, observed: list[str]) -> str | None:
     if len(observed) != len(entry.leaf_digests):
         return f"{entry.case.name}: {len(observed)} leaves, golden has {len(entry.leaf_digests)} (steps skipped or added)"
@@ -193,9 +233,14 @@ def main(argv: list[str] | None = None) -> int:
     compute.add_argument("--image-digest")
     compute.add_argument("--cases", type=int, default=3)
     compute.add_argument("--out", type=Path, required=True)
+    adopt = sub.add_parser("adopt", help="turn a kuno-verified-check run into a golden set (Phase 0 step 3)")
+    adopt.add_argument("--run", type=Path, required=True, help="a kuno-verified-check run file from reference hardware")
+    adopt.add_argument("--image-digest")
+    adopt.add_argument("--out", type=Path, required=True)
     check = sub.add_parser("check", help="compare observed leaf digests with a golden set")
     check.add_argument("--golden", type=Path, required=True)
-    check.add_argument("--leaves", type=Path, required=True, help='JSON: {"case name": ["leaf digest", ...]}')
+    check.add_argument("--leaves", type=Path, help='JSON: {"case name": ["leaf digest", ...]}')
+    check.add_argument("--run", type=Path, help="a kuno-verified-check run file, instead of --leaves")
     args = parser.parse_args(argv)
 
     if args.command == "compute":
@@ -212,8 +257,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote {len(golden.entries)} golden case(s) for {profile.id} on {args.hardware_class} to {args.out}")
         return 0
 
+    if args.command == "adopt":
+        try:
+            golden = golden_from_run(json.loads(args.run.read_text()), image_digest=args.image_digest)
+        except ValueError as exc:
+            print(f"cannot adopt {args.run}: {exc}", file=sys.stderr)
+            return 2
+        args.out.write_text(golden.model_dump_json(indent=2))
+        print(f"wrote {len(golden.entries)} golden case(s) for {golden.profile_id} on {golden.hardware_class} to {args.out}")
+        return 0
+
+    if (args.leaves is None) == (args.run is None):
+        print("give exactly one of --leaves and --run", file=sys.stderr)
+        return 2
     golden = GoldenSet.model_validate_json(args.golden.read_text())
-    report = check_observed(golden, json.loads(args.leaves.read_text()))
+    observed = observed_from_run(json.loads(args.run.read_text())) if args.run else json.loads(args.leaves.read_text())
+    report = check_observed(golden, observed)
     for line in report.mismatches:
         print(line)
     print(f"{'PASS' if report.ok else 'FAIL'}: {report.checked} case(s), {len(report.mismatches)} mismatch(es)")

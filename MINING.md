@@ -153,6 +153,18 @@ The subnet owner turns bench files from several machines into VCU weights and ra
 `kuno-devkit derive-rates bench-*.json --gpu-price h200=3.20 …`. It prints a proposal and writes nothing
 unless you pass `--write-proposal`.
 
+On the same box, `kuno-verified-check` says whether your hardware class renders the same trajectory twice, which is
+what verified mode is judged against:
+
+```bash
+uv run kuno-verified-check run --profile ltx-2.5-fast --hardware-class C1.rtx-pro-6000-bw-se.x1 \
+    --models-dir /models/ltx-2.5 --out a.json
+uv run kuno-verified-check run --cases a.json --models-dir /models/ltx-2.5 --out b.json   # a second process
+uv run kuno-verified-check compare a.json b.json
+```
+
+A machine that fails this will fail audits on that class ([VERIFIED_MODE.md](VERIFIED_MODE.md#phase-0-before-enabling-a-gpu-class)).
+
 ## 3. First run on a dev network
 
 A rented GPU box usually has no TDX, so run the real models with a simulated TEE against

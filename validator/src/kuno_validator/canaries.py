@@ -9,16 +9,10 @@ from __future__ import annotations
 
 import random
 
-FALLBACK_PROMPTS = [
-    "A fishing boat returns to harbor at golden hour, gulls circling, gentle waves",
-    "Close-up of rain running down a café window, neon signs blurred behind it",
-    "A potter's hands shape wet clay on a spinning wheel, soft studio light",
-    "Aerial shot over autumn forest with a winding river, morning mist",
-    "A street musician plays violin under a stone archway, passersby slow down",
-    "Macro shot of a hummingbird hovering near red flowers, shallow depth of field",
-    "A night train crosses a snowy bridge, warm lights in the carriages",
-    "Chef plating a dessert with precise tweezers, overhead camera",
-]
+from kuno_protocol.prompts import NEUTRAL_PROMPTS
+
+# The worker's determinism check builds the same golden cases from the same list, so it lives in the protocol.
+FALLBACK_PROMPTS = NEUTRAL_PROMPTS
 
 
 def pick_prompt(rng: random.Random | None = None) -> str:

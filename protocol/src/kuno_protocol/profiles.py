@@ -72,6 +72,15 @@ MODE_ROLES: dict[Mode, tuple[frozenset[InputRole], frozenset[InputRole]]] = {
     Mode.RETAKE: (frozenset({R.SOURCE_VIDEO}), frozenset({R.SOURCE_VIDEO})),
 }
 
+
+def example_roles(mode: Mode) -> list[InputRole]:
+    """The inputs a mode is normally called with: everything it requires, or one reference image."""
+    required, _ = MODE_ROLES[mode]
+    if required:
+        return sorted(required, key=lambda r: r.value)
+    return [InputRole.REFERENCE_IMAGE] if mode is Mode.REFERENCE_TO_VIDEO else []
+
+
 VISUAL_ROLES = frozenset({R.FIRST_FRAME, R.LAST_FRAME, R.KEYFRAME, R.REFERENCE_IMAGE, R.REFERENCE_VIDEO, R.SOURCE_VIDEO})
 AUDIO_ROLES = frozenset({R.REFERENCE_AUDIO, R.SOURCE_AUDIO})
 

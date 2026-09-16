@@ -375,11 +375,25 @@ constant one; `step_thresholds` is the first step in that direction.
 ## Phase 0, before enabling a GPU class
 
 1. On the class's hardware, run a worker image in verified mode over the golden cases twice, in two
-   processes. The leaves must be identical; this establishes determinism.
+   processes. The leaves must be identical; this establishes determinism. `kuno-verified-check` in the
+   worker image does exactly this, and names the step where two runs diverge:
+
+   ```
+   kuno-verified-check run --profile ltx-2.5-fast --hardware-class C1.rtx-pro-6000-bw-se.x1 \
+       --models-dir /models/ltx-2.5 --out a.json
+   kuno-verified-check run --cases a.json --models-dir /models/ltx-2.5 --out b.json   # a second process
+   kuno-verified-check compare a.json b.json
+   ```
+
+   The second run takes its cases from the first run's file, so the two cannot drift. On a rented box
+   `KUNO_SMOKE_TASK=determinism scripts/gpu-test/ltx-smoke.sh` does all three and tars up the evidence.
 2. Replay every stage-0 step of those trajectories with the GPU executor on a second machine of the
    same class. Every step must match. This validates the hooks: packed-latent capture, audio
    capture, sigma handling, and the duplicate-sigma replay trick.
-3. Publish the golden set and the weights digest (`model_digest`) in the owner-signed manifest.
+3. Publish the golden set and the weights digest (`model_digest`) in the owner-signed manifest. A run
+   that passed step 1 becomes the golden set with
+   `python -m kuno_validator.golden adopt --run a.json --image-digest <the image> --out golden.json`,
+   and any later run is checked against it with `golden check --golden golden.json --run c.json`.
    For a quantized class, first run `worker/scripts/benchmark_ltx_quantized.py` on the card: it records
    load time, speed, peak memory against the recipe's estimate, and whether outputs repeat; then compute
    `kuno-devkit weights-digest` for `<profile>@<class>` and calibrate that variant (above).

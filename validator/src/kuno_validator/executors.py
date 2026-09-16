@@ -44,6 +44,8 @@ from kuno_protocol.verified import StepCommitment, StepTranscript, Tensor, expec
 from .audits import CanaryRecord, TranscriptMismatch
 
 # Must equal kuno_worker.backends.ltx_resident.DISTILLED_SIGMAS (tests/test_verified_audit_flow.py checks).
+# The worker's stage-0 sigmas (ltx_resident.DISTILLED_SIGMAS) plus the terminal 0.0 the scheduler appends: a replay is
+# checked against what the transcript recorded, which is scheduler.sigmas, not the shorter list passed to the call.
 LTX_DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 LTX_FULL_STEPS = 30
 
