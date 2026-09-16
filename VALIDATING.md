@@ -1,9 +1,11 @@
 # Running a KunoWorld validator
 
-Validators decide who gets paid. Each round a validator challenges every enclave with its
-own nonce and verifies the answer itself, sends canary jobs through the ordinary encrypted
-path, audits the receipt ledger against keys it checked itself, scores miners, and sets
-weights.
+Validators decide who gets paid. KunoWorld runs **one main validator**, which tests miners: each round it challenges
+every enclave with its own nonce, sends canary jobs through the ordinary encrypted path, and replays steps of those
+canaries. **Every other validator is an auditor** (the default role). An auditor sends no jobs. It verifies the
+attestation evidence the gateway publishes, with spot challenges of its own. It applies the main validator's signed
+findings, audits the receipt ledger against keys it checked itself, scores miners, sets weights, and measures how far
+those weights are from the main validator's. See [Validator roles](#validator-roles).
 
 No GPU is needed for attestation checks, canaries or scoring. GPUs become necessary later,
 for the step-replay audits that re-run one denoising step of a canary to catch a miner
@@ -18,7 +20,11 @@ uv pip install -e protocol -e validator
 uv pip install -e "validator[canary]"           # canary jobs use the public client SDK
 uv pip install -e "validator[chain]"            # bittensor, for setting weights
 
-KUNO_DATA_DIR=data kuno-validator once --canary ltx-2.5-fast --canary h3-turbo
+KUNO_DATA_DIR=data kuno-validator once --main-validator-hotkey <main validator hotkey>   # an auditor
+export KUNO_VALIDATOR_ROLE=auditor                 # or main (KunoWorld's own validator); default auditor
+export KUNO_MAIN_VALIDATOR_HOTKEY=<ss58>           # auditors: whose signed findings to apply; required to set weights
+export KUNO_SPOT_CHECK_RATE=0.1                    # auditors: share of enclaves challenged with our own nonce each round
+export KUNO_DIVERGENCE_WARNING=0.1                 # auditors: warn when this share of weight differs from the main validator's
 export KUNO_GATEWAY_URL=<gateway-url>             # default http://127.0.0.1:8080
 export KUNO_VALIDATOR_API_KEY=...                  # required; sent on every gateway call
 export KUNO_MANIFEST=/path/to/golden-manifest.json # required
@@ -33,7 +39,10 @@ export KUNO_COLLATERAL_MAX_STALE_S=8640            # how long a failed chain rea
 export KUNO_CHAIN_ENDPOINT=wss://...               # optional; defaults to the --network's public endpoint
 export KUNO_PAY_MODE=vcu                           # or usd: see USD-denominated pay (needs KUNO_RATE_CARD and --netuid)
 export KUNO_CAPACITY_MAX_GAP_S=8640                # capacity pay: longest gap between a GPU's verified checks; default 2 × --interval
-kuno-validator run --interval 4320 --netuid <netuid> \
+kuno-validator run --interval 4320 --netuid <netuid> --wallet-name <name> --wallet-hotkey <hotkey>
+
+# KunoWorld's main validator: tests miners and signs its findings with its wallet hotkey
+kuno-validator run --role main --interval 4320 --netuid <netuid> \
   --wallet-name <name> --wallet-hotkey <hotkey> --canary ltx-2.5-fast --standard-canary ltx-2.5-fast
 ```
 
@@ -74,7 +83,66 @@ kuno-validator once --netuid <netuid> --wallet-name <name> --wallet-hotkey <hotk
 It resolves scored hotkeys to UIDs, reports any that are not registered, and prints the
 vector it would submit.
 
+## Validator roles
+
+| | Main validator (`--role main`) | Auditor (`--role auditor`, the default) |
+|---|---|---|
+| Who runs it | KunoWorld | every other validator |
+| Attestation | challenges every active enclave with its own nonce | verifies the evidence the gateway publishes for every active enclave, and challenges a random `KUNO_SPOT_CHECK_RATE` share (default 10%) with its own nonce |
+| Canaries and step audits | sends them | sends none; applies the findings the main validator signed |
+| Ledger audit, scoring, weights | yes | yes, the same code over the same public ledger |
+| Publishes | a signed findings report each round | nothing |
+| Checks | miners | miners, and the main validator: logs how far its weights are from the main validator's |
+
+**Why two roles.** Testing miners costs GPU time and money. A canary is a real job, and a step replay needs a GPU. It
+also needs traffic that miners can't tell from customers'. One well-resourced validator can do that; a dozen
+independent ones would multiply the load on miners and still couldn't check every video. Confidential computing makes
+the rest cheap to check for anyone: attestation proves which image an enclave runs, and receipts are signed by keys that
+attestation binds. So auditors check those themselves and trust the main validator only for what it alone can see.
+
+**Published evidence.** The gateway replaces an enclave's published evidence and endorsements at every successful
+re-attestation. An auditor verifies them without trusting the gateway:
+- TDX quotes go through its own Intel DCAP and NVIDIA verifiers when it has them (production requires them), or else
+  the Intel collateral and NVIDIA tokens relayed next to the evidence ([PROTOCOL.md](PROTOCOL.md#endorsements-what-clients-check-tdx-evidence-with)).
+- Published evidence carries someone else's nonce, so on its own it shows only that the enclave was genuine within the
+  manifest's `max_evidence_age_s`.
+- The spot challenges catch a gateway serving evidence an enclave can no longer produce. An enclave that fails one, or
+  doesn't answer, is unattested for the round.
+
+**Findings.**
+- **What the main validator publishes.** At the end of each round it signs a report with its hotkey
+  (`kuno_protocol.findings`: `"kuno/v1/findings\n" + canonical_json(report)`, sr25519). The report lists every
+  attributable canary and step-audit failure in the window, with job, enclave and profile, plus its weights for the
+  round. It publishes the report through `POST /validator/v1/findings`.
+- **What the gateway does.** When `KUNO_MAIN_VALIDATOR_HOTKEY` is set there, it refuses reports that anyone else
+  signed. It keeps reports for 7 days and serves them at `GET /validator/v1/findings?since=`.
+- **What an auditor does.**
+  - It applies only findings from reports whose signature verifies against the `KUNO_MAIN_VALIDATOR_HOTKEY` *it* was
+    configured with, so a gateway can't forge, retarget or replay one into its scores.
+  - Each finding zeroes the miner exactly as the main validator's own canary policy does, and is logged with
+    `[main validator]`.
+  - Without a main validator hotkey, an auditor applies no findings and refuses to set live weights.
+- **Signing key.** The main validator signs with `KUNO_VALIDATOR_HOTKEY_SEED` (a 32-byte hex seed, or a file holding
+  one, for development networks), or else its wallet hotkey.
+
+**Divergence.** An auditor compares its weights with the ones in the newest report: the divergence is half the L1
+distance between the two normalized vectors, the share of weight that would have to move. Above
+`KUNO_DIVERGENCE_WARNING` (default 0.1) it logs a warning, and `run` prints it every round.
+
+Some divergence is normal: the ledger window moves between the two rounds, and a spot challenge can catch an enclave
+the main validator passed. Persistent divergence means one of them is wrong. Say so publicly, as in
+[Keeping validators honest with each other](#keeping-validators-honest-with-each-other).
+
+A gateway can withhold reports: an auditor would then pay a miner the main validator zeroed, and the divergence shows
+it.
+
+The report exposes the main validator's weights to registered validators before commit-reveal would. Auditors follow the
+main validator by design, so hiding them from auditors protects nothing this subnet relies on.
+
 ## What a round does
+
+The steps below are the main validator's. An auditor replaces step 1 with verifying published evidence plus spot
+challenges, and step 2 with the main validator's findings ([Validator roles](#validator-roles)).
 
 1. **Attestation.** Fetches every enclave from `/validator/v1/enclaves`, issues a fresh 32-byte
    nonce to each active one through `/validator/v1/challenges`, and verifies the answer locally:
@@ -608,9 +676,9 @@ Everything a validator uses is available to every registered validator, with its
 `/validator/v1/enclaves` carries the attestation evidence, `/validator/v1/ledger` carries the
 finished jobs and their receipts, and `/v1/switch` carries the owner-signed model switch.
 Receipts and switches are signed by keys the gateway does not hold, so two validators running
-this code over the same window should agree. Canary penalties are the exception: each validator
-runs its own canaries. If yours disagrees with the metagraph, recompute from the ledger and say
-so publicly rather than quietly adjusting.
+this code over the same window should agree. Canary and step-audit penalties come from the main validator's signed
+findings, which every auditor verifies against the same hotkey. If yours disagrees with the metagraph or with the main
+validator's published weights, recompute from the ledger and say so publicly rather than quietly adjusting.
 
 ## Turbo track (mechanism 1)
 

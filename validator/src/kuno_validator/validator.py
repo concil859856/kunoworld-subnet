@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import random
 import secrets
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
-from kuno_protocol.attestation import AttestationEvidence, AttestationPolicy, GoldenManifest, Verdict
+from kuno_protocol.attestation import AttestationEvidence, AttestationPolicy, GoldenManifest, Verdict, verify_endorsed_evidence
 from kuno_protocol.canonical import canonical_json, sha256_hex
+from kuno_protocol.findings import MAX_FINDINGS, Finding, FindingsReport, SignedFindings, sign_findings, verify_findings
+from kuno_protocol.hotkey import HotkeySigner
 from kuno_protocol.mp4 import Mp4Error, probe
 from kuno_protocol.profiles import Mode, ModelProfile, load_profiles
 from kuno_protocol.receipts import Receipt, verify_receipt
@@ -37,6 +42,25 @@ LEDGER_PAGE = 5000
 CANARY_RETENTION_S = 7 * 86400.0
 # How often a standard canary polls its job.
 STANDARD_CANARY_POLL_S = 2.0
+# Validator roles (VALIDATING.md, "Validator roles"): the main validator tests miners; auditors audit.
+Role = Literal["main", "auditor"]
+ROLES: tuple[str, ...] = ("main", "auditor")
+# The share of active enclaves an auditor challenges with its own nonce each round, on top of the published evidence.
+DEFAULT_SPOT_CHECK_RATE = 0.1
+# Above this share of weight moved, an auditor warns that its weights and the main validator's disagree.
+DEFAULT_DIVERGENCE_WARNING = 0.1
+
+
+def weight_divergence(mine: dict[str, float], theirs: dict[str, float]) -> float:
+    """Half the L1 distance between two normalized weight vectors: the share of weight that would have to move, 0..1."""
+    def unit(weights: dict[str, float]) -> dict[str, float]:
+        total = sum(w for w in weights.values() if w > 0)
+        return {k: w / total for k, w in weights.items() if w > 0} if total > 0 else {}
+
+    a, b = unit(mine), unit(theirs)
+    if not a and not b:
+        return 0.0
+    return 0.5 * sum(abs(a.get(k, 0.0) - b.get(k, 0.0)) for k in set(a) | set(b))
 
 
 class GatewayAuthError(RuntimeError):
@@ -78,7 +102,16 @@ class Validator:
         calibration: Calibration | None = None,
         pay: UsdPay | None = None,
         capacity: CapacityTracker | None = None,
+        role: Role = "main",
+        findings_signer: HotkeySigner | None = None,
+        main_validator_hotkey: str | None = None,
+        spot_check_rate: float = DEFAULT_SPOT_CHECK_RATE,
+        divergence_warning: float = DEFAULT_DIVERGENCE_WARNING,
     ):
+        if role not in ROLES:
+            raise ValueError(f"validator role must be one of {', '.join(ROLES)}, not {role!r}")
+        if not 0.0 <= spot_check_rate <= 1.0:
+            raise ValueError("the spot-check rate is a share of enclaves, between 0 and 1")
         if not api_key:
             raise ValueError("a validator API key is required: the gateway authenticates every validator read")
         self.gateway_url = gateway_url.rstrip("/")
@@ -120,6 +153,15 @@ class Validator:
         self.capacity = capacity or CapacityTracker()
         self.enclave_profiles: dict[str, list[str]] = {}
         self.last_capacity: CapacityCredit | None = None
+        # The main validator signs its findings with its hotkey; an auditor applies only findings its configured main
+        # validator signed, and compares its weights with the ones that validator published.
+        self.role: Role = role
+        self.findings_signer = findings_signer
+        self.main_validator_hotkey = main_validator_hotkey
+        self.spot_check_rate = spot_check_rate
+        self.divergence_warning = divergence_warning
+        self.last_divergence: float | None = None
+        self._main_weights: dict[str, float] | None = None
         self.state_path = state_path
         self._load_state()
         # Step audits of this validator's own canaries: open a random denoising step and replay it (VERIFIED_MODE.md).
@@ -210,14 +252,18 @@ class Validator:
 
     # ------------------------------------------------------------ attestation
 
-    def check_enclaves(self, timeout_s: float = 30.0) -> dict[str, Verdict]:
-        """Challenges every active enclave with our own nonce and verifies the answer ourselves."""
+    def _active_enclaves(self) -> list[dict]:
         # Turbo candidates are challenged by the Turbo track against their own manifest.
-        enclaves = [
+        return [
             e for e in self.enclaves()
             if e["status"] == "active" and not is_candidate_profile_list(list(e.get("profiles") or []))
         ]
-        self.enclave_profiles = {}
+
+    def check_enclaves(self, timeout_s: float = 30.0, enclaves: list[dict] | None = None) -> dict[str, Verdict]:
+        """Challenges every active enclave (or those given) with our own nonce and verifies the answer ourselves."""
+        if enclaves is None:
+            enclaves = self._active_enclaves()
+            self.enclave_profiles = {}
         pending: dict[str, tuple[dict, bytes]] = {}
         for enclave in enclaves:
             nonce = os.urandom(32)
@@ -239,12 +285,10 @@ class Validator:
                     if verdict.enclave_id != enclave["enclave_id"]:
                         verdict.ok = False
                         verdict.reasons.append("answered with different keys than the registered enclave")
-                    elif verdict.ok and verdict.tier:
-                        # Only our own verdicts decide an enclave's tier (rates, admission, the fraud rule).
-                        self.enclave_tiers[verdict.enclave_id] = verdict.tier
-                    if verdict.ok:
-                        # The profiles the evidence claimed and the manifest approved: capacity pay splits GPU-time by them.
-                        self.enclave_profiles[verdict.enclave_id] = list(evidence.profiles)
+                    else:
+                        # Only verdicts this validator reached decide an enclave's tier (rates, admission, the fraud
+                        # rule), and the profiles capacity pay splits GPU-time by.
+                        self._accept_verdict(enclave, evidence, verdict)
                     verdicts[enclave["enclave_id"]] = verdict
                     del pending[challenge_id]
                 elif answer["status"] == "expired":
@@ -254,6 +298,135 @@ class Validator:
         for challenge_id, (enclave, _) in pending.items():
             verdicts[enclave["enclave_id"]] = Verdict(False, enclave["enclave_id"], ["did not answer the challenge in time"])
         return verdicts
+
+    def published_verdicts(self, spot_timeout_s: float = 30.0) -> dict[str, Verdict]:
+        """An auditor's attestation check: every active enclave's published evidence, verified here, plus challenges
+        with our own nonce for a random `spot_check_rate` share of them.
+
+        Published evidence carries someone else's nonce, so on its own it proves only that the enclave was genuine
+        within the manifest's `max_evidence_age_s`, which the gateway keeps fresh by replacing it at every
+        re-attestation. The spot challenges are what catch a gateway serving evidence an enclave can no longer
+        produce. A TDX quote is checked with this validator's own DCAP and NVIDIA verifiers when it has them
+        (production requires them), else with the Intel and NVIDIA material relayed next to the evidence
+        (kuno_protocol.endorsements), so no step takes the gateway's word.
+        """
+        enclaves = self._active_enclaves()
+        self.enclave_profiles = {}
+        verdicts: dict[str, Verdict] = {}
+        for enclave in enclaves:
+            enclave_id = enclave["enclave_id"]
+            published = enclave.get("evidence")
+            if not published:
+                verdicts[enclave_id] = Verdict(False, enclave_id, ["the gateway publishes no evidence for this enclave"])
+                continue
+            try:
+                evidence = AttestationEvidence.model_validate(published)
+            except ValueError:
+                verdicts[enclave_id] = Verdict(False, enclave_id, ["the published evidence is malformed"])
+                continue
+            if evidence.tee == "tdx" and self.policy.quote_verifier is None:
+                verdict = verify_endorsed_evidence(evidence, self.manifest, enclave.get("endorsements"))
+            else:
+                extra = {"allow_open": True} if evidence.tee == "open" else {}
+                verdict = self.policy.verify(evidence, self.manifest, **extra)
+            self._accept_verdict(enclave, evidence, verdict)
+            verdicts[enclave_id] = verdict
+        spot = [e for e in enclaves if verdicts.get(e["enclave_id"]) is not None and verdicts[e["enclave_id"]].ok]
+        count = math.ceil(self.spot_check_rate * len(spot)) if spot else 0
+        if count:
+            chosen = random.SystemRandom().sample(spot, count)
+            answered = self.check_enclaves(spot_timeout_s, chosen)
+            for enclave in chosen:
+                enclave_id = enclave["enclave_id"]
+                # A challenge that expired unanswered leaves no verdict: for a spot check that is a failure.
+                verdict = answered.get(enclave_id) or Verdict(False, enclave_id, ["did not answer our spot challenge"])
+                if not verdict.ok:
+                    log.warning("enclave %s passed on its published evidence but failed our spot challenge: %s",
+                                enclave_id, "; ".join(verdict.reasons))
+                    self.enclave_profiles.pop(enclave_id, None)
+                verdicts[enclave_id] = verdict
+        return verdicts
+
+    def _accept_verdict(self, enclave: dict, evidence: AttestationEvidence, verdict: Verdict) -> None:
+        if verdict.enclave_id != enclave["enclave_id"]:
+            verdict.ok = False
+            verdict.reasons.append("the evidence names different keys than the registered enclave")
+        elif verdict.ok and verdict.tier:
+            self.enclave_tiers[verdict.enclave_id] = verdict.tier
+        if verdict.ok:
+            self.enclave_profiles[verdict.enclave_id] = list(evidence.profiles)
+
+    # ------------------------------------------------------------ findings (main validator -> auditors)
+
+    def findings(self, now: float, window_s: float) -> list[Finding]:
+        """The main validator's attributable failures in the window: its canaries and its step audits."""
+        out = [
+            Finding(kind="canary_failed", miner_hotkey=r.miner_hotkey, detail=r.detail[:500], at=r.at, job_id=r.job_id,
+                    enclave_id=r.enclave_id, profile_id=r.profile_id)
+            for r in self.canary_results
+            if not r.ok and r.attributable and r.miner_hotkey and r.at >= now - window_s
+        ]
+        out += [
+            Finding(kind="audit_failed", miner_hotkey=o.miner_hotkey, detail=o.detail[:500], at=o.at, job_id=o.job_id,
+                    enclave_id=o.enclave_id, profile_id=o.profile_id)
+            for o in self.auditor.outcomes
+            if not o.ok and o.attributable and o.miner_hotkey and o.at >= now - window_s
+        ]
+        return sorted(out, key=lambda f: f.at, reverse=True)[:MAX_FINDINGS]
+
+    def publish_findings(self, weights: dict[str, float], now: float, window_s: float) -> bool:
+        """Signs this round's findings and weights with the main validator's hotkey and hands them to the gateway."""
+        if self.findings_signer is None:
+            log.error("no hotkey to sign findings with: auditors can't see this validator's canary and audit failures")
+            return False
+        report = FindingsReport(
+            validator_hotkey=self.findings_signer.ss58_address, issued_at=now, window_s=window_s,
+            findings=self.findings(now, window_s), weights={k: round(v, 9) for k, v in weights.items()},
+        )
+        response = self._request("POST", "/validator/v1/findings", json=sign_findings(self.findings_signer, report).model_dump(mode="json"))
+        if response.status_code not in (200, 201):
+            log.error("the gateway refused this round's findings (%d): %s", response.status_code, response.text[:200])
+            return False
+        return True
+
+    def main_validator_findings(self, now: float, window_s: float) -> dict[str, list[str]]:
+        """An auditor's penalties from the main validator: findings in the window from reports its hotkey signed.
+
+        Also keeps the weights of the newest verified report, which `step` compares with this validator's own."""
+        if self.main_validator_hotkey is None:
+            log.error("no main validator hotkey configured: this auditor applies none of its canary or audit findings")
+            return {}
+        response = self._request("GET", "/validator/v1/findings", params={"since": now - window_s})
+        if response.status_code != 200:
+            log.error("could not read the main validator's findings (%d); scoring without them", response.status_code)
+            return {}
+        penalties: dict[str, list[str]] = {}
+        seen: set[tuple[str, str | None, str]] = set()
+        newest: FindingsReport | None = None
+        for document in response.json():
+            try:
+                signed = SignedFindings.model_validate(document)
+            except ValueError:
+                log.warning("skipping a malformed findings report from the gateway")
+                continue
+            ok, detail = verify_findings(signed, self.main_validator_hotkey)
+            if not ok:
+                log.warning("skipping a findings report: %s", detail)
+                continue
+            report = signed.report
+            if newest is None or report.issued_at > newest.issued_at:
+                newest = report
+            for finding in report.findings:
+                key = (finding.kind, finding.job_id, finding.miner_hotkey)
+                if finding.at < now - window_s or key in seen:
+                    continue
+                seen.add(key)
+                noun = "canary" if finding.kind == "canary_failed" else "step audit of"
+                penalties.setdefault(finding.miner_hotkey, []).append(
+                    f"failed {noun} {finding.profile_id or 'a job'} ({finding.detail}) [main validator]"
+                )
+        self._main_weights = dict(newest.weights) if newest is not None and newest.weights is not None else None
+        return penalties
 
     def attested_hotkeys(self, verdicts: dict[str, Verdict]) -> set[str]:
         return {self._hotkeys[eid] for eid, v in verdicts.items() if v.ok and self._hotkeys.get(eid)}
@@ -519,7 +692,9 @@ class Validator:
 
     # ------------------------------------------------------------ scoring
 
-    def score(self, verdicts: dict[str, Verdict], window_s: float = 86400.0) -> dict[str, MinerScore]:
+    def score(
+        self, verdicts: dict[str, Verdict], window_s: float = 86400.0, extra_penalties: dict[str, list[str]] | None = None
+    ) -> dict[str, MinerScore]:
         now = time.time()
         enclaves = self.enclaves()
         rows = self.ledger(now - window_s)
@@ -543,6 +718,8 @@ class Validator:
         for hotkey, reasons in self.canary_penalties(now, window_s).items():
             penalties.setdefault(hotkey, []).extend(reasons)
         for hotkey, reasons in self.auditor.penalties(now, window_s).items():
+            penalties.setdefault(hotkey, []).extend(reasons)
+        for hotkey, reasons in (extra_penalties or {}).items():
             penalties.setdefault(hotkey, []).extend(reasons)
         attested = self.attested_hotkeys(verdicts)
         self.record_hardware(verdicts, now, window_s)
@@ -568,18 +745,45 @@ class Validator:
             penalties=penalties, flags=flags, tier_rates=self.tier_policy.rates(), capacity=self.last_capacity,
         )
 
-    def step(self, canary_profiles: list[str] | None = None, standard_canary_profiles: list[str] | None = None) -> dict[str, float]:
-        verdicts = self.check_enclaves()
+    def step(
+        self, canary_profiles: list[str] | None = None, standard_canary_profiles: list[str] | None = None,
+        window_s: float = 86400.0,
+    ) -> dict[str, float]:
+        """One serving round. The main validator challenges, sends canaries, audits, scores and publishes its findings;
+        an auditor verifies published evidence with spot challenges, applies the main validator's signed findings,
+        scores, and measures how far its weights are from the main validator's."""
+        extra_penalties: dict[str, list[str]] | None = None
+        if self.role == "auditor":
+            if canary_profiles or standard_canary_profiles:
+                log.warning("auditor validators send no canaries; ignoring the canary profiles given")
+            verdicts = self.published_verdicts()
+            extra_penalties = self.main_validator_findings(time.time(), window_s)
+        else:
+            verdicts = self.check_enclaves()
         for eid, verdict in verdicts.items():
             if not verdict.ok:
                 log.warning("enclave %s failed attestation: %s", eid, "; ".join(verdict.reasons))
-        canaries = [(p, "private") for p in canary_profiles or []] + [(p, "standard") for p in standard_canary_profiles or []]
-        for profile_id, privacy in canaries:
-            outcome = self.run_canary(profile_id, privacy)
-            level = logging.INFO if outcome.ok else logging.WARNING
-            log.log(level, "%s canary %s on %s: %s", privacy, profile_id, outcome.miner_hotkey or "unknown miner", outcome.detail)
-        self.run_audits()
-        scores = self.score(verdicts)
+        if self.role == "main":
+            canaries = [(p, "private") for p in canary_profiles or []] + [(p, "standard") for p in standard_canary_profiles or []]
+            for profile_id, privacy in canaries:
+                outcome = self.run_canary(profile_id, privacy)
+                level = logging.INFO if outcome.ok else logging.WARNING
+                log.log(level, "%s canary %s on %s: %s", privacy, profile_id, outcome.miner_hotkey or "unknown miner", outcome.detail)
+            self.run_audits()
+        scores = self.score(verdicts, window_s, extra_penalties)
+        weights = self._weights(scores)
+        now = self._scored[0] if self._scored is not None else time.time()
+        if self.role == "main":
+            self.publish_findings(weights, now, window_s)
+        elif self._main_weights is not None:
+            self.last_divergence = weight_divergence(weights, self._main_weights)
+            level = logging.WARNING if self.last_divergence > self.divergence_warning else logging.INFO
+            log.log(level, "weights differ from the main validator's by %.1f%% of total weight", 100 * self.last_divergence)
+        else:
+            self.last_divergence = None
+        return weights
+
+    def _weights(self, scores: dict[str, MinerScore]) -> dict[str, float]:
         for miner in scores.values():
             log.info(
                 "miner %s: score=%.4f ok=%d failed=%d %s%s",
@@ -595,7 +799,7 @@ class Validator:
             )
         if self.pay is not None and self.pay.policy.usd and self._scored is not None:
             # USD-denominated pay: the same gates, with work priced by the owner-signed rate card. PayUnavailable
-            # propagates, so the caller leaves the previous weights in place.
+            # propagates, so the caller leaves the previous weights in place (and publishes no findings).
             now, window_s, switch = self._scored
             entries = self.last_audit.entries if self.last_audit is not None else []
             try:

@@ -60,13 +60,20 @@ KUNO_DATA_DIR=data uv run kuno-worker --profiles ltx-2.5-fast,h3-turbo
 Production is meant to run inside the published CVM image with `KUNO_TEE=tdx` and
 `KUNO_BACKEND=real`: the official SGLang server for H3 and resident pipelines for LTX-2.5. The two
 worker images that package them, LTX-2.5 and MiniMax H3 with SGLang, are built from
-`image/worker.Dockerfile` ([MINING.md](MINING.md#3c-worker-images)). None of it has run on GPUs yet. `KUNO_TEE=tdx` collects NVIDIA GPU evidence through `nvattest` or
+`image/worker.Dockerfile` ([MINING.md](MINING.md#3c-worker-images)). Both have run on rented GPUs without confidential
+computing (September 2026: LTX-2.5 Fast and Pro on an RTX PRO 6000, H3 and H3 Director on 4× H200), never inside a
+confidential VM. `KUNO_TEE=tdx` collects NVIDIA GPU evidence through `nvattest` or
 NVML, and `kuno_protocol` has TDX (DCAP) and NVIDIA verifiers, but neither has run against real
 TDX + NVIDIA CC hardware, and the CVM image and its golden measurements are not released.
 
 ## For validators
 
-Each round the validator:
+KunoWorld runs one **main validator** that tests miners with challenges, canary jobs and step audits, and signs its
+findings each round. Every other validator is an **auditor** (the default): it sends no jobs, verifies the published
+attestation evidence itself with spot challenges, applies the main validator's signed findings, and flags weights that
+diverge from the main validator's ([VALIDATING.md](VALIDATING.md#validator-roles)).
+
+Each round the main validator:
 1. challenges every active enclave with its own nonce and verifies the answer itself;
 2. sends canary jobs through the normal encrypted path (indistinguishable from customer jobs)
    and checks that the requested model served them and the output matches the request;
@@ -78,8 +85,9 @@ Each round the validator:
    subnet's TAO emission share).
 
 ```bash
-KUNO_DATA_DIR=data uv run kuno-validator once --canary h3-turbo --canary ltx-2.5-fast
-uv run --package kuno-validator --extra chain kuno-validator run --netuid <netuid> --wallet-name <name> --wallet-hotkey <hotkey>
+KUNO_DATA_DIR=data uv run kuno-validator once --role main --canary h3-turbo --canary ltx-2.5-fast   # KunoWorld's main validator
+uv run --package kuno-validator --extra chain kuno-validator run --netuid <netuid> --wallet-name <name> --wallet-hotkey <hotkey> \
+  --main-validator-hotkey <main validator hotkey>                                                   # an auditor
 ```
 
 Validators must send H3 canaries from a region where the H3 license applies.

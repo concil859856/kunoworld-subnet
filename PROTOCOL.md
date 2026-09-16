@@ -269,6 +269,24 @@ TDX evidence without endorsements is refused by clients, not half-checked. Imple
 (Python), `verifyEvidence` with `endorsements` (JavaScript). `sdk/js/test/endorsement_vectors.json` holds cases both
 must decide identically.
 
+## Validator findings
+
+The main validator signs a report of the miners it caught each round, so auditor validators can apply those penalties
+without trusting the gateway that relays them (`kuno_protocol.findings`, [VALIDATING.md](VALIDATING.md#validator-roles)):
+
+```
+report  = {"v": 1, "validator_hotkey": ss58, "issued_at": float, "window_s": float,
+           "findings": [{"kind": "canary_failed" | "audit_failed", "miner_hotkey", "detail" (<= 500 chars), "at",
+                         "job_id"?, "enclave_id"?, "profile_id"?}, ... <= 1000],
+           "weights": {hotkey: normalized weight} | null}
+message = "kuno/v1/findings\n" | canonical_json(report)
+signed  = {"report": report, "signature": b64url(sr25519_sign(validator hotkey, message))}
+```
+
+A signature over `"<Bytes>" | message | "</Bytes>"` is accepted too, as with hotkey proofs. The report verifies only
+against the hotkey the verifier was configured with as the main validator; the hotkey the report names must be that
+one. Gateways relay reports at `POST` / `GET /validator/v1/findings`.
+
 ## Golden manifest
 
 The owner signs `"kuno/v1/manifest\n" + canonical_json(GoldenManifest)` with Ed25519 and publishes
