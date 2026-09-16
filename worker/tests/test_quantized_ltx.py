@@ -128,11 +128,24 @@ def test_consumer_classes_plan_offload_and_refuse_what_does_not_fit(tmp_path):
     assert plan_for_class(FAST, RTX4090, host_ram_gib=128).max_tokens < plan.max_tokens
 
 
-def test_classes_that_hold_the_whole_pipeline_keep_running_without_offload():
-    assert plan_for_class(FAST, "O1.h100-80gb.x1", host_ram_gib=512) is None
-    assert plan_for_class(FAST, "C1.rtx-pro-6000-bw-se.x1", host_ram_gib=512) is None  # confidential: no vram_gb
+def test_cards_that_hold_every_weight_keep_them_on_the_gpu_with_a_measured_token_cap():
+    # RTX PRO 6000, 2026-09-16: 720p 12 s (32,560 tokens) peaked at 93.68 GiB allocated; 14 s ran out of memory. The cap
+    # keeps the planner's 1.5 GiB overhead and 0.5 GiB reserve on top, so it serves 11 s.
+    for cls in ("C1.rtx-pro-6000-bw-se.x1", None, "O1.rtx-pro-6000-bw-96gb.x1"):
+        plan = plan_for_class(FAST, cls, host_ram_gib=512, device_gib=94.97)
+        assert plan is not None and plan.offload == "none" and plan.measured
+        assert latent_tokens(1280, 704, 265) <= plan.max_tokens < latent_tokens(1280, 704, 289)  # 11 s fits, 12 s doesn't
+    # Without a device reading, a class that declares no VRAM has nothing to plan against (CPU tests, the mock network).
+    assert plan_for_class(FAST, "C1.rtx-pro-6000-bw-se.x1", host_ram_gib=512) is None
     assert plan_for_class(FAST, None, host_ram_gib=512) is None
+    # A "96 GB" class is planned on what the card reports.
+    assert plan_for_class(FAST, "O1.rtx-pro-6000-bw-96gb.x1", host_ram_gib=512).max_tokens > plan.max_tokens
+    # 80 GB can't hold the weights and the measured activations together, so an H100 offloads.
+    assert plan_for_class(FAST, "O1.h100-80gb.x1", host_ram_gib=512).offload == "group"
     assert plan_for_class(FAST, "O1.h100-80gb.x1", host_ram_gib=512, mode="model").offload == "model"
+    # An H200 fits almost the whole profile without offload; its cap only reaches 1080p 21:9 past 18 s.
+    h200 = plan_for_class(FAST, "C2.h200-141gb.x1", host_ram_gib=512, device_gib=139.8)
+    assert h200.offload == "none" and h200.max_tokens >= latent_tokens(1920, 1088, 481)
 
 
 def test_host_ram_card_size_and_bad_modes_are_explained():

@@ -63,8 +63,11 @@ COPY --from=build /opt/kuno /opt/kuno
 COPY --from=safety-models /opt/kuno-safety /opt/kuno-safety
 # HOME is the writable scratch runtime caches go to, whatever uid the container runs as: kuno-app runs uid 0
 # on a read-only root with a tmpfs at /var/lib/kuno. A worker refuses to start without both classifiers.
+# expandable_segments: without it, a 12 s 720p LTX-2.5 clip on a 96 GB RTX PRO 6000 ran out of memory with 3.8 GiB reserved
+# but unused (fragmentation); with it the clip fit (2026-09-16). The worker's memory plan assumes it.
 ENV PATH=/opt/kuno/bin:$PATH \
     HOME=/var/lib/kuno \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HUB_OFFLINE=1 \
@@ -133,8 +136,10 @@ RUN set -e; cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
 # SGLang and diffusers both resolve offline. kuno-h3-worker refuses profiles that would load H3 twice on one worker's
 # GPUs (h3, h3-reference and h3-turbo each have their own server), so the default is one profile, and one that needs
 # nothing else mounted: h3-turbo also needs KUNO_H3_TURBO_LORA. image/CVM.md §6 gives each GPU group its own profiles.
+# PYTORCH_CUDA_ALLOC_CONF is cleared: the LTX image's allocator setting has not been measured with SGLang's H3 servers.
 ENV KUNO_PROFILES=h3 \
     KUNO_SGLANG_BIN=/opt/sglang/bin/sglang \
-    HF_HUB_CACHE=/models/h3
+    HF_HUB_CACHE=/models/h3 \
+    PYTORCH_CUDA_ALLOC_CONF=""
 USER kuno
 ENTRYPOINT ["kuno-h3-worker"]

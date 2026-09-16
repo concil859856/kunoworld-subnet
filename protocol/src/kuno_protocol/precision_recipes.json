@@ -18,11 +18,11 @@
       "memory": {
         "components_gib": {"transformer": 39.13, "text_encoder": 22.4, "prompt_enhancer": 8.0, "other": 2.64},
         "group_onload_gib": 1.7,
-        "activation_fixed_gib": 2.0,
-        "activation_gib_per_10k_tokens": 1.6,
+        "activation_fixed_gib": 9.55,
+        "activation_gib_per_10k_tokens": 3.674,
         "overhead_gib": 1.5,
-        "measured": false,
-        "basis": "transformer: ltx-2.5-22b-distilled-transformer-bf16.safetensors is 42,018,190,584 bytes (HF tree); text encoder: 12B parameters x 2 bytes; other: 22.67 - 20.03 GiB (runaihome, 4090); activations fitted to 'int8-convrot maxes out around 10 s at 720p, 15 s OOM' on a 5090 (note.com); prompt enhancer: unknown, 8 GiB assumed"
+        "measured": true,
+        "basis": "activations measured 2026-09-16 on an RTX PRO 6000 Blackwell Server Edition (94.97 GiB), bf16, no offload, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: torch peak allocated 86.89 GiB at 14,080 full-size latent tokens (720p 5 s) and 93.68 GiB at 32,560 (720p 12 s); 720p at 14, 15, 16 and 20 s ran out of memory. The line through the two peaks sets the per-token and fixed terms, and overestimates a 3 s clip by 2.3 GiB. Weights: transformer ltx-2.5-22b-distilled-transformer-bf16.safetensors is 42,018,190,584 bytes (HF tree); text encoder: 12B parameters x 2 bytes; other: 22.67 - 20.03 GiB (runaihome, 4090); prompt enhancer: 8 GiB assumed"
       },
       "sources": [
         "https://huggingface.co/Lightricks/LTX-2.5",
@@ -106,11 +106,11 @@
       "memory": {
         "components_gib": {"transformer": 20.03, "text_encoder": 22.4, "prompt_enhancer": 8.0, "other": 2.64},
         "group_onload_gib": 1.0,
-        "activation_fixed_gib": 2.0,
-        "activation_gib_per_10k_tokens": 1.6,
+        "activation_fixed_gib": 9.55,
+        "activation_gib_per_10k_tokens": 3.674,
         "overhead_gib": 1.5,
         "measured": false,
-        "basis": "transformer assumed equal to the 8-bit int8-convrot build's measured 20.03 GiB resident (runaihome); SGLang documents 18.11 GB for its FP8 LTX-2.5 transformer. Text encoder stays bf16 and is offloaded while the transformer runs."
+        "basis": "transformer assumed equal to the 8-bit int8-convrot build's measured 20.03 GiB resident (runaihome); SGLang documents 18.11 GB for its FP8 LTX-2.5 transformer. Text encoder stays bf16 and is offloaded while the transformer runs.; activation terms from the bf16 recipe's 2026-09-16 RTX PRO 6000 measurement (activations run in bf16 whatever the weights' storage), not measured on this class"
       },
       "sources": [
         "https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-core/src/ltx_core/quantization",
@@ -148,11 +148,11 @@
       "memory": {
         "components_gib": {"transformer": 20.35, "text_encoder": 11.4, "prompt_enhancer": 8.0, "other": 2.64},
         "group_onload_gib": 1.0,
-        "activation_fixed_gib": 2.0,
-        "activation_gib_per_10k_tokens": 1.6,
+        "activation_fixed_gib": 9.55,
+        "activation_gib_per_10k_tokens": 3.674,
         "overhead_gib": 1.5,
         "measured": false,
-        "basis": "int8 weights + one bf16 scale per 128 weights (x 1.016) over the 20.03 GiB 8-bit transformer; text encoder 12B x 1 byte. Lightricks' comfy-int8-convrot file is ComfyUI-only, so this class quantizes the bf16 checkpoint with torchao at load."
+        "basis": "int8 weights + one bf16 scale per 128 weights (x 1.016) over the 20.03 GiB 8-bit transformer; text encoder 12B x 1 byte. Lightricks' comfy-int8-convrot file is ComfyUI-only, so this class quantizes the bf16 checkpoint with torchao at load.; activation terms from the bf16 recipe's 2026-09-16 RTX PRO 6000 measurement (activations run in bf16 whatever the weights' storage), not measured on this class"
       },
       "sources": [
         "https://huggingface.co/docs/diffusers/main/en/quantization/torchao",

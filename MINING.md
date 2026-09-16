@@ -472,17 +472,30 @@ The resident backend (`KUNO_BACKEND=real`) loads LTX-2.5 in the precision your c
 | Weights (estimated) | transformer ≈ 20 GiB, text encoder 22.4 GiB, prompt enhancer ≈ 8 GiB, VAEs/vocoder/upsampler ≈ 2.6 GiB | transformer ≈ 20.4 GiB, text encoder 11.4 GiB, the rest as on the 5090 |
 | Offload (`KUNO_LTX_OFFLOAD=auto`) | `group`: transformer and text encoder streamed a block at a time from pinned host memory | `group` |
 | Host RAM | ≥ 61 GiB | ≥ 50 GiB |
-| Longest 720p 16:9 request | 20 s at 24 fps, 20 s at 50 fps | 20 s at 24 fps, 18 s at 50 fps |
-| Longest 1080p 16:9 request | 20 s at 24 fps, 11 s at 50 fps | 16 s at 24 fps, 7 s at 50 fps |
-| Longest 1080p 21:9 request | 18 s at 24 fps, 8 s at 50 fps | 12 s at 24 fps, 5 s at 50 fps |
+| Longest 720p 16:9 request | 16 s at 24 fps, 8 s at 50 fps | 8 s at 24 fps, 4 s at 50 fps |
+| Longest 1080p 16:9 request | 7 s at 24 fps, 3 s at 50 fps | 3 s at 24 fps, none at 50 fps |
+| Longest 1080p 21:9 request | 5 s at 24 fps, 2 s at 50 fps | 2 s at 24 fps, none at 50 fps |
 | Speed | **unmeasured** | **unmeasured** |
 
-**These sizes are estimates, not measurements.** They come from a linear memory model fitted to two
-community reports, both with the ComfyUI int8-convrot build: 20.03 GiB resident on a 4090, and about
-10 s of 720p before running out of memory on a 5090. No KunoWorld code has run on either card. `auto`
-picks the offload mode that serves the most requests, which on these cards is `group`.
-`KUNO_LTX_OFFLOAD=model` keeps the transformer on the GPU and is faster, but on a 5090 it fits only about
-12 s of 720p at 24 fps (5 s at 50 fps), and on a 4090 nothing at all.
+**These sizes are estimates, not measurements on these cards.**
+- **Weights** come from two community reports, both with the ComfyUI int8-convrot build: 20.03 GiB resident on a
+  4090, and about 10 s of 720p before running out of memory on a 5090.
+- **Activations** use the bf16 pipeline's measurement on an RTX PRO 6000 (2026-09-16): 86.9 GiB at 720p 5 s and
+  93.7 GiB at 12 s. Activations run in bf16 whatever the weights' storage. Those figures replaced an estimate less
+  than half as large, which is why these limits shrank.
+- No KunoWorld code has run on either card.
+- `auto` picks the offload mode that serves the most requests, which on these cards is `group`.
+  `KUNO_LTX_OFFLOAD=model` keeps the transformer on the GPU and would be faster, but it fits nothing on either card.
+
+**The bf16 cards.** A card that holds every weight keeps them all on the GPU (no offload) and serves what the
+activations leave room for.
+- **RTX PRO 6000 (96 GB, 94.97 GiB usable).** 720p up to 11 s at 24 fps (5 s at 50 fps), and 1080p 16:9 up to 4 s.
+  - **Measured:** 12 s of 720p fit with 1.3 GiB to spare; 14, 15, 16 and 20 s ran out of memory.
+  - **Offload:** `model` would fit 20 s, but made every 5 s shot three times slower (41-44 s against 13.9 s).
+  - **Longer clips** go to larger cards, and storyboards chain shots of these lengths.
+- **H200 (141 GB).** Everything at 720p and 1080p 16:9. 1080p 21:9 up to 18 s at 24 fps (estimated).
+- **The image sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.** Without it, 12 s ran out of memory with
+  3.8 GiB reserved but unused.
 
 Why not the checkpoints Lightricks ships:
 - **No FP8 file for LTX-2.5.** Lightricks publishes FP8 checkpoints only for LTX-2 and LTX-2.3, so the
@@ -512,13 +525,14 @@ refusal below uses, so the two always agree. Every registration carries the enve
 your class can't serve in full ([PROTOCOL.md](PROTOCOL.md#serving-envelope)), for example on a 5090:
 
 ```json
-{"ltx-2.5-fast": {"1080p": {"16:9": {"24": 20, "50": 10}, "21:9": {"24": 18, "50": 8}}, "720p": {"...": {}}}}
+{"ltx-2.5-fast": {"1080p": {"16:9": {"24": 7, "50": 3}, "21:9": {"24": 5, "50": 2}}, "720p": {"...": {}}}}
 ```
 
 The gateway sends you only jobs inside it. It picks standard jobs' workers by their parameters.
 Private clients get a filtered `/v1/route`, and the gateway refuses to admit a private job sealed to
-you that doesn't fit (`409 envelope_exceeded`). A card with the whole bf16 pipeline (80 GB and up)
-advertises nothing, which means its profiles' full limits.
+you that doesn't fit (`409 envelope_exceeded`). A card whose plan fits every request of a profile advertises nothing
+for it, which means the profile's full limits; the envelope comes from the class's VRAM or, for classes that declare
+none (the confidential ones), the GPU's own memory.
 
 **What a refusal costs.** A job the plan cannot fit fails at once with `capacity_refused`, before its
 inputs are downloaded or decrypted, naming the longest duration the class serves at that size and

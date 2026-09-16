@@ -238,15 +238,35 @@ def host_memory_gib() -> float | None:
         return None
 
 
-def plan_for_class(profile: ModelProfile, hardware_class: str | None, *, host_ram_gib: float | None, mode: str = "auto") -> MemoryPlan | None:
-    """The plan admission uses, or None: no class, a class that declares no VRAM (the confidential
-    classes), or, with `auto`, a class that holds every component at once (the official 80-96 GB bf16
-    recipe keeps running without offload or admission, as before quantized classes existed)."""
+def plan_for_class(
+    profile: ModelProfile, hardware_class: str | None, *, host_ram_gib: float | None, mode: str = "auto", device_gib: float | None = None,
+) -> MemoryPlan | None:
+    """The plan admission uses, or None: nothing to plan against (neither the class nor a device reading gives the VRAM),
+    or, with `auto`, a card that fits every request of the profile with every component on the GPU.
+
+    `device_gib` is the GPU's own total (probe_device): it plans the classes that declare no VRAM (the confidential ones)
+    and a worker with no class, and caps a class's figure, since a "96 GB" card reports 94.97 GiB.
+
+    A card that holds every component but not the profile's largest requests keeps them all on the GPU and gets a token
+    cap. Offloading would fit those requests, but on an RTX PRO 6000 (2026-09-16) it made every 5 s shot three times
+    slower (41-44 s against 13.9 s), so they go to larger cards instead."""
     recipe, hardware = resolve_recipe(profile, hardware_class)
-    if hardware is None or not hardware.vram_gb:
+    vram = hardware.vram_gb if hardware is not None and hardware.vram_gb else None
+    if device_gib is not None:
+        vram = device_gib if vram is None else min(vram, device_gib)
+    if vram is None:
         return None
-    if mode == "auto" and hardware.vram_gb >= recipe.memory.weights_gib + recipe.memory.overhead_gib:
-        return None
+    if hardware is None:
+        hardware = HardwareClass(id="unclassified", tier="unclassified", gpu_sku="this GPU", gpu_count=1, vram_gb=vram)
+    elif hardware.vram_gb != vram:
+        hardware = hardware.model_copy(update={"vram_gb": vram})
+    if mode == "auto" and vram >= recipe.memory.weights_gib + recipe.memory.overhead_gib:
+        whole = _plan(recipe, hardware, "none", vram - VRAM_RESERVE_GIB)
+        low, high = profile_token_range(profile)
+        if whole.max_tokens >= high:
+            return None
+        if whole.max_tokens >= low:
+            return whole
     return plan_memory(profile, recipe, hardware, host_ram_gib=host_ram_gib, mode=mode)
 
 
@@ -323,7 +343,8 @@ def prepare_load(
     recipe, hardware = resolve_recipe(profile, hardware_class)
     if device is not None:
         check_device(recipe, hardware, device)
-    memory = plan_for_class(profile, hardware_class, host_ram_gib=host_ram_gib, mode=offload)
+    memory = plan_for_class(profile, hardware_class, host_ram_gib=host_ram_gib, mode=offload,
+                            device_gib=device.total_gib if device is not None else None)
     if memory is not None:
         mode = memory.offload
     elif offload in ("auto", "none"):

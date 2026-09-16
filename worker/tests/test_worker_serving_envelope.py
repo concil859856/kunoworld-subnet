@@ -105,7 +105,8 @@ def test_consumer_class_plans_advertise_less_than_the_profile_and_the_4090_less_
         for aspect, by_fps in ratios.items():
             for fps in by_fps:
                 assert small.get(resolution, {}).get(aspect, {}).get(fps, 0) <= big.get(resolution, {}).get(aspect, {}).get(fps, 0)
-    assert big["720p"]["16:9"][24] == FAST.limits.max_duration_s  # MINING.md §6: 20 s of 720p at 24 fps on either card
+    # MINING.md §6 (activations as measured on an RTX PRO 6000, 2026-09-16): 16 s of 720p at 24 fps on a 5090, 8 s on a 4090.
+    assert (big["720p"]["16:9"][24], small["720p"]["16:9"][24]) == (16.0, 8.0)
 
 
 def test_the_resident_backend_advertises_its_plan_and_full_limits_without_one(tmp_path):

@@ -136,11 +136,13 @@ class LtxResidentBackend(Backend):
         allow_unpinned_weights: bool = False,
         host_ram_gib: float | None = None,
         storyboard_renderer: Callable[[Any, ModelProfile], Any] | None = None,
+        device_gib: float | None = None,
     ):
         """`hardware_class` turns on verified mode for profiles that pin it (see VERIFIED_MODE.md) and picks
         the weights precision (backends/quantized.py); `model_digest` is the weights identity from the
         owner-signed manifest. `offload` is auto | none | model | group. `storyboard_renderer(loaded, profile)` replaces
-        the one storyboards render through (ltx_storyboard.ExtendRenderer on the loaded pipelines) in tests."""
+        the one storyboards render through (ltx_storyboard.ExtendRenderer on the loaded pipelines) in tests. `device_gib`
+        replaces reading the GPU's memory (quantized.probe_device) for the memory plan."""
         if loader is None:
             if models_dir is None:
                 raise ValueError("KUNO_LTX_MODELS_DIR must point at the LTX-2.5 weights")
@@ -158,18 +160,31 @@ class LtxResidentBackend(Backend):
         self.offload = offload
         self.host_ram_gib = host_ram_gib
         self.storyboard_renderer = storyboard_renderer
+        self.device_gib = device_gib
         self._plans: dict[str, Any] = {}
         self._determinism: dict[str, Any] | None = None
 
     def memory_plan(self, profile: ModelProfile):
-        """The class's memory plan for this profile (None for classes that declare no VRAM). Raises
-        PrecisionError when the class cannot serve the profile at all."""
+        """The memory plan for this profile on this GPU (None when nothing limits it, or when neither the class nor the
+        device gives the VRAM, e.g. without CUDA). Raises PrecisionError when the GPU cannot serve the profile at all."""
         if profile.id not in self._plans:
             from .quantized import host_memory_gib, plan_for_class
 
             ram = host_memory_gib() if self.host_ram_gib is None else self.host_ram_gib
-            self._plans[profile.id] = plan_for_class(profile, self.hardware_class, host_ram_gib=ram, mode=self.offload)
+            self._plans[profile.id] = plan_for_class(
+                profile, self.hardware_class, host_ram_gib=ram, mode=self.offload, device_gib=self._device_gib(),
+            )
         return self._plans[profile.id]
+
+    def _device_gib(self) -> float | None:
+        if self.device_gib is None:
+            try:
+                from .quantized import probe_device
+
+                self.device_gib = probe_device().total_gib
+            except Exception:  # noqa: BLE001 - no torch or no CUDA (CPU tests, the mock network): nothing to plan against
+                return None
+        return self.device_gib
 
     def serving_envelope(self, profile: ModelProfile):
         """What the gateway may route here: the profile's limits, or on a class with a memory plan, the longest
