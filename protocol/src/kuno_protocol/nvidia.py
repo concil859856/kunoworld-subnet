@@ -103,6 +103,15 @@ class GpuEvidenceBundle(BaseModel):
             raise ValueError(f"not {GPU_EVIDENCE_FORMAT} evidence") from exc
 
 
+class NvidiaResult(BaseModel):
+    """One NRAS answer, kept as NVIDIA signed it: `[["JWT", overall], {"GPU-0": token, ...}]` for one kind of
+    device, and the JWKS entries (with their x5c chains) whose `kid`s sign those tokens."""
+
+    device: Literal["gpu", "switch"]
+    answer: list
+    keys: list[dict]
+
+
 class GpuEvidenceCollector(Protocol):
     def collect(self, gpu_nonce: bytes) -> list[GpuEvidenceItem]:
         """Evidence for every GPU (or NVSwitch) the worker can open, generated for this 32-byte nonce."""
@@ -123,6 +132,9 @@ class GpuVerification:
     ueids: list[str | None] = dc_field(default_factory=list)
     cc: GpuCcSettings | None = None
     switch_ueids: list[str | None] = dc_field(default_factory=list)
+    # NRAS's signed answers and the JWKS entries that sign them (endorsements.py), for clients that can't call NRAS.
+    # Empty for verifiers whose results no third party signed (local NVAT).
+    results: list[NvidiaResult] = dc_field(default_factory=list)
 
     @property
     def gpu_count(self) -> int:
@@ -272,6 +284,42 @@ def _split_detached_eat(document) -> tuple[str, dict[str, str]]:
     raise GpuTokenError("unexpected NRAS response shape")
 
 
+def token_kid(token: str) -> str | None:
+    try:
+        header = json.loads(_b64url(token.split(".")[0]))
+    except (ValueError, IndexError):
+        return None
+    return header.get("kid") if isinstance(header, dict) else None
+
+
+def check_nras_answer(
+    answer, claims_of: Callable[[str], dict], gpu_nonce: bytes, count: int, noun: str
+) -> tuple[list[dict] | None, list[str]]:
+    """An NRAS answer for `count` devices of one kind: (their verified claims in token-name order, problems).
+
+    `claims_of` verifies one token's signature and returns its claims; it raises for a token it can't verify."""
+    try:
+        overall_token, detached = _split_detached_eat(answer)
+        overall = claims_of(overall_token)
+        per_device = {name: claims_of(token) for name, token in detached.items()}
+    except ValueError as exc:  # GpuTokenError and JSON errors
+        return None, [f"NRAS verification failed: {exc}"]
+    problems = []
+    if overall.get("x-nvidia-overall-att-result") is not True:
+        problems.append("NRAS overall attestation result is not true")
+    if str(overall.get("eat_nonce", "")).lower() != gpu_nonce.hex():
+        problems.append("NRAS token is for a different nonce")
+    if len(per_device) != count:
+        problems.append(f"NRAS attested {len(per_device)} {noun}(s) but the evidence holds {count}")
+    check = gpu_claim_problems if noun == "GPU" else switch_claim_problems
+    for name, claims in sorted(per_device.items()):
+        # Each device token repeats the nonce; one minted for another nonce must not ride along with a fresh overall token.
+        if "eat_nonce" in claims and str(claims["eat_nonce"]).lower() != gpu_nonce.hex():
+            problems.append(f"{name}: token is for a different nonce")
+        problems += [f"{name}: {p}" for p in check(claims)]
+    return [claims for _, claims in sorted(per_device.items())], problems
+
+
 # ---------------------------------------------------------------- verifiers
 
 
@@ -330,8 +378,8 @@ class NrasGpuVerifier:
         result = self.verify_devices(evidence, gpu_nonce)
         return result.ok, result.detail
 
-    def _attest(self, url: str, items: list[GpuEvidenceItem], gpu_nonce: bytes, noun: str) -> tuple[list[dict] | None, list[str]]:
-        """One NRAS call for devices of one kind: (their verified claims in token-name order, problems)."""
+    def _attest(self, url: str, items: list[GpuEvidenceItem], gpu_nonce: bytes, noun: str) -> tuple[list[dict] | None, list[str], object]:
+        """One NRAS call for devices of one kind: (their verified claims in token-name order, problems, NRAS's answer)."""
         body = {
             "nonce": gpu_nonce.hex(),
             "arch": items[0].arch,
@@ -344,24 +392,22 @@ class NrasGpuVerifier:
         try:
             status, payload = self._http("POST", url, json.dumps(body).encode(), headers, self.timeout_s)
             if status != 200:
-                return None, [f"NRAS returned HTTP {status}: {payload[:200].decode('utf-8', 'replace')}"]
-            overall_token, detached = _split_detached_eat(json.loads(payload))
-            overall = self._claims(overall_token)
-            per_device = {name: self._claims(token) for name, token in detached.items()}
-        except (OSError, ValueError) as exc:  # URLError is an OSError; GpuTokenError and JSON errors are ValueErrors
-            return None, [f"NRAS verification failed: {exc}"]
+                return None, [f"NRAS returned HTTP {status}: {payload[:200].decode('utf-8', 'replace')}"], None
+            answer = json.loads(payload)
+        except (OSError, ValueError) as exc:  # URLError is an OSError; JSON errors are ValueErrors
+            return None, [f"NRAS verification failed: {exc}"], None
+        try:
+            claims, problems = check_nras_answer(answer, self._claims, gpu_nonce, len(items), noun)
+        except OSError as exc:  # the JWKS fetch inside _claims
+            return None, [f"NRAS verification failed: {exc}"], None
+        return claims, problems, answer
 
-        problems = []
-        if overall.get("x-nvidia-overall-att-result") is not True:
-            problems.append("NRAS overall attestation result is not true")
-        if str(overall.get("eat_nonce", "")).lower() != gpu_nonce.hex():
-            problems.append("NRAS token is for a different nonce")
-        if len(per_device) != len(items):
-            problems.append(f"NRAS attested {len(per_device)} {noun}(s) but the evidence holds {len(items)}")
-        check = gpu_claim_problems if noun == "GPU" else switch_claim_problems
-        for name, claims in sorted(per_device.items()):
-            problems += [f"{name}: {p}" for p in check(claims)]
-        return [claims for _, claims in sorted(per_device.items())], problems
+    def _result(self, device: str, answer) -> NvidiaResult:
+        """What NRAS signed for these devices, with the JWKS entries a client needs to check it offline."""
+        _, detached = _split_detached_eat(answer)
+        kids = {token_kid(token) for token in [answer[0][1], *detached.values()]}
+        keys = [k for k in self._keys().get("keys", []) if k.get("kid") in kids]
+        return NvidiaResult(device=device, answer=answer, keys=keys)
 
     def verify_devices(self, evidence: bytes, gpu_nonce: bytes) -> GpuVerification:
         try:
@@ -371,18 +417,20 @@ class NrasGpuVerifier:
         refused = _bundle_problems(bundle, gpu_nonce)
         if refused:
             return GpuVerification(False, refused)
-        gpus, problems = self._attest(self.url, bundle.gpus, gpu_nonce, "GPU")
+        gpus, problems, answer = self._attest(self.url, bundle.gpus, gpu_nonce, "GPU")
         switches: list[dict] = []
+        switch_answer = None
         if gpus is not None and not problems and bundle.switches:
-            attested, switch_problems = self._attest(self.switch_url, bundle.switches, gpu_nonce, "NVSwitch")
+            attested, switch_problems, switch_answer = self._attest(self.switch_url, bundle.switches, gpu_nonce, "NVSwitch")
             switches, problems = attested or [], [f"NVSwitch evidence: {p}" for p in switch_problems]
         if gpus is None or problems:
             return GpuVerification(False, "; ".join(problems))
+        results = [self._result("gpu", answer)] + ([self._result("switch", switch_answer)] if switch_answer is not None else [])
         models = sorted({str(c.get("hwmodel", "?")) for c in gpus})
         detail = f"{len(gpus)} GPU(s) attested by NRAS ({', '.join(models)})"
         if switches:
             detail += f" with {len(switches)} NVSwitch(es)"
-        return GpuVerification(True, detail, [_ueid(c) for c in gpus], bundle.cc, [_ueid(c) for c in switches])
+        return GpuVerification(True, detail, [_ueid(c) for c in gpus], bundle.cc, [_ueid(c) for c in switches], results)
 
 
 class NvattestGpuVerifier:

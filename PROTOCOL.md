@@ -234,6 +234,41 @@ verifier did not count them), `nvswitch_count`, and the evidence's `gpu_mode` an
   without a `ueid`, evidence without `cc` (devtools mode can't be ruled out), and `devtools: true`
   (devtools keeps encryption but opens performance counters and debugging to the host).
 
+## Endorsements (what clients check TDX evidence with)
+
+A client about to seal a private job can't reach Intel's collateral service (no cross-origin access) or NVIDIA's
+Remote Attestation Service (it needs the raw GPU evidence posted to it), yet must not take the evidence's signatures on
+the gateway's word. So every route and feed that serves an enclave's `evidence` also serves `endorsements`
+(`kuno_protocol.endorsements.Endorsements`), the third-party-signed material the gateway's own verification used:
+
+```
+{"v": 1,
+ "tdx_collateral": {pck_crl_issuer_chain, root_ca_crl, pck_crl, tcb_info_issuer_chain, tcb_info, tcb_info_signature,
+                    qe_identity_issuer_chain, qe_identity, qe_identity_signature}  | null,
+ "nvidia": [{"device": "gpu" | "switch", "answer": [["JWT", overall], {"GPU-0": token, ...}], "keys": [JWKS entry, ...]}]}
+```
+
+`null` for simulated and open-tier enclaves. The gateway replaces both `evidence` and `endorsements` at every
+successful re-attestation, so what it serves is never older than the challenge interval. Clients check:
+
+- **Intel.** Full DCAP verification of the quote with `tdx_collateral`: PCK chain and CRLs to Intel's SGX root CA
+  (pinned by dcap-qvl), QE report and identity, quote signature, and a TCB status in the allowed set (default
+  `UpToDate`). A relay can withhold collateral or serve an older unexpired copy, so a platform revoked since then passes
+  until that copy's `nextUpdate`; it can't forge it.
+- **NVIDIA.** Every token in `answer` is an ES384 JWS whose `kid` names an entry in `keys`. That entry's `x5c` must be
+  exactly `[signing certificate, intermediate]`, with SHA-256 of the intermediate's DER SubjectPublicKeyInfo in the
+  pinned set (`fd32837f954e2c45db073105166dfe6985ae0480bb113fba63b091a75affe896`, "NVIDIA Attestation Service GPU
+  Intermediate 004", valid to 2029-12-08), the signing certificate issued by it (sha256WithRSAEncryption), both valid
+  at the token's `iat` (or `nbf`), and the entry's `x`/`y` equal to the certificate's P-384 key. The token must not be
+  older than the manifest's `max_evidence_age_s` or expired. Then the same claim rules as an online NRAS check: overall
+  result true, `eat_nonce` equal to the GPU nonce bound by REPORTDATA (and on every device token that carries one), one
+  device token per device in the evidence, `measres` success, debug disabled, secure boot on, and the report's nonce
+  match and signature claims true. NVSwitch evidence needs a `switch` answer checked the same way.
+
+TDX evidence without endorsements is refused by clients, not half-checked. Implementations: `verify_endorsed_evidence`
+(Python), `verifyEvidence` with `endorsements` (JavaScript). `sdk/js/test/endorsement_vectors.json` holds cases both
+must decide identically.
+
 ## Golden manifest
 
 The owner signs `"kuno/v1/manifest\n" + canonical_json(GoldenManifest)` with Ed25519 and publishes
@@ -241,6 +276,10 @@ The owner signs `"kuno/v1/manifest\n" + canonical_json(GoldenManifest)` with Ed2
 signed manifest whose signature does not verify; production verifiers also refuse unsigned
 manifests and any manifest that trusts the simulated TEE. A bare `GoldenManifest` document is
 still accepted on development networks.
+
+Gateways serve the signed document at `GET /v1/manifest/signed` (404 `unsigned_manifest` on a development gateway
+running a bare manifest). A client configured with the owner's public key uses the gateway's manifest only after that
+signature verifies, which is as strong as pinning a manifest without re-pinning at every image release.
 
 `GoldenManifest.open_tier` is optional:
 `{"enabled": bool, "images": [{"image_digest", "profiles": [...]}]}`. Absent (the default, and

@@ -56,6 +56,9 @@ class TdxQuoteResult:
     advisory_ids: list[str] = field(default_factory=list)
     # The platform's PPID from the PCK certificate dcap-qvl verified to Intel's root (dcap-qvl >= 0.6).
     ppid: bytes | None = None
+    # The Intel-signed collateral the quote verified against, as dcap-qvl's JSON, for clients that can't fetch it
+    # themselves (endorsements.py). Set only on success.
+    collateral: dict | None = None
 
 
 def _timestamp(text: str) -> float:
@@ -169,7 +172,7 @@ def verify_tdx_quote(
         return TdxQuoteResult(False, f"platform is affected by rejected advisories {', '.join(blocked)}", status, advisories)
     detail = f"TCB status {status}" + (f", advisories {', '.join(advisories)}" if advisories else "")
     ppid = getattr(report, "ppid", None)
-    return TdxQuoteResult(True, detail, status, advisories, bytes(ppid) if ppid else None)
+    return TdxQuoteResult(True, detail, status, advisories, bytes(ppid) if ppid else None, json.loads(collateral.to_json()))
 
 
 class DcapQuoteVerifier:

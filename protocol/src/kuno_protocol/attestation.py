@@ -246,6 +246,20 @@ def load_manifest(path: str | Path, owner_public_key: bytes | None = None, requi
     return parse_manifest(Path(path).read_text(), owner_public_key, require_signature)
 
 
+def signed_manifest_in(path: str | Path) -> SignedManifest | None:
+    """The owner-signed manifest a file holds, for serving whole; None for a bare manifest. Verify with parse_manifest."""
+    try:
+        document = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict) or "manifest" not in document or not document.get("signature"):
+        return None
+    try:
+        return SignedManifest.model_validate(document)
+    except ValidationError:
+        return None
+
+
 # ---------------------------------------------------------------- providers
 
 
@@ -495,6 +509,9 @@ class Verdict:
     gpu_mode: str | None = None
     gpu_devtools: bool | None = None
     nvswitch_count: int | None = None
+    # What Intel and NVIDIA signed for this evidence (endorsements.Endorsements), for a relay to hand to clients.
+    # Set only on an ok TDX verdict whose verifiers kept that material.
+    endorsements: object | None = None
 
     def hardware_tokens(self, kind: str | None = None) -> set[str]:
         return {h.token for h in self.hardware if kind is None or h.kind == kind}
@@ -506,7 +523,7 @@ def _seal(verdict: Verdict, reasons: list[str], hardware: list[HardwareIdentity]
     # Identities from a refused verdict must not be used for anything, so they aren't kept.
     verdict.hardware, verdict.gpu_count = (hardware, gpu_count) if verdict.ok else ([], None)
     if not verdict.ok:
-        verdict.gpu_mode = verdict.gpu_devtools = verdict.nvswitch_count = None
+        verdict.gpu_mode = verdict.gpu_devtools = verdict.nvswitch_count = verdict.endorsements = None
     return verdict
 
 
@@ -557,7 +574,8 @@ def verify_evidence(
         # Nothing about the hardware is verified, so no identity is taken from it (the dict stays self-reported).
         return _seal(verdict, reasons, [], None)
 
-    measurements, report_data, platform = _quote_claims(evidence.tee, quote, manifest, quote_verifier, reasons)
+    signed: dict = {}  # the verifiers' Intel collateral and NRAS answers, gathered into Verdict.endorsements
+    measurements, report_data, platform = _quote_claims(evidence.tee, quote, manifest, quote_verifier, reasons, signed)
     verdict.measurements = measurements
     hardware: list[HardwareIdentity] = [platform] if platform is not None else []
 
@@ -581,6 +599,7 @@ def verify_evidence(
                 result = verify_devices(gpu, gpu_nonce)
                 ok, detail = result.ok, result.detail
                 if ok:
+                    signed["nvidia"] = list(getattr(result, "results", None) or [])
                     gpu_ueids = list(result.ueids)
                     switch_ueids = list(getattr(result, "switch_ueids", None) or [])
                     gpu_cc = getattr(result, "cc", None)
@@ -625,7 +644,51 @@ def verify_evidence(
     verdict.gpu_mode = gpu_cc.mode if gpu_cc is not None else None
     verdict.gpu_devtools = gpu_cc.devtools if gpu_cc is not None else None
     verdict.nvswitch_count = nvswitch_count
+    if evidence.tee == "tdx" and signed:
+        from .endorsements import Endorsements
+
+        verdict.endorsements = Endorsements(tdx_collateral=signed.get("tdx_collateral"), nvidia=signed.get("nvidia", []))
     return _seal(verdict, reasons, hardware, gpu_count)
+
+
+def verify_endorsed_evidence(
+    evidence: AttestationEvidence,
+    manifest: GoldenManifest,
+    endorsements: object | None,
+    expected_nonce: bytes | None = None,
+    now: float | None = None,
+    trusted_spki: Sequence[str] | None = None,
+) -> Verdict:
+    """What a client checks before sealing a job to an enclave, when it can't reach Intel or NVIDIA itself.
+
+    Simulated evidence is checked as `verify_evidence` checks it. TDX evidence is checked in full with the Intel
+    collateral and NRAS answers the relay sent (`endorsements`, an endorsements.Endorsements or its JSON): the quote's
+    signature chain to Intel's root and the platform's TCB status, and NVIDIA-signed GPU claims under the pinned NRAS
+    intermediate. Without endorsements, TDX evidence is refused rather than half-checked.
+    """
+    from .endorsements import NRAS_INTERMEDIATE_SPKI_SHA256, EndorsedGpuVerifier, EndorsedQuoteVerifier, Endorsements
+
+    now = time.time() if now is None else now
+    if evidence.tee != "tdx":
+        return verify_evidence(evidence, manifest, expected_nonce, now)
+    try:
+        material = endorsements if isinstance(endorsements, Endorsements) else (
+            Endorsements.model_validate(endorsements) if endorsements is not None else None
+        )
+    except ValidationError:
+        material = None
+        refusal = "the relayed endorsements are malformed"
+    else:
+        refusal = "no endorsements were relayed, so the quote's Intel signature and the GPUs' NVIDIA attestation can't be checked"
+    if material is None:
+        verdict = verify_evidence(evidence, manifest, expected_nonce, now)
+        return _seal(verdict, [refusal] + [r for r in verdict.reasons if "verifier configured" not in r], verdict.hardware, verdict.gpu_count)
+    pins = tuple(trusted_spki) if trusted_spki is not None else NRAS_INTERMEDIATE_SPKI_SHA256
+    return verify_evidence(
+        evidence, manifest, expected_nonce, now,
+        quote_verifier=EndorsedQuoteVerifier(material, now),
+        gpu_verifier=EndorsedGpuVerifier(material, now, pins, max_age_s=manifest.max_evidence_age_s),
+    )
 
 
 def _entry_gpu_problems(entry: AllowedMeasurement, cc: GpuCcSettings | None, gpu_count: int | None, nvswitch_count: int | None) -> list[str]:
@@ -668,7 +731,8 @@ def _mock_gpu_devices(gpu: bytes, reasons: list[str]) -> tuple[list[str | None] 
 
 
 def _quote_claims(
-    tee: str, quote: bytes, manifest: GoldenManifest, quote_verifier: QuoteVerifier | None, reasons: list[str]
+    tee: str, quote: bytes, manifest: GoldenManifest, quote_verifier: QuoteVerifier | None, reasons: list[str],
+    signed: dict | None = None,
 ) -> tuple[dict[str, str], str | None, HardwareIdentity | None]:
     if tee == "mock":
         try:
@@ -701,6 +765,8 @@ def _quote_claims(
             if callable(verify_quote):
                 result = verify_quote(quote)
                 ok, detail, ppid = result.ok, result.detail, getattr(result, "ppid", None)
+                if ok and signed is not None and getattr(result, "collateral", None) is not None:
+                    signed["tdx_collateral"] = result.collateral
             else:
                 (ok, detail), ppid = quote_verifier.verify(quote), None
             if not ok:
