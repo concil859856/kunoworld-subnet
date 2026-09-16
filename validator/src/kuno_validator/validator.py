@@ -656,7 +656,7 @@ class Validator:
                 continue
             record = Auditor.standard_record(row, response.json())
             if record is None:
-                log.info("standard job %s isn't replayable here (no explicit seed, inputs or options); not audited", row["job_id"])
+                log.info("standard job %s isn't replayable here (no explicit seed, inputs, options or a storyboard); not audited", row["job_id"])
                 continue
             records.append(record)
         return records

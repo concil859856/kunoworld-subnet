@@ -37,6 +37,11 @@ the validator's own knowledge, so a failure that a gateway lie about the prompt 
 explain (a conditioning or seed mismatch) is `unproven`, not attributable. Params are bound by the
 receipt's signed digest and stay attributable. A miner that commits a wrong conditioning on purpose
 to dodge standard audits is still caught by canaries, which it can't tell apart.
+
+Storyboards (PROTOCOL.md, "Storyboards") carry no step commitment, and one transcript couldn't describe
+their chained shots anyway, so none is audited: not sampled, not selected, never a missing-commitment
+failure, in either tier, whatever `require_commitment` says. Whether a job is a storyboard is read from
+params that hash to the receipt's signed digest, so a relay can't hide a job from audits by calling it one.
 """
 
 from __future__ import annotations
@@ -82,7 +87,7 @@ from kuno_protocol.verified import (
     verify_sealed_opening,
 )
 
-from .ledger import EnclaveKey
+from .ledger import EnclaveKey, is_storyboard
 
 log = logging.getLogger("kuno.validator.audits")
 
@@ -285,9 +290,14 @@ class Auditor:
             receipt = Receipt.model_validate(canary.receipt)
         except ValidationError:
             return False
-        return profile is not None and profile.verified is not None and receipt.body.step_commitment is not None
+        return (
+            profile is not None and profile.verified is not None and receipt.body.step_commitment is not None
+            and not is_storyboard(canary.params)
+        )
 
     def should_audit(self, canary: CanaryRecord) -> bool:
+        if is_storyboard(canary.params):
+            return False
         if not self.auditable(canary):
             return self.policy.require_commitment and self.profiles.get(canary.profile_id) is not None
         rate = self.policy.rate if self.policy.rate is not None else self.profiles[canary.profile_id].verified.audit_rate
@@ -318,6 +328,8 @@ class Auditor:
                 receipt = Receipt.model_validate(row["receipt"])
             except ValidationError:
                 continue
+            if _signed_storyboard(row.get("params"), receipt):
+                continue
             tier = tiers.get(row.get("enclave_id") or "", OPEN)
             if receipt.body.step_commitment is None and tier != OPEN and not self.policy.require_commitment:
                 continue
@@ -333,8 +345,11 @@ class Auditor:
     @staticmethod
     def standard_record(row: dict, job: dict) -> CanaryRecord | None:
         """A replayable record from a ledger row and the gateway's standard-job record, or None when this validator
-        could not replay it honestly (no explicit seed, inputs it isn't given, or options that change conditioning)."""
+        could not replay it honestly (no explicit seed, inputs it isn't given, options that change conditioning, or a
+        storyboard, which has no step commitment)."""
         if job.get("privacy") != "standard" or job.get("job_id") != row.get("job_id") or job.get("seed") is None:
+            return None
+        if job.get("shots") is not None or is_storyboard(job.get("params")) or is_storyboard(row.get("params")):
             return None
         options = {k: v for k, v in (job.get("options") or {}).items() if k != "kuno_audit_key"}
         if job.get("inputs") or options or not isinstance(job.get("prompt"), str):
@@ -385,6 +400,9 @@ class Auditor:
         profile = self.profiles.get(body.profile_id)
         commitment = body.step_commitment
         if profile is None or profile.verified is None:
+            return None
+        if is_storyboard(canary.params):
+            # Signed params (checked just above) say storyboard: no commitment to open, and none owed.
             return None
         if commitment is None:
             if self.policy.require_commitment or canary.tier == OPEN:
@@ -631,6 +649,17 @@ class Auditor:
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"audits": [asdict(o) for o in self.outcomes]}, indent=2))
         tmp.replace(self.state_path)
+
+
+def _signed_storyboard(params: Any, receipt: Receipt) -> bool:
+    """Whether a ledger row's params are a storyboard's and are the ones the receipt signs. A row whose params don't hash
+    to the digest isn't skipped: `request` then records the mismatch."""
+    if not is_storyboard(params):
+        return False
+    try:
+        return sha256_hex(canonical_json(GenerationParams.model_validate(params).model_dump(mode="json"))) == receipt.body.params_digest
+    except ValidationError:
+        return False
 
 
 def _error_code(response: httpx.Response) -> str:

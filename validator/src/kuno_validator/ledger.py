@@ -26,7 +26,7 @@ from pydantic import ValidationError
 
 from kuno_protocol.attestation import enclave_id_for
 from kuno_protocol.canonical import b64d, canonical_json, sha256_hex
-from kuno_protocol.profiles import ModelProfile
+from kuno_protocol.profiles import Mode, ModelProfile
 from kuno_protocol.receipts import Receipt, verify_receipt
 from kuno_protocol.schemas import GenerationParams
 
@@ -64,11 +64,24 @@ def enclave_keys(enclaves: list[dict]) -> dict[str, EnclaveKey]:
     return keys
 
 
-def duration_bounds(profile: ModelProfile, duration_s: float, fps: int | None) -> tuple[float, float]:
-    """Acceptable rendered length for a requested duration, allowing for the model's frame grid."""
+def duration_bounds(profile: ModelProfile, duration_s: float, fps: int | None, *, storyboard: bool = False) -> tuple[float, float]:
+    """Acceptable rendered length for a requested duration, allowing for the model's frame grid.
+
+    A storyboard's `duration_s` is already a frame count over fps, its stitched frames (PROTOCOL.md, "Storyboards";
+    `profiles.storyboard_frames`), so it has no grid to round to: the frame count of `duration_s` as one clip means
+    nothing for it, and only the slack applies."""
+    if storyboard:
+        return duration_s - DURATION_SLACK_S, duration_s + DURATION_SLACK_S
     fps = fps or profile.limits.default_fps
     rendered = profile.num_frames(duration_s, fps) / fps
     return duration_s - DURATION_SLACK_S, max(duration_s, rendered) + DURATION_SLACK_S
+
+
+def is_storyboard(params: GenerationParams | dict | None) -> bool:
+    """Whether public params (a model or their JSON) describe a storyboard: mode `storyboard`, or a shot list."""
+    if isinstance(params, GenerationParams):
+        return params.mode is Mode.STORYBOARD or params.shots is not None
+    return isinstance(params, dict) and (params.get("mode") == Mode.STORYBOARD.value or params.get("shots") is not None)
 
 
 @dataclass
@@ -163,6 +176,7 @@ def _verify_entry(raw: dict, keys: dict[str, EnclaveKey], profiles: dict[str, Mo
 
     entry = dict(raw, miner_hotkey=key.miner_hotkey)
     fps: int | None = None
+    storyboard = False
     if raw.get("params") is not None:
         # Preferred: the gateway publishes the full public params, which we bind to the signed digest.
         try:
@@ -173,14 +187,15 @@ def _verify_entry(raw: dict, keys: dict[str, EnclaveKey], profiles: dict[str, Mo
             return "params do not match the signed params digest"
         if params.profile_id != body.profile_id:
             return "receipt does not match its ledger entry"
-        requested, fps = params.duration_s, params.fps
+        # A storyboard bills its stitched length; its VCU sums the shots it rendered (scoring.job_vcu, `vcu_for`).
+        requested, fps, storyboard = params.duration_s, params.fps, is_storyboard(params)
     elif isinstance(raw.get("duration_s"), (int, float)):
         requested = float(raw["duration_s"])
         entry["_params_unbound"] = True
     else:
         return "no public duration for the job"
 
-    low, high = duration_bounds(profile, requested, fps)
+    low, high = duration_bounds(profile, requested, fps, storyboard=storyboard)
     entry["billable_s"] = requested
     entry["credit"] = True
     claimed = body.video.duration_s
