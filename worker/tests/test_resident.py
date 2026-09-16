@@ -234,10 +234,10 @@ def test_4k_renders_at_half_rate_then_interpolates(tmp_path):
 def test_h3_keyframe_and_reference_calls(tmp_path):
     flf = h3_call(task_for("h3", Mode.FIRST_LAST_FRAME, tmp_path, duration_s=5))
     assert flf["num_frames"] == 124 and flf["image"] and flf["last_image"]
-    assert flf["video_shift"] == 12.0 and flf["num_inference_steps"] == 50
+    assert flf["video_shift"] == 12.0 and flf["num_inference_steps"] == 51  # 50 passes
 
     turbo = h3_call(task_for("h3-turbo", Mode.TEXT_TO_VIDEO, tmp_path))
-    assert turbo["video_shift"] == 6.0 and turbo["num_inference_steps"] == 8  # LoRA's trained shift
+    assert turbo["video_shift"] == 6.0 and turbo["num_inference_steps"] == 9  # the LoRA's trained shift and 8-pass grid
 
     refs = h3_call(task_for("h3-reference", Mode.VIDEO_EDIT, tmp_path))
     assert refs["references"][0]["type"] == "video_audio"

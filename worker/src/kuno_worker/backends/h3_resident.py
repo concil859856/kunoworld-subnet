@@ -1,8 +1,9 @@
 """MiniMax H3 kept resident through the diffusers modular pipeline.
 
 The SGLang server (backends/h3.py) is already resident and is the officially documented
-serving path; use it when it is running. This backend covers the case SGLang does not:
-the LightX2V Turbo LoRA, whose only documented entry point reloads ~124 GB per job.
+serving path; use it when it is running. This backend serves the LightX2V Turbo LoRA, whose
+only documented entry point reloads ~124 GB per job. SGLang 0.5.19 can serve that LoRA too
+(`--lora-path`, measured 2026-09-16); this path also needs `peft`, which the H3 image lacks.
 
 As everywhere else, the call is plain data and tested without a GPU; only the loader in
 runtimes.py needs hardware.
@@ -13,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
-from kuno_protocol.profiles import InputRole, Mode, ModelProfile, h3_num_frames
+from kuno_protocol.profiles import InputRole, Mode, ModelProfile, h3_num_frames, h3_schedule_points
 from kuno_protocol.receipts import VideoInfo
 
 from ..verified import RetentionStore, context_bytes
@@ -44,7 +45,7 @@ def build_call(task: GenerationTask) -> dict[str, Any]:
         "height": task.height,
         "aspect_ratio": params.aspect_ratio,
         "num_frames": h3_num_frames(params.duration_s),
-        "num_inference_steps": profile.steps,
+        "num_inference_steps": h3_schedule_points(profile.steps),
         "seed": task.seed,
         **(TURBO_SHIFTS if turbo else FULL_SHIFTS),
     }

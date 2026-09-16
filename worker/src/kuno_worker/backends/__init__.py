@@ -24,7 +24,7 @@ def build_backends(kind: str, config) -> dict[str, Backend]:
         from .ltx_resident import LtxResidentBackend
 
         # SGLang is the documented H3 serving path and is already resident; it forwards
-        # the Turbo profile to the LoRA runtime, which SGLang does not support.
+        # the Turbo profile to the in-process LoRA runtime (SGLang could serve the LoRA too).
         h3 = H3SglangBackend(config.h3_fl2va_url, config.h3_ref2va_url, config.workdir)
         verified = {"hardware_class": config.verified_hardware_class, "model_digest": config.model_digest}
         # KUNO_H3_MODEL_ID names the same weights the SGLang servers load (a local path, or a Hub id resolved

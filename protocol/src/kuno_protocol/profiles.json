@@ -85,10 +85,10 @@
       },
       "vcu_weights": {
         "per_output_second": {
-          "768p": 17
+          "768p": 19
         },
-        "duration_slope": 0.05,
-        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4); not benchmarked — the other H3 profiles were measured 2026-09-15 (research/pricing/measured_2026-09-15.md) and cost 1.7x their estimate, so expect this to be low too"
+        "duration_slope": 0.072,
+        "note": "GPU-cost weights, measured 2026-09-16 (research/pricing/measured_2026-09-16_h3-turbo.md): 5, 10 and 14 s at 768p on 4x H200 through SGLang with the 8-step LoRA, corrected to 8 passes"
       },
       "min_vram_gb": 80,
       "verified": {
@@ -254,8 +254,8 @@
         "per_output_second": {
           "768p": 100
         },
-        "duration_slope": 0.06,
-        "note": "GPU-cost weights, measured 2026-09-15 (research/pricing/measured_2026-09-15.md): 5 s at 768p on 4x H200"
+        "duration_slope": 0.093,
+        "note": "GPU-cost weights, measured 2026-09-15 (research/pricing/measured_2026-09-15.md): 5 s at 768p on 4x H200; duration slope from 5, 10 and 14 s on 2026-09-16 (measured_2026-09-16_h3-turbo.md)"
       },
       "min_vram_gb": 80,
       "verified": {

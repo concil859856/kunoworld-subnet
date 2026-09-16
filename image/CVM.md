@@ -259,13 +259,21 @@ The `h3` target adds SGLang's side:
 - **No lightx2v.** `real` serves h3-turbo in the worker process through diffusers 0.40, already in `/opt/kuno`.
   LightX2V's `inference_minimax_h3.py` is only the `cold` backend, which reloads about 124 GB for every job.
 - **Why it's off by default.**
-  - Its loader puts H3 on one device, beside two SGLang servers that hold the same four GPUs. Nobody has
-    measured whether that fits.
+  - Its loader puts H3 on one device, beside SGLang servers that hold the same four GPUs. It can't fit there: one
+    loaded H3 server holds 87–97 GB per H200 (measured 2026-09-16).
+  - diffusers' `load_lora_weights` needs `peft`, which the image doesn't install.
   - It needs the LoRA file mounted (`KUNO_H3_TURBO_LORA`).
+  - SGLang 0.5.19 in `/opt/sglang` loads the LoRA itself (`sglang serve --lora-path`, or `POST /v1/set_lora` on a
+    running server). That is how Turbo was measured, 8-step at 11.5 GPU-s per output second at 5 s on 4 H200s
+    (`research/pricing/measured_2026-09-16_h3-turbo.md` in the dev repo). Moving `h3-turbo` onto it is the fix.
 - **Turning it on.** Set `KUNO_PROFILES=h3-turbo,h3,h3-reference` once it has run on GPUs.
 
-**Not verified: nothing in this image has run on a GPU.** In particular:
-- SGLang loading H3 from a read-only, offline hub cache, and both variants fitting side by side on four GPUs.
+**Run on GPUs without confidential computing** (4 of 8 H200s, 2026-09-15 and -16): SGLang loads H3 from a read-only,
+offline hub cache, and its JIT kernels compile with the pip CUDA 13 toolkit once `lib64` and the unversioned `.so`
+names exist (both fixed in `worker.Dockerfile`). **Not verified**, in particular:
+- **Both variants side by side on four GPUs, which is what the default `KUNO_PROFILES=h3,h3-reference` starts.** One
+  loaded server holds 87–97 GB per GPU and peaks at about 103 GB, so two cannot share 141 GB H200s, and very likely
+  not 180 GB B200s. Until each GPU group can serve its own profiles, give a worker one variant: `h3` or `h3-reference`.
 - SGLang's JIT kernels compiling with the CUDA 13 toolkit that pip wheels put in `/opt/sglang`. `kuno-h3-worker` sets
   the servers' `CUDA_HOME` to it (`site-packages/nvidia/cu13`, holding `nvcc` and the runtime headers), and g++ is
   the host compiler. Whether those wheels hold everything the kernels include and link is unchecked.

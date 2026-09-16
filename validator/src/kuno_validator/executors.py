@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from kuno_protocol.profiles import ModelProfile
+from kuno_protocol.profiles import ModelProfile, h3_schedule_points
 from kuno_protocol.schemas import GenerationParams
 from kuno_protocol.torch_verified import (
     SchedulerTrap,
@@ -256,7 +256,7 @@ class H3StepExecutor(_DiffusersExecutor):
         try:
             pipe(
                 prompt=canary.prompt, width=width, height=height, num_frames=profile.num_frames(params.duration_s, params.fps),
-                num_inference_steps=profile.steps, generator=cpu_generator(canary.seed), output=["videos"],
+                num_inference_steps=h3_schedule_points(profile.steps), generator=cpu_generator(canary.seed), output=["videos"],
             )
             raise ReplayScheduleError("the pipeline finished before the replayed step")
         except _StopReplay:

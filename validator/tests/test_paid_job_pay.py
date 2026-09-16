@@ -113,7 +113,7 @@ def test_usd_mode_owes_only_paid_jobs_by_vcu_and_counts_only_billable_revenue():
         entry("C", "ltx-2.5-fast", 5, privacy="standard"),  # a row from an older gateway: billable, revenue at list price
     ]
     work = usd_owed(entries, {"A", "B", "C"}, card, PROFILES, SwitchConfig(), now=1100.0, window_s=500.0)
-    h3_vcu, fast_1080p_50fps_vcu, fast_720p_vcu = 100 * (1 + 0.06 * 5) * 10, 5 * 2 * 5, 3 * 5
+    h3_vcu, fast_1080p_50fps_vcu, fast_720p_vcu = 100 * (1 + 0.093 * 5) * 10, 5 * 2 * 5, 3 * 5
     assert work.owed_usd == pytest.approx({"A": (h3_vcu + fast_1080p_50fps_vcu) * 0.0019, "C": fast_720p_vcu * 0.0019})
     assert work.unpaid_seconds == {"B": 10.0}
     standard = PROFILES["ltx-2.5-fast"].price_usd(GenerationParams.model_validate(entries[3]["params"]), privacy="standard")

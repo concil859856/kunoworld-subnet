@@ -54,7 +54,7 @@ def test_h3_keyframe_requests(mode, expected_task, frame_indexes, tmp_path):
     assert all(c["type"] == "image" and c["role"] == "keyframe" for c in body["conditions"])
     assert all(c["uri"].startswith("file://") for c in body["conditions"])
     assert body["target"] == {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}
-    assert body["num_inference_steps"] == 50 and body["seed"] == 42
+    assert body["num_inference_steps"] == 51 and body["seed"] == 42  # 50 passes: the grid includes the terminal 0
 
 
 def test_h3_reference_request_keeps_customer_order_and_maps_types(tmp_path):

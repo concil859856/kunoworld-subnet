@@ -371,6 +371,14 @@ def h3_num_frames(duration_s: float) -> int:
     return min(345, 17 * math.ceil((24 * duration_s - 5) / 17) + 5)
 
 
+def h3_schedule_points(steps: int) -> int:
+    """The `num_inference_steps` to send H3's runtimes for `steps` model passes. SGLang and diffusers both build the
+    sigma grid as `linspace(1, 0, num_inference_steps)`, and its terminal 0 is not a pass, so N points run N - 1 passes.
+    A profile's `steps` (and verified mode's `stage_steps`) count passes, which is also how LightX2V names its Turbo
+    LoRAs: the 8-step LoRA is trained on the 9-point grid (ModelTC/Minimax-H3-Turbo, "Note on shift")."""
+    return steps + 1
+
+
 def ltx_num_frames(duration_s: float, fps: int) -> int:
     """LTX requires 8k+1 frames."""
     return 8 * max(1, round(duration_s * fps / 8)) + 1

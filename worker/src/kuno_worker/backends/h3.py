@@ -29,7 +29,7 @@ from pathlib import Path
 
 import httpx
 
-from kuno_protocol.profiles import InputRole, Mode
+from kuno_protocol.profiles import InputRole, Mode, h3_schedule_points
 from kuno_protocol.receipts import VideoInfo
 
 from .base import Backend, GenerationTask, ProgressFn, VideoResult
@@ -63,7 +63,7 @@ def build_sglang_request(task: GenerationTask, directory: Path) -> tuple[str, di
             "duration_seconds": params.duration_s,
         },
         "seed": task.seed,
-        "num_inference_steps": task.profile.steps,
+        "num_inference_steps": h3_schedule_points(task.profile.steps),
     }
     if params.mode in FL2VA_MODES:
         conditions = []

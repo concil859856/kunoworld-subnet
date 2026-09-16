@@ -97,9 +97,10 @@ def test_the_margin_check_flags_every_cell_priced_below_the_miner_multiple():
     flagged = {(row["profile"], row["resolution"], row["privacy"]) for row in proposal["margin_check"]}
     # h3 and h3-reference are flagged from their measured weights (research/pricing/measured_2026-09-15.md): their
     # customer prices are below what a miner must earn. They have no standard price, so only the private rows appear.
+    # h3-turbo's measured weight and slope (measured_2026-09-16_h3-turbo.md) put its $0.05 standard price below that too.
     assert flagged == {
         ("ltx-2.5-pro", "1080p", "private"), ("ltx-2.5-pro", "1080p", "standard"),
-        ("h3", "768p", "private"), ("h3-reference", "768p", "private"),
+        ("h3", "768p", "private"), ("h3-reference", "768p", "private"), ("h3-turbo", "768p", "standard"),
     }
     rate = proposal["rate_card"]["usd_per_vcu_second"]["confidential"]
     private = next(row for row in proposal["margin_check"] if row["privacy"] == "private" and row["profile"] == "ltx-2.5-pro")

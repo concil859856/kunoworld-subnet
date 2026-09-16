@@ -205,8 +205,9 @@ export KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.
 ```
 
 For MiniMax H3, `real` still prefers the official SGLang servers from step 2 (already
-resident); only the Turbo LoRA profile, which SGLang does not support, runs through the
-in-process pipeline. Serving several profiles on one machine loads them in turn and evicts
+resident); only the Turbo LoRA profile runs through the in-process pipeline. That path is not ready: the H3 image
+lacks `peft`, which diffusers needs to load the LoRA. SGLang 0.5.19 serves the LoRA itself (`--lora-path`; measured
+2026-09-16), and the worker does not use that yet. Serving several profiles on one machine loads them in turn and evicts
 the least recently used when VRAM runs out, so pin `KUNO_PROFILES` to what the card can
 actually hold.
 
