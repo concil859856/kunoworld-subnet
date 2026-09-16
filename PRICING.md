@@ -86,12 +86,17 @@ for the gateway, storage and validators.
 |---|---|---|---|---|
 | `ltx-2.5-fast` 720p | $0.05 | $0.008 | fal LTX-2.5 Fast $0.09/s | comfortable; the margin is the widest we have |
 | `ltx-2.5-pro` 720p | $0.075 | **$0.096** | fal LTX-2.5 Pro $0.12/s | **below cost-based minimum**; $0.10 works and still undercuts fal |
-| `h3` 768p, 5 s | $0.20 | **$0.29** (14 s: **$0.50**) | fal H3 Max $0.08/s ($0.04 until 2026-09-30), fal H3 $0.06/s, MiniMax API about $0.09/s | **cannot be sold at market price**: our cost alone is above what fal and MiniMax charge |
-| `h3-turbo` 768p, 5 s | $0.05 Standard, $0.065 Private | **$0.053** (14 s: **$0.088**) | fal H3 Max Turbo $0.04/s ($0.02 until 2026-09-30) | at the floor for 5 s clips, below it from about 6 s; above fal either way |
-| `h3-reference` 768p, 5 s | $0.30 | **$0.47** | no direct market price | same problem, worse |
+| `h3` 768p | Standard $0.06; Private $0.30, $0.51 over 6 s | **$0.29** at 5 s, **$0.50** at 14 s | fal MiniMax H3 $0.06/s, fal H3 Max $0.08/s, MiniMax API about $0.09/s | Standard at fal's price, **sold below cost** (by decision); Private covers cost at every length |
+| `h3-turbo` 768p | Standard $0.04; Private $0.065, $0.091 over 8 s | **$0.053** at 5 s, **$0.088** at 14 s | fal H3 Max Turbo $0.04/s ($0.02 until 2026-09-30) | same: Standard at fal's list price, below cost; Private covers it |
+| `h3-reference` 768p | Standard $0.06; Private $0.50, $0.75 over 6 s | **$0.47** at 5 s, about **$0.74** at 14 s | fal MiniMax H3 reference-to-video $0.06/s | same |
 
 **The H3 finding is strategic, not a rounding error.** Running H3 ourselves on rented confidential 4-GPU workers costs
-more per second than MiniMax charges for the same model through its own API. Three ways out, in order of preference:
+more per second than MiniMax charges for the same model through its own API.
+
+**Decided 2026-09-16 (owner):** Standard prices match fal's list prices; Private is priced above them to cover the
+cost. Private uses `long_clip` (Private-only since then), because an H3 second costs more the longer the clip. Standard
+H3 is sold below what miners earn for it, and the gap is paid out of margin elsewhere or emissions. `kuno-devkit
+derive-rates` flags those Standard rows, and that is expected. The three paths considered before the decision:
 
 1. **Launch on LTX-2.5** (`fast` and `pro`), where cost, market price and available hardware all work. This also
    matches the confidential capacity that can actually be rented today.
@@ -108,7 +113,7 @@ Already done in code: the measured VCU weights, `$0.0019` per VCU-second and per
 ($0.80 / $1.50). What is left is the owner's:
 
 1. Set `ltx-2.5-pro` at or above **$0.10** per second at 720p; it is $0.075 today, below its own cost floor.
-2. Choose one of the three H3 paths above before H3 is offered to customers.
+2. ~~Choose an H3 path~~: decided 2026-09-16 (§4). Standard H3 at fal's list prices, Private above cost.
 3. Decide whether `ltx-2.5-fast` keeps a 12x margin or leads on price; it is the profile with room to move.
 4. Then flip `"placeholder": false` on the rate card and sign it.
 

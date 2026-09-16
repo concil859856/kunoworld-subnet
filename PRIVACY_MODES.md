@@ -48,8 +48,8 @@ honestly. They never receive the video.
 
 This page describes how the system is built. It is not a contract. The legal entity that
 operates KunoWorld and its jurisdiction are not yet named; the terms of service and privacy
-policy will govern, and prices on the site are placeholders. Private is priced above Standard,
-and full MiniMax H3 and H3 Director are offered in Private mode only.
+policy will govern, and prices on the site are placeholders. Private is priced above Standard:
+Standard follows the market's list prices, and Private covers the cost of confidential rendering.
 
 ## Key sync
 

@@ -123,11 +123,13 @@ def test_usd_mode_owes_only_paid_jobs_by_vcu_and_counts_only_billable_revenue():
 
 
 def test_a_list_price_in_a_mode_the_profile_isnt_offered_in_is_unknown_not_a_crash():
-    private_only = next(profile for profile in PROFILES.values() if not profile.offers("standard"))
+    # Every shipped profile has a Standard price; take full H3's away to make a Private-only one.
+    shipped = PROFILES["h3"]
+    private_only = shipped.model_copy(update={"pricing": shipped.pricing.model_copy(update={"standard_usd_per_second": None})})
     row = entry("C", private_only.id, 5, privacy="standard")
     assert list_price_usd(row, private_only) is None
     assert list_price_usd({**row, "privacy": None}, private_only) == private_only.price_usd(GenerationParams.model_validate(row["params"]))
-    work = usd_owed([row], {"C"}, placeholder_rate_card(), PROFILES, SwitchConfig(), now=1100.0, window_s=500.0)
+    work = usd_owed([row], {"C"}, placeholder_rate_card(), {**PROFILES, "h3": private_only}, SwitchConfig(), now=1100.0, window_s=500.0)
     assert work.revenue_unknown_jobs == 1 and work.owed_usd["C"] > 0
     resolution = next(iter(private_only.limits.sizes))
     bare = {key: value for key, value in row.items() if key != "params"} | {"resolution": resolution, "duration_s": 5}

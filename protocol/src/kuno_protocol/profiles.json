@@ -75,12 +75,12 @@
           "768p": 0.065
         },
         "standard_usd_per_second": {
-          "768p": 0.05
+          "768p": 0.04
         },
         "min_job_usd": 0.1,
         "long_clip": {
-          "over_s": 10,
-          "multiplier": 1.2
+          "over_s": 8,
+          "multiplier": 1.4
         }
       },
       "vcu_weights": {
@@ -241,13 +241,15 @@
       },
       "pricing": {
         "usd_per_second": {
-          "768p": 0.2
+          "768p": 0.3
         },
-        "standard_usd_per_second": null,
+        "standard_usd_per_second": {
+          "768p": 0.06
+        },
         "min_job_usd": 0.1,
         "long_clip": {
-          "over_s": 10,
-          "multiplier": 1.2
+          "over_s": 6,
+          "multiplier": 1.7
         }
       },
       "vcu_weights": {
@@ -437,13 +439,15 @@
       },
       "pricing": {
         "usd_per_second": {
-          "768p": 0.3
+          "768p": 0.5
         },
-        "standard_usd_per_second": null,
+        "standard_usd_per_second": {
+          "768p": 0.06
+        },
         "min_job_usd": 0.1,
         "long_clip": {
-          "over_s": 10,
-          "multiplier": 1.2
+          "over_s": 6,
+          "multiplier": 1.5
         }
       },
       "vcu_weights": {

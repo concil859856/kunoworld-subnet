@@ -27,9 +27,10 @@ RATES = {
     ("ltx-2.5-pro", "1080p"): (0.11, 0.085),
     ("ltx-2.5-4k", "1440p"): (0.15, 0.12),
     ("ltx-2.5-4k", "2160p"): (0.32, 0.25),
-    ("h3-turbo", "768p"): (0.065, 0.05),
-    ("h3", "768p"): (0.20, None),
-    ("h3-reference", "768p"): (0.30, None),
+    # H3's Standard prices are fal's list prices (2026-09-16); Private covers the measured cost at every length.
+    ("h3-turbo", "768p"): (0.065, 0.04),
+    ("h3", "768p"): (0.30, 0.06),
+    ("h3-reference", "768p"): (0.50, 0.06),
 }
 
 
@@ -66,12 +67,14 @@ def test_high_frame_rates_multiply_the_whole_ltx_job():
     assert PROFILES["ltx-2.5-4k"].price_usd(params("ltx-2.5-4k", resolution="2160p", fps=50), "standard") == 1.875
 
 
-def test_h3_clips_over_ten_seconds_cost_more_for_the_whole_clip():
+def test_long_private_h3_clips_cost_more_for_the_whole_clip_and_standard_stays_flat():
     turbo = PROFILES["h3-turbo"]
-    assert turbo.price_usd(params("h3-turbo", duration_s=10)) == 0.65
-    assert turbo.price_usd(params("h3-turbo", duration_s=11)) == 0.858  # 0.065 x 11 x 1.2
-    assert turbo.price_usd(params("h3-turbo", duration_s=11), "standard") == 0.66
-    assert PROFILES["h3"].price_usd(params("h3", duration_s=14)) == 3.36
+    assert turbo.price_usd(params("h3-turbo", duration_s=8)) == 0.52
+    assert turbo.price_usd(params("h3-turbo", duration_s=10)) == 0.91  # 0.065 x 10 x 1.4
+    assert turbo.price_usd(params("h3-turbo", duration_s=10), "standard") == 0.40  # no long-clip rule in Standard
+    assert PROFILES["h3"].price_usd(params("h3", duration_s=14)) == 7.14  # 0.30 x 14 x 1.7
+    assert PROFILES["h3"].price_usd(params("h3", duration_s=14), "standard") == 0.84
+    assert PROFILES["h3-reference"].price_usd(params("h3-reference", duration_s=6)) == 3.0
     # LTX has no long-clip rule.
     assert PROFILES["ltx-2.5-fast"].price_usd(params("ltx-2.5-fast", duration_s=20)) == 1.0
 
@@ -84,8 +87,10 @@ def test_no_job_costs_less_than_the_minimum_charge():
 
 
 def test_private_only_profiles_refuse_a_standard_price():
+    # Every shipped profile has a Standard price now; a profile without one is Private-only.
     for profile_id in ("h3", "h3-reference"):
-        profile = PROFILES[profile_id]
+        shipped = PROFILES[profile_id]
+        profile = shipped.model_copy(update={"pricing": shipped.pricing.model_copy(update={"standard_usd_per_second": None})})
         assert profile.privacy_modes == ["private"] and not profile.offers("standard")
         assert profile.price_usd(params(profile_id)) > 0
         with pytest.raises(PrivacyModeUnavailable, match="Private mode only"):

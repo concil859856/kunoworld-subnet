@@ -124,7 +124,8 @@ PRIVACY_MODES = ("private", "standard")
 
 
 class LongClip(BaseModel):
-    """A multiplier on the whole job once its duration exceeds `over_s`."""
+    """A multiplier on a whole Private job once its duration exceeds `over_s`. Standard prices follow the market's list
+    prices, which are flat per second, so it never applies to them."""
 
     over_s: float
     multiplier: float
@@ -339,7 +340,8 @@ class ModelProfile(BaseModel):
         return privacy in self.privacy_modes
 
     def price_usd(self, params: GenerationParams, privacy: str = "private") -> float:
-        """Per-second rate x duration x the fps and long-clip multipliers, never below the profile's minimum charge."""
+        """Per-second rate x duration x the fps multiplier (and, in Private mode, the long-clip multiplier), never below
+        the profile's minimum charge."""
         if privacy not in PRIVACY_MODES:
             raise ParamError(f"unknown privacy mode {privacy!r}")
         if not self.offers(privacy):
@@ -350,7 +352,7 @@ class ModelProfile(BaseModel):
         if rate is None:
             raise ParamError(f"{self.name} has no {privacy} price for {params.resolution}")
         usd = rate * params.duration_s * pricing.fps_multipliers.get(params.fps, 1.0)
-        if pricing.long_clip is not None and params.duration_s > pricing.long_clip.over_s:
+        if privacy == "private" and pricing.long_clip is not None and params.duration_s > pricing.long_clip.over_s:
             usd *= pricing.long_clip.multiplier
         return round(max(pricing.min_job_usd, usd), 4)
 
@@ -389,7 +391,7 @@ class ParamError(ValueError):
 
 
 class PrivacyModeUnavailable(ParamError):
-    """The profile isn't sold in the requested privacy mode (full H3 and H3 Director are Private-only)."""
+    """The profile isn't sold in the requested privacy mode (a profile with no Standard price is Private-only)."""
 
 
 def validate_params(profile: ModelProfile, params: GenerationParams) -> None:
