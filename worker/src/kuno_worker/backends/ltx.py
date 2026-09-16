@@ -122,8 +122,8 @@ def build_command(task: GenerationTask, paths: LtxPaths, directory: Path, output
             "--temporal-upsampler-path", paths.temporal_upsampler,
             "--temporal-upscalings", "1" if temporal else "0",
         ]
-    if task.options.get("enhance_prompt") and task.profile.limits.prompt_enhancer:
-        argv.append("--enhance-prompt")
+    # No --enhance-prompt: the CLI would rewrite the prompt inside its own process, where the worker cannot check the
+    # result before rendering. This backend has no separate enhancement step, so the option has no effect here.
 
     if pipeline == "a2vid_two_stage":
         audio = task.first(InputRole.SOURCE_AUDIO)

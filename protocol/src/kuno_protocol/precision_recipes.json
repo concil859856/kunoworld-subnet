@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Weight precision recipes for the resident LTX-2.5 backend, diffusers layout (Lightricks/LTX-2.5-Diffusers). Memory figures are GiB estimates (measured: false) until worker/scripts/benchmark_ltx_quantized.py measures them on the class; they are not part of the weights digest. No per-file SHA-256 is pinned: LTX-2.5 is gated and Hugging Face shows none (checked 2026-09-14), so the owner publishes kuno-devkit weights-digest output in the manifest instead.",
+  "note": "Weight precision recipes for the resident LTX-2.5 backend, diffusers layout (Lightricks/LTX-2.5-Diffusers). Memory figures are GiB estimates (measured: false) until worker/scripts/benchmark_ltx_quantized.py measures them on the class; they are not part of the weights digest. No per-file SHA-256 is pinned: LTX-2.5 is gated and Hugging Face shows none (checked 2026-09-14), so the owner publishes kuno-devkit weights-digest output in the manifest instead. `include` names everything the loaded pipeline reads, so all of it is hashed: `processor` holds the prompt enhancer's chat template and tokenizer, which shape the text it writes as much as its weights do.",
   "recipes": [
     {
       "id": "ltx-2.5-distilled/bf16/1",
@@ -9,7 +9,7 @@
       "precision": "bf16",
       "runtime": "diffusers-ltx2/1",
       "transformer_subfolder": "transformer",
-      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "prompt_enhancer"],
+      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "prompt_enhancer", "processor"],
       "components": {
         "transformer": {"method": "none"},
         "text_encoder": {"method": "none"}
@@ -39,7 +39,7 @@
       "precision": "bf16",
       "runtime": "diffusers-ltx2/1",
       "transformer_subfolder": "transformer_full",
-      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer_full", "vae", "audio_vae", "vocoder", "latent_upsampler", "prompt_enhancer"],
+      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer_full", "vae", "audio_vae", "vocoder", "latent_upsampler", "prompt_enhancer", "processor"],
       "components": {
         "transformer": {"method": "none"},
         "text_encoder": {"method": "none"}
@@ -66,7 +66,7 @@
       "precision": "bf16",
       "runtime": "diffusers-ltx2/1",
       "transformer_subfolder": "transformer",
-      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "temporal_latent_upsampler", "diffusion_decoder", "prompt_enhancer"],
+      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "temporal_latent_upsampler", "diffusion_decoder", "prompt_enhancer", "processor"],
       "components": {
         "transformer": {"method": "none"},
         "text_encoder": {"method": "none"}
@@ -92,7 +92,7 @@
       "precision": "fp8-cast",
       "runtime": "diffusers-ltx2/1",
       "transformer_subfolder": "transformer",
-      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "prompt_enhancer"],
+      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "prompt_enhancer", "processor"],
       "components": {
         "transformer": {
           "method": "layerwise-cast",
@@ -127,7 +127,7 @@
       "precision": "int8-wo",
       "runtime": "diffusers-ltx2/1",
       "transformer_subfolder": "transformer",
-      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "prompt_enhancer"],
+      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "prompt_enhancer", "processor"],
       "components": {
         "transformer": {
           "method": "torchao",

@@ -62,6 +62,10 @@ def build_call(task: GenerationTask) -> dict[str, Any]:
         "frame_rate": float(params.fps),
         "seed": task.seed,
         "generate_audio": params.audio,
+        # Never inside the render: diffusers would rewrite the prompt between the worker's safety check and the text
+        # encoder. The worker enhances as a step of its own and checks the result (LtxResidentBackend.enhance_prompt),
+        # so `prompt` here is already the text to condition on. Explicit, so no diffusers default can turn it back on.
+        "enable_prompt_enhancement": False,
     }
     if distilled:
         call["sigmas"] = DISTILLED_SIGMAS
@@ -76,8 +80,6 @@ def build_call(task: GenerationTask) -> dict[str, Any]:
         call["use_cross_timestep"] = True  # as the LTX-2.5-Diffusers card runs transformer_full
         if task.negative_prompt:
             call["negative_prompt"] = task.negative_prompt
-    if profile.limits.prompt_enhancer and task.options.get("enhance_prompt"):
-        call["enable_prompt_enhancement"] = True
     if profile.variant == "dfr":
         call["spatial_upscalings"] = 1
         call["temporal_upscalings"] = 1 if params.fps >= 48 else 0
@@ -121,6 +123,7 @@ def build_call(task: GenerationTask) -> dict[str, Any]:
 class LtxResidentBackend(Backend):
     name = "ltx-2.5/resident"
     storyboards = True
+    prompt_enhancement = True
 
     def __init__(
         self,
@@ -216,6 +219,31 @@ class LtxResidentBackend(Backend):
         self.memory_plan(profile)
         self.store.warm(profile)
 
+    def enhance_prompt(self, task: GenerationTask) -> str:
+        """The loaded pipeline's prompt enhancer (Gemma-4-E2B, `prompt_enhancer/` with `processor/`'s chat template) run
+        on `task.prompt` for the call `generate(task)` will make, as diffusers would have run it inside that call
+        (runtimes.LtxAdapter.enhance_prompt). Memory is admitted first, so a request this class refuses costs no
+        enhancement."""
+        if task.params.mode is Mode.STORYBOARD:
+            raise BackendError("storyboard shots are rendered as written, never enhanced")
+        import shutil
+
+        directory = self.workdir / task.job_id
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            for item in task.inputs:  # an image-to-video call enhances with its first condition's image
+                item.save(directory)
+            call = build_call(task)
+            self.admit(task, call)
+            self._pin(task.profile)  # before the first load, as generate does, if no warm-up loaded the weights
+            with self.store.acquire(task.profile) as loaded:
+                enhance = getattr(loaded, "enhance_prompt", None)
+                if not callable(enhance):
+                    raise BackendError("the loaded LTX-2.5 runtime cannot enhance prompts")
+                return enhance(call)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
         if task.params.mode is Mode.STORYBOARD:
             return self._storyboard(task, progress)
@@ -226,6 +254,13 @@ class LtxResidentBackend(Backend):
                 item.save(directory)
             call = build_call(task)
             self.admit(task, call)
+            # `task.prompt` is the text the model conditions on: the enhanced prompt when the worker enhanced one
+            # (worker.Worker._enhance), since the call no longer enhances. So the retained replay context and the
+            # transcript's conditioning digest (prompt_embeds, verified_gpu.ltx_step_callback) describe the same text.
+            # Validators replay only their canaries and option-free Standard jobs (kuno_validator.audits.standard_record),
+            # and canaries never send enhance_prompt, so every replayed job's conditioning is the prompt the validator
+            # holds. A canary that asked for enhancement would fail the conditioning check against an executor that
+            # encodes the raw prompt, so one may only be sent once the executor enhances the same way first.
             recorder = self.step_recorder(task, context_bytes(prompt=task.prompt, negative_prompt=task.negative_prompt))
             tap = None
             if recorder is not None:

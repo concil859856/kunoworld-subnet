@@ -6,7 +6,9 @@ import logging
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 
 import httpx
 from pydantic import ValidationError
@@ -25,8 +27,8 @@ from kuno_protocol.sealed_payload import MalformedPayload, open_payload
 from kuno_protocol.verified import MinerAudit
 
 from .audits import AuditCalls, AuditResponder
-from .backends.base import Backend, GenerationTask, InputFile
-from .backends.media_tools import CapacityRefused
+from .backends.base import ENHANCE_PROMPT_OPTION, Backend, GenerationTask, InputFile
+from .backends.media_tools import BackendError, CapacityRefused
 from .config import WorkerConfig
 from .gateway_client import GatewayClient, GatewayError
 from .identity import EnclaveIdentity
@@ -39,6 +41,9 @@ PROGRESS_INTERVAL_S = 0.5
 # While a job runs the worker doesn't pull, and the gateway counts an enclave silent for a minute (enclave_heartbeat_s)
 # as gone. A render or an upload can block the job thread for longer, so a side thread repeats the last progress report.
 HEARTBEAT_S = 20.0
+# One message for every blocked prompt, whoever wrote it. In Private mode the gateway sees failure messages but not the
+# sealed options, so a message of its own for an enhanced prompt would tell it that enhancement was asked for.
+PROMPT_BLOCKED = "The request was blocked by the content policy."
 
 
 class JobRejected(Exception):
@@ -506,13 +511,17 @@ class Worker:
             raise JobRejected("prompt_too_long", f"Prompts are limited to {profile.limits.max_prompt_chars} characters.")
         if payload.negative_prompt and not profile.limits.negative_prompt:
             raise JobRejected("unsupported_option", f"{profile.name} does not use negative prompts.")
+        enhance = bool(profile.limits.prompt_enhancer and payload.options.get(ENHANCE_PROMPT_OPTION))
+        if enhance and job.params.mode is Mode.STORYBOARD:
+            # Refused rather than enhanced shot by shot: each shot would be its own enhancer run (tens of seconds on
+            # the GPU, unmeasured, times up to max_shots) and its own check, and shots rewritten one at a time are free
+            # to describe the same scene differently across the joins. Shots render the prompts the customer wrote.
+            raise JobRejected("unsupported_option", "Prompt enhancement is not available for storyboards.")
         try:
             for prompt in model_prompts:
                 check_request(prompt, payload.negative_prompt)
         except SafetyViolation:
-            raise JobRejected("safety_blocked", "The request was blocked by the content policy.") from None
-        # Booleans only (e.g. "the prompt names a minor"); the frame check uses them to err toward blocking.
-        signals = RequestSignals.combine(request_signals(prompt, payload.negative_prompt) for prompt in model_prompts)
+            raise JobRejected("safety_blocked", PROMPT_BLOCKED) from None
 
         width, height = profile.size_for(job.params.resolution, job.params.aspect_ratio)
         task = GenerationTask(
@@ -528,7 +537,16 @@ class Worker:
             options=payload.options,
             shot_prompts=model_prompts if job.params.mode is Mode.STORYBOARD else None,
         )
+        # Before any enhancement, which counts as generating: a stage of its own would tell the gateway, which sees
+        # progress but not the sealed options, that enhancement was asked for.
         self._progress(job.job_id, 0.05, "generating", force=True)
+        checked = list(model_prompts)
+        if enhance and getattr(backend, "prompt_enhancement", False):
+            task = self._enhance(backend, task)
+            checked.append(task.prompt)
+        # Booleans only (e.g. "the prompt names a minor"), over every prompt checked: the customer's, and the enhanced
+        # one, which may name what the customer's didn't. The frame check uses them to err toward blocking.
+        signals = RequestSignals.combine(request_signals(prompt, payload.negative_prompt) for prompt in checked)
         result = backend.generate(task, lambda value, stage: self._progress(job.job_id, 0.05 + 0.85 * value, stage))
         if result.openings is not None:
             self._openings[job.job_id] = result.openings
@@ -610,6 +628,35 @@ class Worker:
             # gateway replaces this with an issued certificate, or with a dev one only if the gateway has no CA.
             self._install_dev_certificate(signer, PROVISIONAL)
         return signer
+
+    def _enhance(self, backend: Backend, task: GenerationTask) -> GenerationTask:
+        """The task to render when the customer asked for prompt enhancement: the backend's rewrite of the prompt,
+        checked like the customer's prompt, with the option removed so nothing downstream enhances again."""
+        [enhanced] = self._generate_checked(lambda: [backend.enhance_prompt(task)], task.negative_prompt)
+        options = {key: value for key, value in task.options.items() if key != ENHANCE_PROMPT_OPTION}
+        return replace(task, prompt=enhanced, options=options)
+
+    @staticmethod
+    def _generate_checked(generate: Callable[[], list[str]], negative_prompt: str | None) -> list[str]:
+        """Text a language model writes inside the enclave, held to the customer's own prompt check before anything
+        conditions on it: the shared content policy, then the prompt classifier (`check_request`), each text with the
+        negative prompt it will render beside. Every step that generates text with a loaded model goes through here: an
+        enhanced prompt today, a plan's shot prompts later. It reports no progress stage of its own, since the gateway
+        sees stages, and whether a prompt was enhanced is sealed.
+
+        A block is `safety_blocked` with the fixed message any prompt gets. A classifier that cannot answer fails the
+        job as the miner's internal_error, as it does for the customer's prompt. The customer's length limit is not
+        applied: the enhancer's own token budget bounds what it writes, and the customer can't shorten it."""
+        texts = generate()
+        if not texts or any(not isinstance(text, str) or not text.strip() for text in texts):
+            # A model that wrote nothing: a failure of this worker, not a prompt to render or to blame on the customer.
+            raise BackendError("the language model returned no text")
+        try:
+            for text in texts:
+                check_request(text, negative_prompt)
+        except SafetyViolation:
+            raise JobRejected("safety_blocked", PROMPT_BLOCKED) from None
+        return texts
 
     @staticmethod
     def _model_prompts(params: GenerationParams, payload: SealedPayload) -> list[str]:

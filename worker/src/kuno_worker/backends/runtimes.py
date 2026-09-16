@@ -82,6 +82,25 @@ class LtxAdapter:
             "sampling_rate": _audio_rate(pipeline, result),
         }
 
+    def enhance_prompt(self, call: dict[str, Any]) -> str:
+        """The prompt `call` would condition on had it passed `enable_prompt_enhancement=True`, computed apart from the
+        render so the worker can check it first. As diffusers 0.40 does inside the call (LTX2Pipeline.__call__ and
+        LTX2ConditionPipeline.__call__ into `enhance_prompt`): the dedicated `prompt_enhancer` through `processor`'s chat
+        template, greedy (GEMMA4_PROMPT_ENHANCEMENT_CONFIG), seeded with the job seed its generator would carry; on the
+        condition pipeline with the first condition's image and LTX-2.5's image-to-video instructions, otherwise with
+        the text-to-video ones. Once per job: inside the call, the distilled recipe's second pass enhanced again."""
+        from diffusers.pipelines.ltx2.utils import LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT, LTX2_5_T2V_DEFAULT_SYSTEM_PROMPT
+
+        pipeline = self.pipelines.get(call["pipeline"]) or self.pipelines["text"]
+        if getattr(pipeline, "prompt_enhancer", None) is None or getattr(pipeline, "processor", None) is None:
+            # diffusers would fall back to the text encoder, which LTX-2.5 did not train for enhancement.
+            raise RuntimeError("the loaded LTX-2.5 pipeline has no prompt_enhancer and processor")
+        conditions = call.get("conditions") or []
+        image = _load_image(conditions[0]["path"]) if conditions and pipeline is self.pipelines.get("condition") else None
+        instructions = LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT if image is not None else LTX2_5_T2V_DEFAULT_SYSTEM_PROMPT
+        [enhanced] = pipeline.enhance_prompt(prompt=call["prompt"], system_prompt=instructions, seed=int(call["seed"]), image=image)
+        return enhanced
+
     @staticmethod
     def _two_stage(pipeline: Any, upsample: Any, generator: Any, second_stage: list[float], call: dict[str, Any]) -> Any:
         """The distilled recipe diffusers documents for LTX-2.5: the first sigmas at half size, the video latents

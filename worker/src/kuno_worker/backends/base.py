@@ -15,6 +15,9 @@ from ..verified import OpeningsHandle, RetentionStore, StepRecorder, shared_rete
 
 ProgressFn = Callable[[float, str], None]
 
+# The sealed option (SealedPayload.options) asking a profile with `limits.prompt_enhancer` to rewrite the prompt first.
+ENHANCE_PROMPT_OPTION = "enhance_prompt"
+
 
 @dataclass
 class InputFile:
@@ -108,6 +111,11 @@ class Backend(ABC):
     # Renders storyboard jobs (PROTOCOL.md, "Storyboards"). A backend without it would render one clip of the stitched
     # length, so the worker refuses the job instead.
     storyboards: bool = False
+    # Rewrites a prompt with a language model the backend already holds (LTX-2.5's bundled prompt enhancer), as a step of
+    # its own: the worker checks the text `enhance_prompt` returns exactly as it checks a customer's prompt, then renders
+    # it (worker.Worker._enhance). `generate` never rewrites a prompt itself, since nothing would check what it wrote.
+    # Without it the option has no effect, and the prompt renders as sent.
+    prompt_enhancement: bool = False
 
     def warm(self, profile: ModelProfile) -> None:
         """Load weights ahead of the first job. TEE model loads are slow; do it once."""
@@ -142,6 +150,11 @@ class Backend(ABC):
             context=context,
             audit_binding=binding if isinstance(binding, str) else None,
         )
+
+    def enhance_prompt(self, task: GenerationTask) -> str:
+        """`task.prompt` rewritten by the backend's prompt enhancer for the render `generate(task)` would make. Only
+        called when `prompt_enhancement` is set, never for a storyboard; errors must not carry either prompt."""
+        raise NotImplementedError(f"{self.name} has no prompt enhancer")
 
     @abstractmethod
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult: ...
