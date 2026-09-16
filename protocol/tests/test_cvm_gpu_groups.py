@@ -43,16 +43,35 @@ def table(tmp_path_factory) -> Path:
     return path
 
 
-def groups(table: Path, spec: str, profiles: str, gpus: int = 8):
+def agent(*args: str):
     if shutil.which("bash") is None:
         pytest.skip("kuno-app needs bash")
-    return subprocess.run(["bash", str(AGENT), "--gpu-groups", spec, profiles, str(table), *map(str, range(gpus))], capture_output=True, text=True)
+    return subprocess.run(["bash", str(AGENT), *args], capture_output=True, text=True)
+
+
+def groups(table: Path, spec: str, profiles: str, gpus: int = 8):
+    return agent("--gpu-groups", spec, profiles, str(table), *map(str, range(gpus)))
 
 
 def test_two_h3_workers_split_an_eight_gpu_vm_into_groups_of_four(table):
-    out = groups(table, "0,1,2,3 4,5,6,7", "h3-turbo, h3,h3-reference")
+    out = groups(table, "0,1,2,3 4,5,6,7", "h3-turbo, h3,h3-reference")  # one list, with a space after a comma
     assert out.returncode == 0, out.stderr
-    assert out.stdout.split() == ["0,1,2,3", "4,5,6,7"]
+    assert out.stdout.splitlines() == ["0,1,2,3 h3-turbo,h3,h3-reference", "4,5,6,7 h3-turbo,h3,h3-reference"]
+
+
+@pytest.mark.parametrize(
+    ("spec", "profiles", "workers"),
+    [
+        ("0,1,2,3 4,5,6,7", "h3-turbo h3-reference", ["0,1,2,3 h3-turbo", "4,5,6,7 h3-reference"]),
+        ("4,5,6,7 0,1,2,3", " h3 ,h3-turbo\th3-reference ", ["4,5,6,7 h3,h3-turbo", "0,1,2,3 h3-reference"]),
+        ("0 1 2", "ltx-2.5-fast", ["0 ltx-2.5-fast", "1 ltx-2.5-fast", "2 ltx-2.5-fast"]),
+        ("0 1", "ltx-2.5-fast,ltx-2.5-pro ltx-2.5-4k", ["0 ltx-2.5-fast,ltx-2.5-pro", "1 ltx-2.5-4k"]),
+    ],
+)
+def test_each_gpu_group_can_serve_its_own_profiles_in_the_order_of_the_groups(table, spec, profiles, workers):
+    out = groups(table, spec, profiles)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == workers
 
 
 @pytest.mark.parametrize(
@@ -68,6 +87,11 @@ def test_two_h3_workers_split_an_eight_gpu_vm_into_groups_of_four(table):
         ("01,1,2,3", "h3", 8, "must be comma-separated GPU indices"),
         (" ", "h3", 8, "names no GPU group"),
         ("0,1,2,3", "h3", 2, "GPU 2 in group 0,1,2,3 is not in this VM"),
+        ("0,1,2,3 4,5,6,7", "h3-turbo h3-reference h3", 8, "gives 3 profile lists for 2 GPU groups"),
+        ("0,1,2,3", "h3-turbo h3-reference", 8, "gives 2 profile lists for 1 GPU groups"),
+        ("0,1,2,3 4,5,6,7", "h3-turbo ltx-2.5-fast", 8, "need different GPU counts per worker"),
+        ("0 1", "ltx-2.5-fast h9", 8, "profile h9 is not in the catalog"),
+        ("0,1,2,3", ",", 8, "KUNO_PROFILES list , names no profile"),
     ],
 )
 def test_a_layout_that_does_not_fit_the_vm_or_its_profiles_stops_the_agent(table, spec, profiles, gpus, error):
@@ -75,9 +99,25 @@ def test_a_layout_that_does_not_fit_the_vm_or_its_profiles_stops_the_agent(table
     assert out.returncode != 0 and error in out.stderr
 
 
+def test_each_worker_gets_its_group_profiles_and_its_own_h3_server_ports():
+    settings = {i: agent("--worker-settings", str(i), "h3-turbo").stdout.split() for i in (0, 1)}
+    assert settings[1] == [
+        "KUNO_PROFILES=h3-turbo", "KUNO_H3_FL2VA_URL=http://127.0.0.1:30020",
+        "KUNO_H3_REF2VA_URL=http://127.0.0.1:30021", "KUNO_H3_TURBO_URL=http://127.0.0.1:30022",
+    ]
+    ports = [int(line.rsplit(":", 1)[1]) for i in (0, 1) for line in settings[i] if line.startswith("KUNO_H3_")]
+    assert ports == [30010, 30011, 30012, 30020, 30021, 30022]  # kuno-h3-worker puts each server's other ports 1000 and 2000 up
+    assert agent("--worker-settings", "x", "h3").returncode != 0
+
+
 def test_the_agent_gives_each_worker_its_own_gpus_and_supervises_them():
     text = AGENT.read_text()
-    assert "KUNO_GPU_GROUPS" in text.split("readonly ALLOWED_ENV=", 1)[1].split("\n", 1)[0]
+    allowed = text.split("readonly ALLOWED_ENV=", 1)[1].split("\n", 1)[0].split()
+    assert {"KUNO_GPU_GROUPS", "KUNO_H3_TURBO_URL", "KUNO_H3_TURBO_LORA", "KUNO_H3_SHARED_SERVERS"} <= set(allowed)
+    workers = text.split("# One container per group, supervised", 1)[1]
+    assert 'worker_settings "$i" "${group_profiles[$i]}"' in workers and 'write_env "$STATE/worker-$i.env" "${settings[@]}"' in workers
+    # Per-group lists need groups: one worker with every GPU refuses them rather than passing them on.
+    assert "KUNO_PROFILES gives a profile list per GPU group, but KUNO_GPU_GROUPS is not set" in text
     # The table groups are sized by comes from the measured image disk, not the root filesystem.
     assert 'readonly GPUS_PER_WORKER="$IMAGE_MOUNT/gpus-per-worker"' in text and "/usr/share/kuno" not in text
     assert '--device "nvidia.com/gpu=$gpu"' in text and "--device nvidia.com/gpu=all" in text  # groups, and the default

@@ -4,35 +4,42 @@ Media reaches the runtime as TEE-local file paths and is deleted after each job.
 Never enable MiniMax's hosted prompt rewriter (H3-Context-IR) or 2K regenerator:
 both are API-only and would send customer content outside the enclave.
 
-sglang   profiles `h3` and `h3-reference` (official recipe, 4 GPUs, Ulysses SP):
-           sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
-             --performance-mode speed --port 30010 --model-variant fl2va
-           sglang serve ... --port 30011 --model-variant ref2va
-         POST /v1/videos → GET /v1/videos/{id} → GET /v1/videos/{id}/content
+Every profile goes to one of three SGLang servers (official recipe, 4 GPUs, Ulysses SP), which
+h3_servers.py starts beside the worker:
 
-lightx2v profile `h3-turbo`: ModelTC/Minimax-H3-Turbo `inference_minimax_h3.py` with the
-         8-step 768p LoRA (video shift 6, audio shift 3). The script loads weights per
-         invocation; production needs a resident runtime before this profile goes live.
+  h3            fl2va    sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
+                           --performance-mode speed --port 30010 --model-variant fl2va
+  h3-reference  ref2va   sglang serve ... --port 30011 --model-variant ref2va
+  h3-turbo      turbo    sglang serve ... --port 30012 --model-variant fl2va \
+                           --lora-path <KUNO_H3_TURBO_LORA> --lora-nickname turbo
+                         and each request carries the LoRA's shifts (video 6, audio 3)
 
-Status: written against the official docs, not yet run on GPUs. Validate every mode
-against the reference outputs in Phase 0 before enabling the profiles.
+POST /v1/videos → GET /v1/videos/{id} → GET /v1/videos/{id}/content
+
+The exception is verified mode for h3-turbo. Its profile pins the diffusers modular pipeline
+(`diffusers-modular-h3/1`), whose every step the worker commits to, so when the worker's hardware
+class is one the profile pins, `real` runs it in process (h3_resident.py) and starts no Turbo
+server. `h3` and `h3-reference` pin that runtime too, but SGLang exposes no step hook: they stay on
+SGLang in either mode, and their receipts carry no step commitment.
+
+Status: `h3` and `h3-reference` ran through this backend on 4x H200 without confidential computing
+(2026-09-15, one profile per worker). Turbo ran only straight against `sglang serve --lora-path`
+with these shifts (2026-09-16); the Turbo server and requests as built here have not run on GPUs.
 """
 
 from __future__ import annotations
 
-import json
 import shutil
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 import httpx
 
-from kuno_protocol.profiles import InputRole, Mode, h3_schedule_points
+from kuno_protocol.profiles import InputRole, Mode, ModelProfile, h3_schedule_points
 from kuno_protocol.receipts import VideoInfo
 
 from .base import Backend, GenerationTask, ProgressFn, VideoResult
+from .h3_resident import TURBO_SHIFTS
 from .media_tools import BackendError, strip_audio
 
 FPS = 24
@@ -45,7 +52,34 @@ REF_TYPES = {
     InputRole.REFERENCE_AUDIO: "audio",
     InputRole.SOURCE_AUDIO: "audio",
 }
+# The file KUNO_H3_TURBO_LORA names: lightx2v/Minimax-h3-Turbo's 8-step 768p LoRA.
 TURBO_LORA = "minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors"
+TURBO_NICKNAME = "turbo"
+# SGLang's names for the shifts the LoRA was trained with; `audio_flow_shift` is an extra field its H3 pipeline reads.
+SGLANG_TURBO_SHIFTS = {"flow_shift": TURBO_SHIFTS["video_shift"], "audio_flow_shift": TURBO_SHIFTS["audio_shift"]}
+
+
+def is_turbo(profile: ModelProfile) -> bool:
+    """LightX2V's distilled LoRA on the fl2va checkpoint (profile runtime `lightx2v`, which names where the LoRA comes from)."""
+    return profile.runtime == "lightx2v"
+
+
+def server_for(profile: ModelProfile, mode: Mode) -> str:
+    """The SGLang server a job goes to: fl2va or ref2va by checkpoint variant, or turbo for the LoRA profile."""
+    if is_turbo(profile):
+        return "turbo"
+    return "fl2va" if mode in FL2VA_MODES else "ref2va"
+
+
+def turbo_in_process(profile: ModelProfile, hardware_class: str | None) -> bool:
+    """True when `real` runs `profile` in the worker process instead of on SGLang: h3-turbo in verified mode, on a
+    hardware class the profile pins (the same test as Backend.verified_enabled)."""
+    return (
+        is_turbo(profile)
+        and hardware_class is not None
+        and profile.verified is not None
+        and profile.verified.hardware_class(hardware_class) is not None
+    )
 
 
 def _uri(path: Path) -> str:
@@ -53,7 +87,7 @@ def _uri(path: Path) -> str:
 
 
 def build_sglang_request(task: GenerationTask, directory: Path) -> tuple[str, dict]:
-    """Returns (model variant, request body) for the official SGLang video API."""
+    """Returns (server, request body) for the official SGLang video API; `server_for` names the server."""
     params = task.params
     body: dict = {
         "prompt": task.prompt,
@@ -72,7 +106,9 @@ def build_sglang_request(task: GenerationTask, directory: Path) -> tuple[str, di
             if item is not None:
                 conditions.append({"type": "image", "uri": _uri(item.save(directory)), "role": "keyframe", "frame_index": frame_index})
         body.update(task="fl2va" if conditions else "t2va", conditions=conditions)
-        return "fl2va", body
+        if is_turbo(task.profile):
+            body.update(SGLANG_TURBO_SHIFTS)
+        return server_for(task.profile, params.mode), body
 
     # Reference order sets the <Picture n> / <Video n> / <Audio n> labels the prompt refers to.
     conditions = []
@@ -85,7 +121,7 @@ def build_sglang_request(task: GenerationTask, directory: Path) -> tuple[str, di
             condition["start_time_seconds"] = item.ref.start_s
         conditions.append(condition)
     body.update(task="ref2va", conditions=conditions)
-    return "ref2va", body
+    return server_for(task.profile, params.mode), body
 
 
 def _finish(task: GenerationTask, data: bytes) -> VideoResult:
@@ -99,21 +135,35 @@ def _finish(task: GenerationTask, data: bytes) -> VideoResult:
 class H3SglangBackend(Backend):
     name = "minimax-h3"
 
-    def __init__(self, fl2va_url: str, ref2va_url: str, workdir: Path, poll_s: float = 1.0, http: httpx.Client | None = None):
-        self.urls = {"fl2va": fl2va_url.rstrip("/"), "ref2va": ref2va_url.rstrip("/")}
+    def __init__(self, fl2va_url: str, ref2va_url: str, workdir: Path, poll_s: float = 1.0, http: httpx.Client | None = None,
+                 turbo_url: str = "http://127.0.0.1:30012", turbo: Backend | None = None):
+        """`turbo` is the in-process pipeline for verified h3-turbo (build_backends sets it only where a verified
+        class could use it); every other job, h3-turbo in performance mode included, goes to the servers."""
+        self.urls = {"fl2va": fl2va_url.rstrip("/"), "ref2va": ref2va_url.rstrip("/"), "turbo": turbo_url.rstrip("/")}
         self.workdir = Path(workdir)
         self.poll_s = poll_s
         self.http = http or httpx.Client(timeout=60.0)
-        self.turbo = H3TurboBackend(self.workdir)
+        self.turbo = turbo
+
+    def _in_process(self, profile: ModelProfile) -> bool:
+        return self.turbo is not None and turbo_in_process(profile, self.turbo.hardware_class)
+
+    def verified_enabled(self, profile: ModelProfile) -> bool:
+        # Only the in-process Turbo pipeline commits to its steps; the SGLang servers have no step hook.
+        return self._in_process(profile)
+
+    def warm(self, profile: ModelProfile) -> None:
+        if self._in_process(profile):
+            self.turbo.warm(profile)  # the servers were ready before the worker started (h3_servers.py)
 
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
-        if task.profile.runtime == "lightx2v":
+        if self._in_process(task.profile):
             return self.turbo.generate(task, progress)
         directory = self.workdir / task.job_id
         directory.mkdir(parents=True, exist_ok=True)
         try:
-            variant, body = build_sglang_request(task, directory)
-            base = self.urls[variant]
+            server, body = build_sglang_request(task, directory)
+            base = self.urls[server]
             response = self.http.post(f"{base}/v1/videos", json=body)
             if response.status_code >= 400:
                 raise BackendError(f"H3 runtime rejected the request (HTTP {response.status_code})")
@@ -135,58 +185,5 @@ class H3SglangBackend(Backend):
             data = self.http.get(f"{base}/v1/videos/{video_id}/content", timeout=300).content
             progress(1.0, "decoded")
             return _finish(task, data)
-        finally:
-            shutil.rmtree(directory, ignore_errors=True)
-
-
-class H3TurboBackend(Backend):
-    """LightX2V turbo script. Jobs-JSON keys beyond duration/megapixels/aspect_ratio
-    follow the repo's examples and must be checked against examples/prompts_t2va_test.json."""
-
-    name = "minimax-h3-turbo"
-
-    def __init__(self, workdir: Path, script: str = "inference_minimax_h3.py", lora_path: str = TURBO_LORA):
-        self.workdir = Path(workdir)
-        self.script = script
-        self.lora_path = lora_path
-
-    def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
-        directory = self.workdir / task.job_id
-        out_dir = directory / "out"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            job: dict = {
-                "prompt": task.prompt,
-                "duration": task.params.duration_s,
-                "megapixels": round(task.width * task.height / 1_000_000, 4),
-                "aspect_ratio": task.params.aspect_ratio,
-            }
-            images = []
-            for role, frame_index in ((InputRole.FIRST_FRAME, 0), (InputRole.LAST_FRAME, -1)):
-                item = task.first(role)
-                if item is not None:
-                    images.append({"path": str(item.save(directory)), "frame_index": frame_index})
-            if images:
-                job["images"] = images
-            jobs_file = directory / "jobs.json"
-            jobs_file.write_text(json.dumps([job]))
-            command = [
-                sys.executable, self.script,
-                "--jobs-json", str(jobs_file),
-                "--lora-path", self.lora_path,
-                "--inference-steps", str(task.profile.steps),
-                "--video-shift", "6", "--audio-shift", "3", "--lora-alpha", "128",
-                "--seed", str(task.seed),
-                "--output-dir", str(out_dir),
-                "--no-cpu-offload",
-            ]
-            progress(0.05, "denoising")
-            result = subprocess.run(command, cwd=directory, capture_output=True, timeout=task.profile.timeout_s)
-            if result.returncode != 0:
-                raise BackendError(f"H3 turbo runtime exited with code {result.returncode}")
-            outputs = sorted(out_dir.glob("*.mp4"))
-            if not outputs:
-                raise BackendError("H3 turbo runtime produced no video")
-            return _finish(task, outputs[0].read_bytes())
         finally:
             shutil.rmtree(directory, ignore_errors=True)

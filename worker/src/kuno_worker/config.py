@@ -63,9 +63,11 @@ class WorkerConfig:
     retry_max_s: float = 300.0
     hardware: dict[str, str | int] = field(default_factory=dict)
     workdir: Path = Path("/tmp/kuno-worker")
-    # Real backends (processes inside the same CVM).
+    # Real backends (processes inside the same CVM). H3's SGLang servers: fl2va for h3, ref2va for h3-reference, and
+    # the fl2va checkpoint with the Turbo LoRA for h3-turbo.
     h3_fl2va_url: str = "http://127.0.0.1:30010"
     h3_ref2va_url: str = "http://127.0.0.1:30011"
+    h3_turbo_url: str = "http://127.0.0.1:30012"
     ltx_models_dir: Path | None = None
     h3_model_id: str = "MiniMaxAI/MiniMax-H3"
     h3_turbo_lora: str | None = None
@@ -107,6 +109,7 @@ class WorkerConfig:
             workdir=Path(env.get("KUNO_WORKDIR", "/tmp/kuno-worker")),
             h3_fl2va_url=env.get("KUNO_H3_FL2VA_URL", "http://127.0.0.1:30010"),
             h3_ref2va_url=env.get("KUNO_H3_REF2VA_URL", "http://127.0.0.1:30011"),
+            h3_turbo_url=env.get("KUNO_H3_TURBO_URL", "http://127.0.0.1:30012"),
             ltx_models_dir=_path(env.get("KUNO_LTX_MODELS_DIR")),
             h3_model_id=env.get("KUNO_H3_MODEL_ID", "MiniMaxAI/MiniMax-H3"),
             h3_turbo_lora=env.get("KUNO_H3_TURBO_LORA"),

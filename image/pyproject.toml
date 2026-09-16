@@ -4,12 +4,15 @@
 # (worker/pyproject.toml), diffusers, transformers, accelerate and PyAV.
 # `safety` runs the content safety classifiers baked into the images (transformers, timm, and torchvision from
 # the same CUDA 12.8 index); `provenance` embeds C2PA manifests (KUNO_PROVENANCE=c2pa).
+# `peft` lets diffusers load LightX2V's Turbo LoRA into the MiniMax H3 pipeline (`load_lora_weights`; diffusers 0.40
+# requires peft 0.17.0 or newer). The worker runs that pipeline only for h3-turbo in verified mode; SGLang serves the
+# LoRA otherwise.
 # SGLang, for the H3 image, has its own lock: image/sglang/uv.lock.
 [project]
 name = "kuno-worker-image"
 version = "0.1.0"
 requires-python = "==3.12.*"
-dependencies = ["kuno-worker[nvidia,gpu,safety,provenance]", "kuno-protocol"]
+dependencies = ["kuno-worker[nvidia,gpu,safety,provenance]", "kuno-protocol", "peft>=0.17.0"]
 
 [tool.uv]
 package = false

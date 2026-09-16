@@ -67,10 +67,20 @@ server, so H3 runs as one 8-GPU TD with two workers of four GPUs each:
 - `c8.b200-180gb.x8` or `c8.b300-288gb.x8`: CC mode on, with Fabric Manager on the host set to
   `PARTITION_RAIL_POLICY=symmetric`. Traffic between the GPUs is encrypted.
 
-Plan it with `plan-host.py --shape c8.…`, and put `KUNO_PROFILES=h3,h3-reference` and
-`KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7` in `worker.env`. Add `h3-turbo` only once it has run on your GPUs
-([section 3c](#3c-worker-images)). Each worker container starts its own SGLang servers; the second
-worker's listen on ports 30020 and 30021.
+Plan it with `plan-host.py --shape c8.…`, and give each group of four GPUs its own profiles in `worker.env`:
+
+```
+KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7
+KUNO_PROFILES=h3-turbo h3-reference
+KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors
+```
+
+`KUNO_PROFILES` lists each group's profiles in the order of the groups, space-separated: here GPUs 0–3
+serve `h3-turbo` and GPUs 4–7 `h3-reference`. One loaded H3 takes 87–97 GB of each H200, so a worker
+refuses to load it twice, and each group serves one of `h3`, `h3-reference` and `h3-turbo`
+(image/CVM.md §6). Each worker container starts its own SGLang server; the second worker's listen on
+ports 30020–30022. `h3-turbo` has run on H200s straight against SGLang, not yet through the worker
+([section 3c](#3c-worker-images)).
 
 ## 2. Get the weights
 
@@ -98,14 +108,20 @@ directory:
 
 Those files are what the weights digest covers (`kuno-devkit weights-digest`, below).
 
-MiniMax H3 (about 124 GB) is served by the official SGLang server, one per checkpoint:
+MiniMax H3 (about 124 GB) is served by the official SGLang server, one per profile:
 
 ```bash
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
-  --performance-mode speed --port 30010 --model-variant fl2va     # h3, h3-turbo
+  --performance-mode speed --port 30010 --model-variant fl2va     # h3
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
   --performance-mode speed --port 30011 --model-variant ref2va    # h3-reference
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
+  --performance-mode speed --port 30012 --model-variant fl2va \
+  --lora-path /models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors --lora-nickname turbo   # h3-turbo
 ```
+
+Each takes 87–97 GB of every one of its four H200s, so run one per set of four GPUs. The Turbo LoRA
+comes from `lightx2v/Minimax-h3-Turbo`.
 
 The H3 worker image starts these servers itself ([section 3c](#3c-worker-images)). It reads the
 weights from a Hugging Face hub cache mounted at `/models/h3`, for example one written by
@@ -204,12 +220,12 @@ export KUNO_BACKEND=real
 export KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors   # h3-turbo only
 ```
 
-For MiniMax H3, `real` still prefers the official SGLang servers from step 2 (already
-resident); only the Turbo LoRA profile runs through the in-process pipeline. That path is not ready: the H3 image
-lacks `peft`, which diffusers needs to load the LoRA. SGLang 0.5.19 serves the LoRA itself (`--lora-path`; measured
-2026-09-16), and the worker does not use that yet. Serving several profiles on one machine loads them in turn and evicts
-the least recently used when VRAM runs out, so pin `KUNO_PROFILES` to what the card can
-actually hold.
+For MiniMax H3, `real` sends every profile to the SGLang servers from step 2, which are already
+resident; `h3-turbo` goes to its own server with the LoRA. The exception is verified mode for `h3-turbo`
+(`KUNO_VERIFIED_HARDWARE_CLASS` set to a C4 class): it runs in the worker process through diffusers, the runtime its
+profile pins, so that the worker can commit to every step, and no Turbo server starts. That path has not run on GPUs.
+Serving several LTX-2.5 profiles on one machine loads them in turn and evicts the least recently used when VRAM runs
+out, so pin `KUNO_PROFILES` to what the card can actually hold.
 
 ## 3c. Worker images
 
@@ -219,7 +235,7 @@ one repository, `<registry>/<namespace>/kunoworld-worker`, by `image/push.sh`:
 | Tag | Built locally as | Serves | Default `KUNO_PROFILES` | Entry point |
 |---|---|---|---|---|
 | `ltx-<version>` | `kuno-worker:ltx` | `ltx-2.5-fast`, `ltx-2.5-pro`, `ltx-2.5-4k` | `ltx-2.5-fast` | `kuno-worker` |
-| `h3-<version>` | `kuno-worker:h3` | `h3`, `h3-reference`; `h3-turbo` when you enable it | `h3,h3-reference` | `kuno-h3-worker`: SGLang's servers, then the worker |
+| `h3-<version>` | `kuno-worker:h3` | `h3`, `h3-reference`, `h3-turbo` (with its LoRA mounted) | `h3` | `kuno-h3-worker`: SGLang's server, then the worker |
 
 They are about 6.6 GB (`ltx`) and 10.9 GB (`h3`) to pull, and 17.6 GB and 31.6 GB unpacked.
 `<version>` is the worker package's version and the commit it was built from, for example
@@ -231,7 +247,7 @@ not by tag. No digest is published yet.
 | Image | Mount | What it holds |
 |---|---|---|
 | `ltx` | `/models/ltx-2.5` (`KUNO_LTX_MODELS_DIR`) | the diffusers layout from [section 2](#2-get-the-weights), about 66 GB |
-| `h3` | `/models/h3` (`HF_HUB_CACHE`) | a Hugging Face hub cache holding `MiniMaxAI/MiniMax-H3`, about 124 GB; `KUNO_H3_TURBO_LORA` names the Turbo LoRA's path if you enable `h3-turbo` |
+| `h3` | `/models/h3` (`HF_HUB_CACHE`) | a Hugging Face hub cache holding `MiniMaxAI/MiniMax-H3`, about 124 GB; for `h3-turbo`, also the Turbo LoRA, whose path `KUNO_H3_TURBO_LORA` names |
 
 **Already set in the images:**
 - `KUNO_BACKEND=real` and `KUNO_TEE=tdx`.
@@ -244,7 +260,11 @@ not by tag. No digest is published yet.
 - `KUNO_TEE`: `open` on a box without TDX, or `mock` on a dev network.
 - Your hotkey: `KUNO_HOTKEY_SEED_FILE`, pointing at a mounted file.
 - `KUNO_PROFILES`, `KUNO_VERIFIED_HARDWARE_CLASS` and `KUNO_MODEL_DIGEST`.
-- H3 only, all optional:
+- H3 only:
+  - `KUNO_PROFILES`: one H3 profile per four GPUs. The worker refuses a set that loads H3 twice, such as
+    `h3,h3-reference`, because two don't fit on H200s or, very likely, B200s. `KUNO_H3_SHARED_SERVERS=1` allows it,
+    for GPUs that hold two such as B300s (never run).
+  - `KUNO_H3_TURBO_LORA`: the Turbo LoRA's path, required for `h3-turbo`.
   - `KUNO_H3_NUM_GPUS`: default 4.
   - `KUNO_SGLANG_ARGS`: extra `sglang serve` flags.
   - `KUNO_SGLANG_START_TIMEOUT_S`: default 3600.
@@ -273,7 +293,8 @@ MiniMax H3 on four GPUs. H3 has no open-tier class, so outside a CVM this is a d
 
 ```bash
 docker run --rm --gpus '"device=0,1,2,3"' --ipc host \
-  -v /models/h3:/models/h3:ro -e KUNO_PROFILES=h3,h3-reference … \
+  -v /models/h3:/models/h3:ro -e KUNO_PROFILES=h3-turbo \
+  -e KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors … \
   <registry>/<namespace>/kunoworld-worker@sha256:<h3 digest>
 ```
 
@@ -298,7 +319,8 @@ What the H3 image needs from the host:
   - **Where to run.** Place H3 workers close to a landmark, in a licensed country.
 
 **Both images have run on rented GPUs, without confidential computing.** LTX-2.5 Fast and Pro ran on an RTX PRO 6000;
-H3 and H3 Director ran on 4× H200. Neither has run inside a confidential VM; image/CVM.md lists what is unverified.
+H3 and H3 Director ran on 4× H200, one profile per worker. H3 Turbo ran on 4× H200 straight against the image's SGLang,
+not yet through the worker. Neither image has run inside a confidential VM; image/CVM.md lists what is unverified.
 
 ## 4. Mainnet
 

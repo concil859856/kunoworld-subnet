@@ -1,9 +1,12 @@
 """MiniMax H3 kept resident through the diffusers modular pipeline.
 
-The SGLang server (backends/h3.py) is already resident and is the officially documented
-serving path; use it when it is running. This backend serves the LightX2V Turbo LoRA, whose
-only documented entry point reloads ~124 GB per job. SGLang 0.5.19 can serve that LoRA too
-(`--lora-path`, measured 2026-09-16); this path also needs `peft`, which the H3 image lacks.
+The worker serves every H3 profile from SGLang's servers (backends/h3.py), h3-turbo included
+(`--lora-path`, measured 2026-09-16). In serving, this backend is verified h3-turbo: the profile pins
+this pipeline (`diffusers-modular-h3/1`), and only here does the worker see, and commit to, every
+step. `real` routes h3-turbo here only on a hardware class the profile pins; h3_servers.py then
+starts no Turbo server. diffusers loads the LoRA through `peft` (image/pyproject.toml).
+Not yet run on GPUs. Its loader has no sequence parallelism, while the classes h3-turbo pins name
+Ulysses x4.
 
 As everywhere else, the call is plain data and tested without a GPU; only the loader in
 runtimes.py needs hardware.
@@ -31,7 +34,7 @@ REFERENCE_TYPES = {
     InputRole.REFERENCE_AUDIO: "audio",
     InputRole.SOURCE_AUDIO: "audio",
 }
-# LightX2V's 768p distilled LoRA is trained for these shifts.
+# LightX2V's 768p distilled LoRA is trained for these shifts; backends/h3.py sends the same ones to SGLang.
 TURBO_SHIFTS = {"video_shift": 6.0, "audio_shift": 3.0}
 FULL_SHIFTS = {"video_shift": 12.0, "audio_shift": 3.0}
 

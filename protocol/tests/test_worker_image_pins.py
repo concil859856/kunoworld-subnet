@@ -130,8 +130,10 @@ def test_default_profiles_and_entry_points_match_what_each_image_can_serve():
     catalog = load_profiles()
     ltx, h3 = stage_env("ltx"), stage_env("h3")
     assert all(catalog[p].family == "ltx-2.5" for p in ltx["KUNO_PROFILES"].split(","))
-    # h3-turbo runs in the worker process with a LoRA the operator mounts; the image's defaults are the SGLang profiles.
-    assert h3["KUNO_PROFILES"].split(",") and all(catalog[p].runtime == "sglang" for p in h3["KUNO_PROFILES"].split(","))
+    # kuno-h3-worker loads H3 once per worker's GPUs, so the default is one H3 profile, and not h3-turbo, which needs
+    # a LoRA mounted (worker/tests/test_h3_sglang_launcher.py checks that the default plans one server).
+    [default] = h3["KUNO_PROFILES"].split(",")
+    assert catalog[default].family == "minimax-h3" and catalog[default].runtime == "sglang"
     assert 'ENTRYPOINT ["kuno-worker"]' in stage("ltx") and 'ENTRYPOINT ["kuno-h3-worker"]' in stage("h3")
     assert h3["KUNO_SGLANG_BIN"] == "/opt/sglang/bin/sglang"
     assert "COPY --from=sglang-build /opt/sglang /opt/sglang" in stage("h3")
@@ -150,7 +152,8 @@ def test_base_images_python_environments_and_debian_packages_are_pinned():
     extras = set(re.fullmatch(r"kuno-worker\[([^\]]+)\]", worker_image["project"]["dependencies"][0]).group(1).split(","))
     assert {"nvidia", "gpu", "safety", "provenance"} <= extras
     worker_lock = {p["name"]: p for p in tomllib.loads((IMAGE / "uv.lock").read_text())["package"]}
-    assert {"timm", "torchvision", "transformers", "c2pa-python", "diffusers", "av"} <= set(worker_lock)
+    # peft: diffusers' load_lora_weights for verified h3-turbo's in-process pipeline.
+    assert {"timm", "torchvision", "transformers", "c2pa-python", "diffusers", "av", "peft"} <= set(worker_lock)
 
     sglang_project = tomllib.loads((IMAGE / "sglang" / "pyproject.toml").read_text())
     pinned = re.fullmatch(r"sglang\[diffusion\]==(\S+)", sglang_project["project"]["dependencies"][0]).group(1)

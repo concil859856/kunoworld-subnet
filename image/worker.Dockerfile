@@ -130,8 +130,10 @@ RUN set -e; cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
     for f in "$cuda"/lib/lib*.so.[0-9]*; do name="${f%%.so.*}.so"; [ -e "$name" ] || ln -s "$(basename "$f")" "$name"; done; \
     test -e "$cuda/lib64/libcudart.so"
 # The H3 weights are a Hugging Face hub cache mounted at /models/h3 (models--MiniMaxAI--MiniMax-H3/…), which
-# SGLang and diffusers both resolve offline. h3-turbo is not a default profile: see image/CVM.md.
-ENV KUNO_PROFILES=h3,h3-reference \
+# SGLang and diffusers both resolve offline. kuno-h3-worker refuses profiles that would load H3 twice on one worker's
+# GPUs (h3, h3-reference and h3-turbo each have their own server), so the default is one profile, and one that needs
+# nothing else mounted: h3-turbo also needs KUNO_H3_TURBO_LORA. image/CVM.md §6 gives each GPU group its own profiles.
+ENV KUNO_PROFILES=h3 \
     KUNO_SGLANG_BIN=/opt/sglang/bin/sglang \
     HF_HUB_CACHE=/models/h3
 USER kuno

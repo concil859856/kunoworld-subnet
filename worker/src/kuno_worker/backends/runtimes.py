@@ -199,14 +199,18 @@ def h3_loader(model_id: str = "MiniMaxAI/MiniMax-H3", device: str = "cuda", turb
     """Loads H3 through the modular pipeline; `h3-reference` uses the Ref2VA workflow."""
 
     def load(profile: ModelProfile) -> H3Adapter:
+        turbo = profile.runtime == "lightx2v"
+        if turbo and not turbo_lora:
+            # Without it the pipeline would run the full model for 8 passes: refused before ~124 GB loads.
+            raise ValueError(f"{profile.id} needs KUNO_H3_TURBO_LORA, the path of LightX2V's 8-step 768p LoRA")
         import torch
         from diffusers import ModularPipeline
 
         workflow = "ref2va" if profile.id == "h3-reference" else "fl2va"
         pipeline = ModularPipeline.from_pretrained(model_id, workflow=workflow)
         pipeline.load_components(dtype=torch.bfloat16)
-        if profile.runtime == "lightx2v" and turbo_lora:
-            # LightX2V's distilled LoRA: 8 steps at 1344x768, video shift 6.
+        if turbo:
+            # LightX2V's distilled LoRA: 8 passes at 1344x768, video shift 6. diffusers loads it through peft.
             pipeline.load_lora_weights(turbo_lora)
         log.info("MiniMax H3 resident for %s (%s workflow)", profile.id, workflow)
         return H3Adapter(pipeline, device=device)

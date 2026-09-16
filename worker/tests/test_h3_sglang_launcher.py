@@ -1,10 +1,12 @@
 """kuno-h3-worker: which SGLang servers the H3 image starts for which profiles, and how it supervises them
-with the worker. Fake servers and a fake worker stand in; none of this has run against SGLang or a GPU."""
+with the worker. Fake servers and a fake worker stand in; the Turbo server and the one-load rule have not run
+against SGLang or a GPU."""
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import socket
 import sys
 import textwrap
@@ -19,6 +21,10 @@ from kuno_worker.config import WorkerConfig
 from kuno_worker.h3_servers import plan_servers, run, server_env
 
 
+LORA = "/models/h3-turbo/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors"
+H3_CLASS = "C4.h200-141gb.x4.ulysses4"
+
+
 def configure(tmp_path: Path, **values: str) -> tuple[WorkerConfig, dict[str, str]]:
     env = {"KUNO_DATA_DIR": str(tmp_path / "no-dev-env"), "KUNO_BACKEND": "real", **values}
     return WorkerConfig.from_env(env), env
@@ -30,7 +36,7 @@ def configure(tmp_path: Path, **values: str) -> tuple[WorkerConfig, dict[str, st
 def test_h3_needs_only_the_fl2va_server_run_with_the_official_recipe(tmp_path):
     config, env = configure(tmp_path, KUNO_PROFILES="h3")
     [server] = plan_servers(config, env)
-    assert (server.variant, server.port) == ("fl2va", 30010)
+    assert (server.name, server.port) == ("fl2va", 30010)
     assert server.argv == [
         "sglang", "serve", "--model-path", "MiniMaxAI/MiniMax-H3", "--model-variant", "fl2va",
         "--num-gpus", "4", "--ulysses-degree", "4", "--performance-mode", "speed",
@@ -38,24 +44,84 @@ def test_h3_needs_only_the_fl2va_server_run_with_the_official_recipe(tmp_path):
     ]
 
 
-def test_each_checkpoint_variant_the_profiles_route_to_gets_one_server(tmp_path):
-    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo,h3,h3-reference,ltx-2.5-fast")
-    assert [(s.variant, s.port) for s in plan_servers(config, env)] == [("fl2va", 30010), ("ref2va", 30011)]
+@pytest.mark.parametrize("backend", ["real", "cold"])
+def test_h3_turbo_gets_its_own_fl2va_server_with_the_lora_loaded_as_measured(tmp_path, backend):
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_BACKEND=backend, KUNO_H3_TURBO_LORA=LORA)
+    [server] = plan_servers(config, env)
+    assert (server.name, server.port) == ("turbo", 30012)
+    assert server.argv == [
+        "sglang", "serve", "--model-path", "MiniMaxAI/MiniMax-H3", "--model-variant", "fl2va",
+        "--num-gpus", "4", "--ulysses-degree", "4", "--performance-mode", "speed",
+        "--host", "127.0.0.1", "--port", "30012", "--master-port", "31012", "--scheduler-port", "32012",
+        "--lora-path", LORA, "--lora-nickname", "turbo",
+    ]
+
+
+@pytest.mark.parametrize("backend", ["real", "cold"])
+def test_h3_turbo_is_refused_without_its_lora(tmp_path, backend):
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_BACKEND=backend)
+    with pytest.raises(ValueError, match="h3-turbo needs KUNO_H3_TURBO_LORA"):
+        plan_servers(config, env)
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_VERIFIED_HARDWARE_CLASS=H3_CLASS, KUNO_BACKEND=backend)
+    with pytest.raises(ValueError, match="h3-turbo needs KUNO_H3_TURBO_LORA"):  # the in-process pipeline needs it too
+        plan_servers(config, env)
+
+
+@pytest.mark.parametrize(
+    ("profiles", "extra", "named"),
+    [
+        ("h3,h3-reference", {}, ["h3 on the SGLang fl2va server", "h3-reference on the SGLang ref2va server"]),
+        ("h3-turbo,h3", {}, ["h3 on the SGLang fl2va server", "h3-turbo on the SGLang turbo server"]),
+        ("h3-turbo,h3-reference,ltx-2.5-fast", {}, ["h3-reference on the SGLang ref2va server", "h3-turbo on the SGLang turbo server"]),
+        ("h3-turbo,h3", {"KUNO_VERIFIED_HARDWARE_CLASS": H3_CLASS}, ["h3-turbo in the worker process", "h3 on the SGLang fl2va server"]),
+        ("h3,h3-reference", {"KUNO_H3_SHARED_SERVERS": "true"}, ["h3 on the SGLang fl2va server"]),  # only "1" shares
+    ],
+)
+def test_a_worker_that_would_load_h3_more_than_once_on_its_gpus_is_refused(tmp_path, profiles, extra, named):
+    config, env = configure(tmp_path, KUNO_PROFILES=profiles, KUNO_H3_TURBO_LORA=LORA, **extra)
+    with pytest.raises(ValueError) as refused:
+        plan_servers(config, env)
+    message = str(refused.value)
+    assert "would load MiniMax H3 twice" in message and all(part in message for part in named)
+    assert "KUNO_PROFILES list per group" in message and "KUNO_H3_SHARED_SERVERS=1" in message
+
+
+def test_shared_servers_start_every_server_the_profiles_route_to(tmp_path):
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo,h3,h3-reference,ltx-2.5-fast", KUNO_H3_TURBO_LORA=LORA, KUNO_H3_SHARED_SERVERS="1")
+    assert [(s.name, s.port) for s in plan_servers(config, env)] == [("fl2va", 30010), ("ref2va", 30011), ("turbo", 30012)]
     config, env = configure(tmp_path, KUNO_PROFILES="h3-reference")
-    assert [s.variant for s in plan_servers(config, env)] == ["ref2va"]
+    assert [s.name for s in plan_servers(config, env)] == ["ref2va"]
 
 
-@pytest.mark.parametrize(("profiles", "backend"), [("h3-turbo", "real"), ("ltx-2.5-fast,ltx-2.5-pro", "real"), ("h3,h3-reference", "mock")])
+def test_verified_h3_turbo_runs_in_the_worker_process_and_gets_no_server(tmp_path):
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, KUNO_VERIFIED_HARDWARE_CLASS=H3_CLASS)
+    assert plan_servers(config, env) == []
+    # A class h3-turbo does not pin leaves it in performance mode, on its server; cold has no in-process pipeline.
+    for extra in ({"KUNO_VERIFIED_HARDWARE_CLASS": "C2.h200-141gb.x1"}, {"KUNO_VERIFIED_HARDWARE_CLASS": H3_CLASS, "KUNO_BACKEND": "cold"}):
+        config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, **extra)
+        assert [s.name for s in plan_servers(config, env)] == ["turbo"]
+
+
+@pytest.mark.parametrize(("profiles", "backend"), [("ltx-2.5-fast,ltx-2.5-pro", "real"), ("h3,h3-reference", "mock")])
 def test_no_server_starts_when_no_profile_is_served_by_sglang(tmp_path, profiles, backend):
     config, env = configure(tmp_path, KUNO_PROFILES=profiles, KUNO_BACKEND=backend)
     assert plan_servers(config, env) == []
 
 
 def test_the_second_worker_of_a_whole_server_td_gets_its_own_ports(tmp_path):
-    config, env = configure(tmp_path, KUNO_PROFILES="h3,h3-reference",
-                            KUNO_H3_FL2VA_URL="http://127.0.0.1:30020", KUNO_H3_REF2VA_URL="http://127.0.0.1:30021")
+    # kuno-app's settings for worker 1 (image/cvm/rootfs/usr/lib/kuno/kuno-app, worker_settings).
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo,h3,h3-reference", KUNO_H3_TURBO_LORA=LORA, KUNO_H3_SHARED_SERVERS="1",
+                            KUNO_H3_FL2VA_URL="http://127.0.0.1:30020", KUNO_H3_REF2VA_URL="http://127.0.0.1:30021",
+                            KUNO_H3_TURBO_URL="http://127.0.0.1:30022")
     ports = [(s.port, s.argv[s.argv.index("--master-port") + 1], s.argv[s.argv.index("--scheduler-port") + 1]) for s in plan_servers(config, env)]
-    assert ports == [(30020, "31020", "32020"), (30021, "31021", "32021")]
+    assert ports == [(30020, "31020", "32020"), (30021, "31021", "32021"), (30022, "31022", "32022")]
+
+
+def test_servers_started_together_need_different_ports(tmp_path):
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo,h3", KUNO_H3_TURBO_LORA=LORA, KUNO_H3_SHARED_SERVERS="1",
+                            KUNO_H3_TURBO_URL="http://127.0.0.1:30010")
+    with pytest.raises(ValueError, match="KUNO_H3_FL2VA_URL, KUNO_H3_TURBO_URL must use different ports"):
+        plan_servers(config, env)
 
 
 def test_operator_settings_reach_the_server_command(tmp_path):
@@ -67,11 +133,22 @@ def test_operator_settings_reach_the_server_command(tmp_path):
     assert argv[-4:] == ["--tp-size", "2", "--dit-cpu-offload", "false"]
 
 
+@pytest.mark.parametrize(("profiles", "key"), [("h3", "KUNO_H3_FL2VA_URL"), ("h3-turbo", "KUNO_H3_TURBO_URL")])
 @pytest.mark.parametrize("url", ["http://10.0.0.5:30010", "http://127.0.0.1", "http://localhost:30010"])
-def test_a_server_started_here_must_listen_on_loopback_at_an_explicit_port(tmp_path, url):
-    config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_H3_FL2VA_URL=url)
-    with pytest.raises(ValueError, match="KUNO_H3_FL2VA_URL"):
+def test_a_server_started_here_must_listen_on_loopback_at_an_explicit_port(tmp_path, url, profiles, key):
+    config, env = configure(tmp_path, KUNO_PROFILES=profiles, KUNO_H3_TURBO_LORA=LORA, **{key: url})
+    with pytest.raises(ValueError, match=key):
         plan_servers(config, env)
+
+
+def test_the_h3_images_default_profiles_start_one_server(tmp_path):
+    dockerfile = Path(__file__).resolve().parents[2] / "image" / "worker.Dockerfile"
+    if not dockerfile.exists():
+        pytest.skip("image/ is not part of this checkout")
+    stage = dockerfile.read_text().split(" AS h3\n", 1)[1]
+    profiles = re.search(r"KUNO_PROFILES=(\S+)", stage).group(1)
+    config, env = configure(tmp_path, KUNO_PROFILES=profiles)
+    assert len(plan_servers(config, env)) == 1
 
 
 def test_the_servers_get_none_of_the_workers_settings_and_find_their_own_venv_first():
@@ -91,19 +168,53 @@ def test_the_servers_find_the_cuda_compiler_their_venv_ships(tmp_path):
     assert "CUDA_HOME" not in server_env({"PATH": "/usr/bin"}, "sglang")
 
 
-def test_the_turbo_pipeline_loads_the_weights_the_servers_load(tmp_path, monkeypatch):
+# ---------------------------------------------------------------- which runtime the worker sends each profile to
+
+
+@pytest.fixture
+def loaded(monkeypatch):
     from kuno_worker.backends import runtimes
 
     seen = []
 
-    def fake_loader(model_id, **_):
-        seen.append(model_id)
+    def fake_loader(model_id, **kwargs):
+        seen.append((model_id, kwargs.get("turbo_lora")))
         return lambda profile: None
 
     monkeypatch.setattr(runtimes, "h3_loader", fake_loader)
-    config, _ = configure(tmp_path, KUNO_H3_MODEL_ID="/models/MiniMax-H3", KUNO_LTX_MODELS_DIR=str(tmp_path))
-    build_backends("real", config)
-    assert seen == ["/models/MiniMax-H3"]
+    return seen
+
+
+def test_verified_h3_turbo_gets_the_in_process_pipeline_with_the_servers_weights(tmp_path, loaded):
+    from kuno_protocol.profiles import load_profiles
+
+    config, _ = configure(tmp_path, KUNO_H3_MODEL_ID="/models/MiniMax-H3", KUNO_LTX_MODELS_DIR=str(tmp_path),
+                          KUNO_VERIFIED_HARDWARE_CLASS=H3_CLASS, KUNO_H3_TURBO_LORA=LORA)
+    h3 = build_backends("real", config)["minimax-h3"]
+    assert loaded == [("/models/MiniMax-H3", LORA)]
+    profiles = load_profiles()
+    assert h3.verified_enabled(profiles["h3-turbo"]) and h3.turbo.hardware_class == H3_CLASS
+    # SGLang has no step hook: h3 and h3-reference stay on their servers, without step commitments.
+    assert not h3.verified_enabled(profiles["h3"]) and not h3.verified_enabled(profiles["h3-reference"])
+
+
+@pytest.mark.parametrize(("backend", "hardware_class"), [("real", None), ("real", "C2.h200-141gb.x1"), ("cold", H3_CLASS)])
+def test_performance_mode_sends_every_h3_profile_to_the_servers(tmp_path, loaded, backend, hardware_class):
+    values = {"KUNO_LTX_MODELS_DIR": str(tmp_path), "KUNO_H3_TURBO_URL": "http://127.0.0.1:30022/"}
+    if hardware_class:
+        values["KUNO_VERIFIED_HARDWARE_CLASS"] = hardware_class
+    config, _ = configure(tmp_path, **values)
+    h3 = build_backends(backend, config)["minimax-h3"]
+    assert h3.turbo is None and loaded == []
+    assert h3.urls == {"fl2va": "http://127.0.0.1:30010", "ref2va": "http://127.0.0.1:30011", "turbo": "http://127.0.0.1:30022"}
+
+
+def test_the_turbo_pipeline_refuses_to_load_without_its_lora():
+    from kuno_protocol.profiles import load_profiles
+    from kuno_worker.backends.runtimes import h3_loader
+
+    with pytest.raises(ValueError, match="h3-turbo needs KUNO_H3_TURBO_LORA"):
+        h3_loader("/models/MiniMax-H3")(load_profiles()["h3-turbo"])  # before any weights or torch load
 
 
 # ---------------------------------------------------------------- supervision, with fake processes
@@ -163,7 +274,7 @@ def launch(tmp_path):
         "PATH": os.environ.get("PATH", ""), "FAKE_DIR": str(tmp_path), "KUNO_DATA_DIR": str(tmp_path / "no-dev-env"),
         "KUNO_BACKEND": "real", "KUNO_PROFILES": "h3,h3-reference", "KUNO_SGLANG_BIN": str(binary),
         "KUNO_H3_FL2VA_URL": f"http://127.0.0.1:{free_port()}", "KUNO_H3_REF2VA_URL": f"http://127.0.0.1:{free_port()}",
-        "KUNO_SGLANG_START_TIMEOUT_S": "30",
+        "KUNO_SGLANG_START_TIMEOUT_S": "30", "KUNO_H3_SHARED_SERVERS": "1",  # two servers, to supervise more than one
     }
 
     def start(argv=("--profiles", "h3,h3-reference"), stop=None, **overrides):
@@ -220,6 +331,12 @@ def test_a_stop_signal_reaches_the_worker_then_the_servers(launch, tmp_path):
     assert launch(stop=stop) == 0
     assert (tmp_path / "worker-terminated").exists()
     assert all(gone(pid) for pid in server_pids(tmp_path))
+
+
+def test_a_refused_profile_set_starts_nothing(launch, tmp_path):
+    with pytest.raises(ValueError, match="would load MiniMax H3 twice"):
+        launch(KUNO_H3_SHARED_SERVERS="0")
+    assert server_pids(tmp_path) == [] and not (tmp_path / "worker-started").exists()
 
 
 def test_help_goes_straight_to_the_worker(launch, tmp_path):

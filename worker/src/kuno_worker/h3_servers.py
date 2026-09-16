@@ -1,16 +1,25 @@
 """kuno-h3-worker: MiniMax H3's SGLang servers and the worker, supervised together in one container.
 
-The H3 image's entry point. With `KUNO_BACKEND=real` (or `cold`) the `h3` and `h3-reference` profiles
-go to SGLang's official server over loopback (backends/h3.py, at KUNO_H3_FL2VA_URL and
-KUNO_H3_REF2VA_URL), and in the confidential VM each worker container has to bring its own servers:
-kuno-app starts one container per GPU group and gives each its own ports (image/CVM.md, §6). This:
-  1. starts one `sglang serve` per checkpoint variant the profiles route to (fl2va for text, image and
-     first/last-frame modes, ref2va for reference modes), on 127.0.0.1 at the URL's port;
+The H3 image's entry point. With `KUNO_BACKEND=real` (or `cold`) the H3 profiles go to SGLang's official
+server over loopback (backends/h3.py), and in the confidential VM each worker container has to bring its own
+servers: kuno-app starts one container per GPU group and gives each its own ports (image/CVM.md, §6). This:
+  1. starts the `sglang serve` each profile routes to, on 127.0.0.1 at the URL's port:
+       fl2va   h3 (text, image and first/last-frame modes)                    KUNO_H3_FL2VA_URL
+       ref2va  h3-reference (reference modes)                                 KUNO_H3_REF2VA_URL
+       turbo   h3-turbo: fl2va with LightX2V's LoRA (KUNO_H3_TURBO_LORA)      KUNO_H3_TURBO_URL
+     In verified mode on a class h3-turbo pins, h3-turbo runs in the worker process instead (backends/h3.py)
+     and gets no server;
   2. waits for each server's /health, then starts `kuno-worker` with this command's arguments, so the
      worker never registers capacity it cannot serve yet;
   3. when any of them exits, stops the rest. SIGTERM reaches the worker first, so an in-flight job
      can finish, then the servers.
-Profiles with no SGLang server (h3-turbo runs in the worker process; LTX-2.5) just run the worker.
+Profiles with no SGLang server (LTX-2.5) just run the worker.
+
+One H3 load per container. A loaded 4-GPU server holds 87-97 GB per GPU and peaks at about 103 GB (measured
+on H200s, 2026-09-16), so two cannot share 141 GB H200s and very likely not 180 GB B200s. A profile set that
+needs more than one (two servers, or a server beside the in-process Turbo pipeline) is refused unless
+KUNO_H3_SHARED_SERVERS=1, meant for GPUs that hold two, such as 288 GB B300s. Give each GPU group its own
+profiles instead (kuno-app's per-group KUNO_PROFILES).
 
 SGLang's output is discarded unless KUNO_SGLANG_LOG=inherit: nothing guarantees it keeps prompts out of
 its logs, and a console is not private to the enclave. kuno-app does not pass that setting into the VM.
@@ -18,12 +27,16 @@ its logs, and a console is not private to the enclave. kuno-app does not pass th
 Environment, besides the worker's own:
   KUNO_SGLANG_BIN              the sglang executable (default: `sglang` on PATH; the H3 image sets its venv's)
   KUNO_H3_MODEL_ID             --model-path (default MiniMaxAI/MiniMax-H3: with HF_HUB_OFFLINE=1 it resolves in HF_HUB_CACHE)
+  KUNO_H3_TURBO_LORA           --lora-path of the Turbo server, and the in-process pipeline's LoRA; h3-turbo needs it
   KUNO_H3_NUM_GPUS             --num-gpus and --ulysses-degree (default: the profiles' gpus_per_worker)
+  KUNO_H3_SHARED_SERVERS       1 lets one container load H3 more than once on its GPUs (default: refused)
   KUNO_SGLANG_ARGS             extra arguments for every server, shell-quoted
   KUNO_SGLANG_START_TIMEOUT_S  how long to wait for /health (default 3600: loading ~124 GB in a CVM is slow)
   KUNO_SGLANG_LOG              discard (default) | inherit
 
-Not yet run against a real SGLang server or on GPUs: only against fake servers in the tests.
+On GPUs: this launcher started the fl2va and ref2va servers on 4x H200 in the 2026-09-15 smoke test, one profile
+per container. The Turbo server's flags ran by hand on 2026-09-16, not through here; the Turbo server as planned
+here and the one-load refusal have run only against fake servers in the tests.
 """
 
 from __future__ import annotations
@@ -47,13 +60,15 @@ import httpx
 
 from kuno_protocol.profiles import ModelProfile, load_profiles
 
-from .backends.h3 import FL2VA_MODES
+from .backends.h3 import TURBO_NICKNAME, is_turbo, server_for, turbo_in_process
 from .config import WorkerConfig
 
 log = logging.getLogger("kuno.worker.h3_servers")
 
-VARIANTS = ("fl2va", "ref2va")
-URL_KEYS = {"fl2va": "KUNO_H3_FL2VA_URL", "ref2va": "KUNO_H3_REF2VA_URL"}
+SERVERS = ("fl2va", "ref2va", "turbo")
+URL_KEYS = {"fl2va": "KUNO_H3_FL2VA_URL", "ref2va": "KUNO_H3_REF2VA_URL", "turbo": "KUNO_H3_TURBO_URL"}
+IN_PROCESS = "in-process"
+SHARED_KEY = "KUNO_H3_SHARED_SERVERS"
 # SGLang settles its torch.distributed master and scheduler ports itself, checking only that a port is
 # free when it looks, so two servers starting together can pick the same one. Fixed offsets from each
 # server's HTTP port keep every server on the host apart (30010 -> 31010 and 32010).
@@ -70,7 +85,7 @@ class LaunchError(RuntimeError):
 
 @dataclass(frozen=True)
 class Server:
-    variant: str
+    name: str  # fl2va, ref2va or turbo
     port: int
     argv: list[str]
 
@@ -82,34 +97,64 @@ def _loopback_port(url: str, key: str) -> int:
     return parts.port
 
 
+def _describe(load: str) -> str:
+    if load == IN_PROCESS:
+        return "in the worker process (verified mode)"
+    return f"on the SGLang {load} server"
+
+
 def plan_servers(config: WorkerConfig, env: Mapping[str, str], catalog: Mapping[str, ModelProfile] | None = None) -> list[Server]:
-    """The `sglang serve` commands the configured profiles need, in fl2va, ref2va order."""
+    """The `sglang serve` commands the configured profiles need, in fl2va, ref2va, turbo order. Raises ValueError for
+    a profile set that loads H3 more than once on this container's GPUs (unless KUNO_H3_SHARED_SERVERS=1), and
+    for h3-turbo without KUNO_H3_TURBO_LORA."""
     if config.backend not in ("real", "cold"):
         return []
     catalog = load_profiles() if catalog is None else catalog
-    served = [catalog[p] for p in config.profiles if p in catalog and catalog[p].family == "minimax-h3" and catalog[p].runtime == "sglang"]
-    needed = {"fl2va" if mode in FL2VA_MODES else "ref2va" for profile in served for mode in profile.modes}
-    if not needed:
+    h3 = [catalog[p] for p in config.profiles if p in catalog and catalog[p].family == "minimax-h3"]
+    # Each H3 load (a server, or the in-process Turbo pipeline) and the profiles that use it.
+    loads: dict[str, list[str]] = {}
+    served = []
+    for profile in h3:
+        if config.backend == "real" and turbo_in_process(profile, config.verified_hardware_class):
+            loads.setdefault(IN_PROCESS, []).append(profile.id)
+            continue
+        served.append(profile)
+        for server in sorted({server_for(profile, mode) for mode in profile.modes}, key=SERVERS.index):
+            loads.setdefault(server, []).append(profile.id)
+    if any(is_turbo(profile) for profile in h3) and not config.h3_turbo_lora:
+        raise ValueError("h3-turbo needs KUNO_H3_TURBO_LORA, the path of LightX2V's 8-step 768p LoRA (lightx2v/Minimax-h3-Turbo)")
+    if len(loads) > 1 and env.get(SHARED_KEY) != "1":
+        uses = "; ".join(f"{', '.join(ids)} {_describe(load)}" for load, ids in loads.items())
+        times = "twice" if len(loads) == 2 else f"{len(loads)} times"
+        raise ValueError(
+            f"profiles {', '.join(p.id for p in h3)} would load MiniMax H3 {times} on this worker's GPUs ({uses}). "
+            "One loaded H3 holds 87-97 GB per H200, so two don't fit on 141 GB H200s and very likely not on 180 GB B200s. "
+            "Give each GPU group one of them (KUNO_GPU_GROUPS with a KUNO_PROFILES list per group, image/CVM.md §6), "
+            f"or set {SHARED_KEY}=1 on GPUs that hold both, such as 288 GB B300s"
+        )
+    if not served:
         return []
     gpus = int(env.get("KUNO_H3_NUM_GPUS") or max(profile.gpus_per_worker for profile in served))
     binary = env.get("KUNO_SGLANG_BIN") or "sglang"
     extra = shlex.split(env.get("KUNO_SGLANG_ARGS", ""))
-    urls = {"fl2va": config.h3_fl2va_url, "ref2va": config.h3_ref2va_url}
+    urls = {"fl2va": config.h3_fl2va_url, "ref2va": config.h3_ref2va_url, "turbo": config.h3_turbo_url}
     servers = []
-    for variant in VARIANTS:
-        if variant not in needed:
+    for name in SERVERS:
+        if name not in loads:
             continue
-        port = _loopback_port(urls[variant], URL_KEYS[variant])
+        port = _loopback_port(urls[name], URL_KEYS[name])
+        # The Turbo server is the fl2va checkpoint with the LoRA loaded at start, as measured on 2026-09-16.
+        lora = ["--lora-path", str(config.h3_turbo_lora), "--lora-nickname", TURBO_NICKNAME] if name == "turbo" else []
         argv = [
-            binary, "serve", "--model-path", config.h3_model_id, "--model-variant", variant,
+            binary, "serve", "--model-path", config.h3_model_id, "--model-variant", "fl2va" if name == "turbo" else name,
             "--num-gpus", str(gpus), "--ulysses-degree", str(gpus), "--performance-mode", "speed",
             "--host", "127.0.0.1", "--port", str(port),
             "--master-port", str(port + MASTER_PORT_OFFSET), "--scheduler-port", str(port + SCHEDULER_PORT_OFFSET),
-            *extra,
+            *lora, *extra,
         ]
-        servers.append(Server(variant, port, argv))
+        servers.append(Server(name, port, argv))
     if len({server.port for server in servers}) != len(servers):
-        raise ValueError("KUNO_H3_FL2VA_URL and KUNO_H3_REF2VA_URL must use different ports")
+        raise ValueError(f"{', '.join(URL_KEYS[s.name] for s in servers)} must use different ports")
     return servers
 
 
@@ -138,16 +183,16 @@ def wait_until_ready(servers: Sequence[Server], processes: Sequence[subprocess.P
         while True:
             for server, process in zip(servers, processes):
                 if process.poll() is not None:
-                    raise LaunchError(f"the SGLang {server.variant} server exited with code {process.returncode} before it was ready")
+                    raise LaunchError(f"the SGLang {server.name} server exited with code {process.returncode} before it was ready")
             for port, server in list(pending.items()):
                 with contextlib.suppress(httpx.HTTPError):
                     if client.get(f"http://127.0.0.1:{port}/health").status_code == 200:
-                        log.info("SGLang %s server ready on 127.0.0.1:%d", server.variant, port)
+                        log.info("SGLang %s server ready on 127.0.0.1:%d", server.name, port)
                         del pending[port]
             if not pending:
                 return True
             if time.monotonic() > deadline:
-                raise LaunchError(f"SGLang {', '.join(s.variant for s in pending.values())} not ready after {timeout_s:g} s")
+                raise LaunchError(f"SGLang {', '.join(s.name for s in pending.values())} not ready after {timeout_s:g} s")
             if stop.wait(poll_s):
                 return False
 
@@ -203,7 +248,7 @@ def run(argv: Sequence[str], env: Mapping[str, str] | None = None, *, worker_com
     worker_process: subprocess.Popen | None = None
     try:
         for server in servers:
-            log.info("starting the SGLang %s server on 127.0.0.1:%d", server.variant, server.port)
+            log.info("starting the SGLang %s server on 127.0.0.1:%d", server.name, server.port)
             processes.append(subprocess.Popen(server.argv, env=server_env(env, server.argv[0]), stdin=subprocess.DEVNULL,
                                               stdout=output, stderr=output, start_new_session=True))
         timeout_s = float(env.get("KUNO_SGLANG_START_TIMEOUT_S", "3600"))
@@ -220,7 +265,7 @@ def run(argv: Sequence[str], env: Mapping[str, str] | None = None, *, worker_com
                 return _exit_code(worker_process.returncode)
             for server, process in zip(servers, processes):
                 if process.poll() is not None:
-                    log.error("the SGLang %s server exited with code %s; stopping the worker", server.variant, process.returncode)
+                    log.error("the SGLang %s server exited with code %s; stopping the worker", server.name, process.returncode)
                     return 1
             stop.wait(poll_s)
     except (LaunchError, OSError) as exc:

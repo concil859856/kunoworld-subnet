@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from kuno_protocol.profiles import InputRole, Mode, load_profiles
+from kuno_worker.backends.base import Backend
 from kuno_worker.backends.h3 import H3SglangBackend, build_sglang_request
 from kuno_worker.backends.ltx import LtxPaths, build_command, pick_pipeline
 from kuno_worker.backends.media_tools import ffmpeg_exe
@@ -55,6 +56,23 @@ def test_h3_keyframe_requests(mode, expected_task, frame_indexes, tmp_path):
     assert all(c["uri"].startswith("file://") for c in body["conditions"])
     assert body["target"] == {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}
     assert body["num_inference_steps"] == 51 and body["seed"] == 42  # 50 passes: the grid includes the terminal 0
+
+
+@pytest.mark.parametrize(("mode", "expected_task"), [(Mode.TEXT_TO_VIDEO, "t2va"), (Mode.FIRST_LAST_FRAME, "fl2va")])
+def test_h3_turbo_requests_go_to_the_turbo_server_with_the_loras_shifts_and_pass_count(mode, expected_task, tmp_path):
+    task = task_for("h3-turbo", mode, tmp_path, duration_s=14)
+    server, body = build_sglang_request(task, tmp_path)
+    assert server == "turbo" and body["task"] == expected_task
+    # The 8-step LoRA is trained on the 9-point grid, and with video shift 6 and audio shift 3 (measured 2026-09-16).
+    assert body["num_inference_steps"] == 9
+    assert (body["flow_shift"], body["audio_flow_shift"]) == (6.0, 3.0)
+    assert body["target"] == {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 14.0}
+
+
+@pytest.mark.parametrize(("profile_id", "mode"), [("h3", Mode.TEXT_TO_VIDEO), ("h3-reference", Mode.REFERENCE_TO_VIDEO)])
+def test_full_h3_requests_leave_the_shifts_to_the_server(profile_id, mode, tmp_path):
+    _, body = build_sglang_request(task_for(profile_id, mode, tmp_path), tmp_path)
+    assert "flow_shift" not in body and "audio_flow_shift" not in body and body["num_inference_steps"] == 51
 
 
 def test_h3_reference_request_keeps_customer_order_and_maps_types(tmp_path):
@@ -237,6 +255,57 @@ def test_h3_backend_strips_audio_when_the_customer_turned_it_off(fake_sglang, tm
     )
     if probe.returncode == 0:  # ffprobe ships with system ffmpeg, not with imageio-ffmpeg
         assert not any(s["codec_type"] == "audio" for s in json.loads(probe.stdout)["streams"])
+
+
+class InProcessTurbo(Backend):
+    """Stands in for H3ResidentBackend: records what reaches it."""
+
+    name = "in-process"
+
+    def __init__(self, hardware_class: str | None):
+        self.hardware_class = hardware_class
+        self.jobs: list[str] = []
+        self.warmed: list[str] = []
+
+    def warm(self, profile):
+        self.warmed.append(profile.id)
+
+    def generate(self, task, progress):
+        self.jobs.append(task.profile.id)
+        return "in-process result"
+
+
+DEAD_URL = "http://127.0.0.1:9"  # nothing listens: a job sent here fails
+
+
+def test_h3_turbo_jobs_go_to_the_turbo_server(fake_sglang, tmp_path):
+    url, received = fake_sglang
+    backend = H3SglangBackend(DEAD_URL, DEAD_URL, tmp_path / "work", turbo_url=url + "/")
+    result = backend.generate(task_for("h3-turbo", Mode.IMAGE_TO_VIDEO, tmp_path / "inputs", duration_s=5), NOOP)
+    assert result.data[4:8] == b"ftyp" and result.info.frames == 124
+    assert received[0]["flow_shift"] == 6.0 and received[0]["num_inference_steps"] == 9
+    assert not backend.verified_enabled(PROFILES["h3-turbo"])
+
+
+def test_verified_h3_turbo_runs_in_process_and_everything_else_on_the_servers(fake_sglang, tmp_path):
+    url, received = fake_sglang
+    turbo = InProcessTurbo("C4.h200-141gb.x4.ulysses4")
+    backend = H3SglangBackend(url, url, tmp_path / "work", turbo_url=DEAD_URL, turbo=turbo)
+    for profile_id in ("h3-turbo", "h3", "h3-reference"):
+        backend.warm(PROFILES[profile_id])
+    assert backend.generate(task_for("h3-turbo", Mode.TEXT_TO_VIDEO, tmp_path / "turbo"), NOOP) == "in-process result"
+    backend.generate(task_for("h3", Mode.TEXT_TO_VIDEO, tmp_path / "h3"), NOOP)
+    assert turbo.jobs == ["h3-turbo"] and turbo.warmed == ["h3-turbo"] and len(received) == 1
+    assert [backend.verified_enabled(PROFILES[p]) for p in ("h3-turbo", "h3", "h3-reference")] == [True, False, False]
+
+
+def test_an_in_process_pipeline_on_a_class_turbo_does_not_pin_leaves_turbo_on_its_server(fake_sglang, tmp_path):
+    url, received = fake_sglang
+    turbo = InProcessTurbo("C2.h200-141gb.x1")
+    backend = H3SglangBackend(DEAD_URL, DEAD_URL, tmp_path / "work", turbo_url=url, turbo=turbo)
+    backend.warm(PROFILES["h3-turbo"])
+    backend.generate(task_for("h3-turbo", Mode.TEXT_TO_VIDEO, tmp_path / "inputs"), NOOP)
+    assert turbo.jobs == [] and turbo.warmed == [] and len(received) == 1
 
 
 def test_ltx_backend_runs_the_pipeline_module_and_returns_its_video(tmp_path, monkeypatch, sample_mp4):

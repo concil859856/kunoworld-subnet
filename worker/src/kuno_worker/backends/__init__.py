@@ -19,18 +19,24 @@ def build_backends(kind: str, config) -> dict[str, Backend]:
         return {"*": MockBackend()}
 
     if kind == "real":
-        from .h3 import H3SglangBackend
+        from kuno_protocol.profiles import load_profiles
+
+        from .h3 import H3SglangBackend, turbo_in_process
         from .h3_resident import H3ResidentBackend
         from .ltx_resident import LtxResidentBackend
 
-        # SGLang is the documented H3 serving path and is already resident; it forwards
-        # the Turbo profile to the in-process LoRA runtime (SGLang could serve the LoRA too).
-        h3 = H3SglangBackend(config.h3_fl2va_url, config.h3_ref2va_url, config.workdir)
+        # MiniMax H3 is served by SGLang's servers, which are resident and which kuno-h3-worker starts beside the
+        # worker: h3 on fl2va, h3-reference on ref2va, h3-turbo on fl2va with the Turbo LoRA. Verified mode for
+        # h3-turbo is the one exception: its profile pins the diffusers pipeline, whose steps the worker commits to,
+        # so a hardware class it pins gets that pipeline in process (and no Turbo server). SGLang has no step hook,
+        # so h3 and h3-reference stay on SGLang, without step commitments, whatever the class.
+        h3 = H3SglangBackend(config.h3_fl2va_url, config.h3_ref2va_url, config.workdir, turbo_url=config.h3_turbo_url)
         verified = {"hardware_class": config.verified_hardware_class, "model_digest": config.model_digest}
-        # KUNO_H3_MODEL_ID names the same weights the SGLang servers load (a local path, or a Hub id resolved
-        # offline from HF_HUB_CACHE), so the Turbo pipeline never falls back to downloading the default id.
-        model_id = getattr(config, "h3_model_id", None) or "MiniMaxAI/MiniMax-H3"
-        h3.turbo = H3ResidentBackend(config.workdir, model_id=model_id, turbo_lora=config.h3_turbo_lora, **verified)
+        if any(turbo_in_process(profile, config.verified_hardware_class) for profile in load_profiles().values()):
+            # KUNO_H3_MODEL_ID names the same weights the SGLang servers load (a local path, or a Hub id resolved
+            # offline from HF_HUB_CACHE), so the Turbo pipeline never falls back to downloading the default id.
+            model_id = getattr(config, "h3_model_id", None) or "MiniMaxAI/MiniMax-H3"
+            h3.turbo = H3ResidentBackend(config.workdir, model_id=model_id, turbo_lora=config.h3_turbo_lora, **verified)
         ltx = LtxResidentBackend(
             config.ltx_models_dir,
             config.workdir,
@@ -46,7 +52,8 @@ def build_backends(kind: str, config) -> dict[str, Backend]:
         from .ltx import LtxPipelinesBackend
 
         return {
-            "minimax-h3": H3SglangBackend(config.h3_fl2va_url, config.h3_ref2va_url, config.workdir),
+            # SGLang's servers for every H3 profile, h3-turbo included; cold has no in-process pipeline.
+            "minimax-h3": H3SglangBackend(config.h3_fl2va_url, config.h3_ref2va_url, config.workdir, turbo_url=config.h3_turbo_url),
             "ltx-2.5": LtxPipelinesBackend(config.ltx_models_dir, config.workdir),
         }
 

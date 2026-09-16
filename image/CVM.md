@@ -93,8 +93,8 @@ One Dockerfile, `image/worker.Dockerfile`, has a target per model family:
 
 | Image | Target, local tag | Contents | Entry point | Default `KUNO_PROFILES` |
 |---|---|---|---|---|
-| LTX-2.5 | `ltx`, `kuno-worker:ltx` | the worker venv `/opt/kuno`: `kuno-worker[nvidia,gpu,safety,provenance]` (CUDA 12.8 torch, torchaudio, torchao, diffusers, transformers, timm, PyAV, c2pa-python), and the safety classifiers in `/opt/kuno-safety` | `kuno-worker` | `ltx-2.5-fast` |
-| MiniMax H3 | `h3`, `kuno-worker:h3` | everything in `ltx`, plus SGLang in `/opt/sglang` and g++ ("The MiniMax H3 image", below) | `kuno-h3-worker` | `h3,h3-reference` |
+| LTX-2.5 | `ltx`, `kuno-worker:ltx` | the worker venv `/opt/kuno`: `kuno-worker[nvidia,gpu,safety,provenance]` (CUDA 12.8 torch, torchaudio, torchao, diffusers, transformers, timm, PyAV, c2pa-python) and peft, and the safety classifiers in `/opt/kuno-safety` | `kuno-worker` | `ltx-2.5-fast` |
+| MiniMax H3 | `h3`, `kuno-worker:h3` | everything in `ltx`, plus SGLang in `/opt/sglang` and g++ ("The MiniMax H3 image", below) | `kuno-h3-worker` | `h3` |
 
 Sizes as built here:
 - `ltx`: about 6.6 GB to pull and 17.6 GB unpacked, including 3.2 GB of classifier weights.
@@ -206,10 +206,17 @@ Measure on the target shape before fixing `KUNO_SAFETY_FRAMES` or the thread cou
 
 ### The MiniMax H3 image
 
-With `KUNO_BACKEND=real`, the H3 profiles run on two runtimes:
-- `h3` and `h3-reference` go to SGLang's official server over loopback (`worker/backends/h3.py`).
-- `h3-turbo` runs in the worker process, through diffusers' MiniMax H3 modular pipeline with LightX2V's LoRA
-  (`backends/h3_resident.py`).
+With `KUNO_BACKEND=real`, each H3 profile goes to one runtime (`worker/backends/h3.py`):
+
+| Profile | Performance mode | Verified mode: `KUNO_VERIFIED_HARDWARE_CLASS` is a class the profile pins |
+|---|---|---|
+| `h3` | SGLang's fl2va server, over loopback | the same, with no step commitment |
+| `h3-reference` | SGLang's ref2va server | the same, with no step commitment |
+| `h3-turbo` | SGLang's Turbo server: fl2va with LightX2V's LoRA | diffusers' MiniMax H3 modular pipeline with the LoRA, in the worker process (`backends/h3_resident.py`), committing to every step; no Turbo server |
+
+All three profiles' `verified` blocks pin the diffusers pipeline, but SGLang has no per-step hook, so only
+`h3-turbo` has a verified path. diffusers loads the LoRA through `peft`, which `image/pyproject.toml` adds to the
+worker venv for that. `cold` sends every H3 profile to the servers.
 
 The `h3` target adds SGLang's side:
 
@@ -232,15 +239,22 @@ The `h3` target adds SGLang's side:
   SGLang's diffusion kernels include Triton and JIT-compiled ones. The H3 DiT calls `fused_inplace_qknorm`.
 - **`kuno-h3-worker`**, the entry point (`worker/src/kuno_worker/h3_servers.py`). kuno-app starts one container per
   GPU group (§6), so each container brings its own servers.
-  - **What it starts.** One `sglang serve` per checkpoint variant the profiles route to: fl2va for `h3`, ref2va for
-    `h3-reference`. Each runs with the official recipe:
+  - **What it starts.** The `sglang serve` the profiles route to: fl2va for `h3`, ref2va for `h3-reference`, and
+    the Turbo server for `h3-turbo`. Each runs with the official recipe:
     ```
     /opt/sglang/bin/sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va --num-gpus 4 \
         --ulysses-degree 4 --performance-mode speed --host 127.0.0.1 --port 30010 --master-port 31010 --scheduler-port 32010
     ```
-  - **Ports.** The HTTP port comes from `KUNO_H3_FL2VA_URL` or `KUNO_H3_REF2VA_URL`, which must be
-    `http://127.0.0.1:<port>`. SGLang otherwise picks its master and scheduler ports by looking for free ones,
-    which two servers starting at once can race for. So those are fixed 1000 and 2000 above the HTTP port.
+    The Turbo server is the fl2va checkpoint on port 30012 plus `--lora-path <KUNO_H3_TURBO_LORA> --lora-nickname turbo`.
+  - **One H3 load per container.** A loaded 4-GPU server holds 87–97 GB per GPU and peaks at about 103 GB (H200,
+    2026-09-16), so two can't share 141 GB H200s, and very likely not 180 GB B200s. `kuno-h3-worker` refuses a
+    profile set that needs two loads, for example `h3,h3-reference`, or `h3-turbo` beside `h3`. It names the
+    profiles and the fix: one list per GPU group (§6). `KUNO_H3_SHARED_SERVERS=1` lifts the refusal for GPUs that
+    can hold two, such as 288 GB B300s; that has never run.
+  - **Ports.** The HTTP port comes from `KUNO_H3_FL2VA_URL`, `KUNO_H3_REF2VA_URL` or `KUNO_H3_TURBO_URL` (defaults
+    30010, 30011 and 30012), which must be `http://127.0.0.1:<port>`. SGLang otherwise picks its master and
+    scheduler ports by looking for free ones, which two servers starting at once can race for. So those are fixed
+    1000 and 2000 above the HTTP port.
   - **Order.** It waits for every server's `/health` before starting `kuno-worker`, so the worker never registers
     capacity it can't serve yet.
   - **Failures.** If any process exits it stops the others, sending SIGTERM to the worker first so an in-flight job
@@ -255,29 +269,32 @@ The `h3` target adds SGLang's side:
   not to point `--model-path` at a subdirectory of a manual download. `KUNO_H3_MODEL_ID` replaces the id for SGLang
   and the Turbo pipeline alike.
 
-**`h3-turbo` is in the image but not in its default profiles.**
-- **No lightx2v.** `real` serves h3-turbo in the worker process through diffusers 0.40, already in `/opt/kuno`.
-  LightX2V's `inference_minimax_h3.py` is only the `cold` backend, which reloads about 124 GB for every job.
-- **Why it's off by default.**
-  - Its loader puts H3 on one device, beside SGLang servers that hold the same four GPUs. It can't fit there: one
-    loaded H3 server holds 87–97 GB per H200 (measured 2026-09-16).
-  - diffusers' `load_lora_weights` needs `peft`, which the image doesn't install.
-  - It needs the LoRA file mounted (`KUNO_H3_TURBO_LORA`).
-  - SGLang 0.5.19 in `/opt/sglang` loads the LoRA itself (`sglang serve --lora-path`, or `POST /v1/set_lora` on a
-    running server). That is how Turbo was measured, 8-step at 11.5 GPU-s per output second at 5 s on 4 H200s
-    (`research/pricing/measured_2026-09-16_h3-turbo.md` in the dev repo). Moving `h3-turbo` onto it is the fix.
-- **Turning it on.** Set `KUNO_PROFILES=h3-turbo,h3,h3-reference` once it has run on GPUs.
+**The image's default is `KUNO_PROFILES=h3`**: one H3 load, needing nothing mounted beyond the hub cache.
+
+**`h3-turbo`.**
+- **The LoRA.** Mount LightX2V's `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` (`lightx2v/Minimax-h3-Turbo`)
+  and set `KUNO_H3_TURBO_LORA` to its path. `kuno-h3-worker` refuses `h3-turbo` without it. In a CVM the container
+  sees only `/models`, so the file has to be on a weights image, for example the `h3` one next to the hub cache.
+- **Requests.** Each carries `flow_shift` 6 and `audio_flow_shift` 3, the LoRA's training shifts, and
+  `num_inference_steps` 9: SGLang runs one pass fewer than the points it is given, and the LoRA is trained for 8.
+- **Measured.** SGLang 0.5.19 from this image served the LoRA through `--lora-path` on 4 H200s (2026-09-16),
+  at 11.5 GPU-s per output second at 5 s (`research/pricing/measured_2026-09-16_h3-turbo.md` in the dev repo). That
+  run sent 8 points, not 9, and went straight to SGLang: the worker has not sent a Turbo job yet.
+- **No lightx2v.** LightX2V's own `inference_minimax_h3.py` isn't in the image, and no backend runs it.
 
 **Run on GPUs without confidential computing** (4 of 8 H200s, 2026-09-15 and -16): SGLang loads H3 from a read-only,
 offline hub cache, and its JIT kernels compile with the pip CUDA 13 toolkit once `lib64` and the unversioned `.so`
 names exist (both fixed in `worker.Dockerfile`). **Not verified**, in particular:
-- **Both variants side by side on four GPUs, which is what the default `KUNO_PROFILES=h3,h3-reference` starts.** One
-  loaded server holds 87–97 GB per GPU and peaks at about 103 GB, so two cannot share 141 GB H200s, and very likely
-  not 180 GB B200s. Until each GPU group can serve its own profiles, give a worker one variant: `h3` or `h3-reference`.
+- **Two H3 loads on one GPU group** (`KUNO_H3_SHARED_SERVERS=1`), on any GPU. The image's earlier default,
+  `h3,h3-reference`, started both servers on four GPUs; it never ran, and would almost certainly run out of memory
+  on H200s.
+- **`h3-turbo` through the worker:** the Turbo server started by `kuno-h3-worker`, and its requests at 9 points.
 - SGLang's JIT kernels compiling with the CUDA 13 toolkit that pip wheels put in `/opt/sglang`. `kuno-h3-worker` sets
   the servers' `CUDA_HOME` to it (`site-packages/nvidia/cu13`, holding `nvcc` and the runtime headers), and g++ is
   the host compiler. Whether those wheels hold everything the kernels include and link is unchecked.
-- The Turbo pipeline's memory, and a CUDA 13 torch (SGLang) sharing the GPUs with a CUDA 12.8 torch (the worker).
+- Verified `h3-turbo` in the worker process: its memory, loading the LoRA through `peft`, and its determinism. Only
+  the imports were checked, with peft 0.21.0 beside this image's diffusers 0.40, transformers and torch. Its loader
+  has no sequence parallelism, while the classes `h3-turbo` pins name Ulysses x4.
 - Shared memory for NCCL between four GPUs in one container. kuno-app sets no `--shm-size`, and podman's default
   `/dev/shm` is 64 MB.
 
@@ -652,22 +669,29 @@ continuing, the way dstack-vmm does (`configure_gpus`: GPUs, then bridges). The 
 `worker.env` sets the layout, and `kuno-app` starts one container per group:
 
 ```
-KUNO_PROFILES=h3,h3-reference
 KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7
+KUNO_PROFILES=h3-turbo h3-reference
+KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors
 ```
 
-Add `h3-turbo` to `KUNO_PROFILES` once it has run on GPUs (§1, "The MiniMax H3 image"). The shapes already
-list it.
-
+- **Profiles per group.** `KUNO_PROFILES` is one comma-separated list, which every group serves, or one list per
+  group, space-separated in the order of `KUNO_GPU_GROUPS`. Above, GPUs 0–3 serve `h3-turbo` and GPUs 4–7
+  `h3-reference`. Spaces next to a comma stay inside a list, so `h3, h3-reference` is one list. Without
+  `KUNO_GPU_GROUPS`, `kuno-app` refuses per-group lists.
+- **One H3 load per group.** On H200s and B200s each H3 group serves one of `h3`, `h3-reference` and `h3-turbo`
+  (§1, "The MiniMax H3 image"). A group given more exits at start, and `kuno-app` then stops the other worker too.
+  `h3-turbo` has not yet run through the worker.
 - **Devices.** Each container gets its group's CDI devices, `nvidia.com/gpu=<index>`, and in Protected PCIe mode
   the NVSwitch device nodes and the root filesystem's NSCQ library.
-- **Layout checks.** `kuno-app` refuses overlapping groups, missing indices, and a group whose size isn't every
-  listed profile's `gpus_per_worker`. The table it checks against is on the worker image disk, measured into RTMR3.
+- **Layout checks.** `kuno-app` refuses overlapping groups, missing indices, a group whose size isn't every
+  listed profile's `gpus_per_worker`, and a number of profile lists that is neither one nor the number of groups.
+  The table it checks against is on the worker image disk, measured into RTMR3.
 - **Supervision.** If one worker exits, `kuno-app` stops the other and fails, and systemd restarts both.
 - **H3 runtime ports.** The workers share the host network namespace, so worker *i* gets
-  `KUNO_H3_FL2VA_URL=http://127.0.0.1:30010+10i` and `KUNO_H3_REF2VA_URL=…:30011+10i`. The H3 image's
-  `kuno-h3-worker` starts that container's SGLang servers there, with their master and scheduler ports 1000 and
-  2000 higher (§1, "The MiniMax H3 image").
+  `KUNO_H3_FL2VA_URL=http://127.0.0.1:30010+10i`, `KUNO_H3_REF2VA_URL=…:30011+10i` and
+  `KUNO_H3_TURBO_URL=…:30012+10i`, with its group's `KUNO_PROFILES`. The H3 image's `kuno-h3-worker` starts that
+  container's SGLang server there, with its master and scheduler ports 1000 and 2000 higher (§1, "The MiniMax H3
+  image").
 - **No layout set.** One worker with every GPU, as before.
 
 Why a hostile layout can't claim more GPUs than it has:

@@ -12,7 +12,8 @@
 #      attested every GPU and NVSwitch and checked their NVLink topology.
 #   5. Loads the worker image from the image disk, stops unless podman loaded exactly the measured image's
 #      config, and runs it with host-provided settings reduced to an allowlist: one worker container per GPU
-#      group (KUNO_GPU_GROUPS), or one worker with every GPU.
+#      group (KUNO_GPU_GROUPS, each with its own KUNO_PROFILES list if the host gives one), or one worker with
+#      every GPU.
 #
 # The worker image is not in the root filesystem, so MRTD and RTMR0-2 stay the same across worker releases for
 # one OS release and VM shape; a Turbo candidate differs from its base only in RTMR3 (TURBO.md).
@@ -39,7 +40,7 @@ readonly ZEROS=00000000000000000000000000000000000000000000000000000000000000000
 readonly EVENT_IMAGE_DISK=kuno/v1/rtmr3/image-disk
 readonly EVENT_IMAGE=kuno/v1/rtmr3/image
 readonly EVENT_WEIGHTS=kuno/v1/rtmr3/weights
-readonly ALLOWED_ENV=" KUNO_GATEWAY_URL KUNO_PROFILES KUNO_CAPACITY KUNO_MINER_HOTKEY KUNO_VERIFIED_HARDWARE_CLASS KUNO_MODEL_DIGEST KUNO_H3_FL2VA_URL KUNO_H3_REF2VA_URL KUNO_H3_TURBO_LORA KUNO_REATTEST_S KUNO_RETRY_MAX_S KUNO_PROVENANCE KUNO_GPU_EVIDENCE KUNO_SAFETY_REQUIRE_CLASSIFIER KUNO_GPU_GROUPS "
+readonly ALLOWED_ENV=" KUNO_GATEWAY_URL KUNO_PROFILES KUNO_CAPACITY KUNO_MINER_HOTKEY KUNO_VERIFIED_HARDWARE_CLASS KUNO_MODEL_DIGEST KUNO_H3_FL2VA_URL KUNO_H3_REF2VA_URL KUNO_H3_TURBO_URL KUNO_H3_TURBO_LORA KUNO_H3_SHARED_SERVERS KUNO_REATTEST_S KUNO_RETRY_MAX_S KUNO_PROVENANCE KUNO_GPU_EVIDENCE KUNO_SAFETY_REQUIRE_CLASSIFIER KUNO_GPU_GROUPS "
 
 log() { printf 'kuno-app: %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
@@ -121,26 +122,59 @@ check_image() {
 #     older enclave on it is replaced, so overlapping groups still leave one enclave per GPU;
 #   - an enclave's capacity is its attested GPUs // gpus_per_worker, and a manifest entry's gpus_per_enclave
 #     refuses any other group size.
-# gpu_groups <groups> <profiles, comma-separated> <gpus-per-worker table> <GPU index>...: the groups, one per line.
+#
+# KUNO_PROFILES is one comma-separated list, which every group serves, or one list per group: space-separated, in
+# KUNO_GPU_GROUPS's order. With the groups above, "h3-turbo h3-reference" gives GPUs 0-3 h3-turbo and GPUs 4-7
+# h3-reference. Spaces next to a comma stay inside a list ("h3, h3-reference" is one list). This is how an H3 TD
+# serves more than one H3 runtime: one loaded H3 fills most of an H200's memory, so kuno-h3-worker refuses a
+# group whose profiles would load it twice (image/CVM.md §6).
+
+# profile_lists <KUNO_PROFILES>: its lists, separated by single spaces, with the spaces next to commas dropped.
+profile_lists() {
+  local value="${1//$'\t'/ }" list out=""
+  local -a lists=()
+  while [[ "$value" == *" ,"* || "$value" == *", "* ]]; do
+    value="${value// ,/,}"
+    value="${value//, /,}"
+  done
+  read -ra lists <<<"$value"
+  for list in "${lists[@]}"; do out="${out:+$out }$list"; done
+  printf '%s\n' "$out"
+}
+
+# gpu_groups <groups> <profiles> <gpus-per-worker table> <GPU index>...: the workers, one per line: "<group> <profiles>".
 gpu_groups() {
-  local spec="$1" profiles="$2" table="$3" size="" needed profile index group count=0
+  local spec="$1" profiles table="$3" size="" needed profile index group list count i
+  profiles="$(profile_lists "$2")"
   shift 3
   local -A available=() used=() catalog=()
+  local -a lists=() groups=() members=()
   for index in "$@"; do available[$index]=1; done
   while read -r profile needed; do
     [ -n "${profile:-}" ] && catalog[$profile]="$needed"
   done < "$table"
   [ -n "$profiles" ] || die "KUNO_GPU_GROUPS needs KUNO_PROFILES, so every group can be sized to its profiles"
-  IFS=, read -ra list <<<"${profiles// /}"
-  for profile in "${list[@]}"; do
-    [ -n "$profile" ] || continue
-    needed="${catalog[$profile]:-}"
-    [[ "$needed" =~ ^[1-9][0-9]*$ ]] || die "profile $profile is not in the catalog"
-    [ -z "$size" ] || [ "$size" = "$needed" ] || die "profiles $profiles need different GPU counts per worker; run them in separate TDs"
-    size="$needed"
+  read -ra lists <<<"$profiles"
+  for i in "${!lists[@]}"; do
+    count=0
+    IFS=, read -ra members <<<"${lists[$i]}"
+    for profile in "${members[@]}"; do
+      [ -n "$profile" ] || continue
+      needed="${catalog[$profile]:-}"
+      [[ "$needed" =~ ^[1-9][0-9]*$ ]] || die "profile $profile is not in the catalog"
+      [ -z "$size" ] || [ "$size" = "$needed" ] || die "profiles $profiles need different GPU counts per worker; run them in separate TDs"
+      size="$needed"
+      count=$((count + 1))
+    done
+    [ "$count" -ge 1 ] || die "KUNO_PROFILES list ${lists[$i]} names no profile"
   done
-  [ -n "$size" ] || die "KUNO_PROFILES names no profile"
-  for group in $spec; do
+  read -ra groups <<<"$spec"
+  [ "${#groups[@]}" -ge 1 ] || die "KUNO_GPU_GROUPS names no GPU group"
+  [ "${#lists[@]}" -eq 1 ] || [ "${#lists[@]}" -eq "${#groups[@]}" ] \
+    || die "KUNO_PROFILES gives ${#lists[@]} profile lists for ${#groups[@]} GPU groups: give one list for all groups, or one per group"
+  for i in "${!groups[@]}"; do
+    group="${groups[$i]}" list="${lists[0]}"
+    [ "${#lists[@]}" -eq 1 ] || list="${lists[$i]}"
     [[ "$group" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || die "GPU group $group must be comma-separated GPU indices"
     IFS=, read -ra members <<<"$group"
     [ "${#members[@]}" -eq "$size" ] || die "GPU group $group has ${#members[@]} GPU(s); profiles $profiles need $size per worker"
@@ -149,17 +183,25 @@ gpu_groups() {
       [ -z "${used[$index]:-}" ] || die "GPU $index is in more than one group"
       used[$index]=1
     done
-    printf '%s\n' "$group"
-    count=$((count + 1))
+    printf '%s %s\n' "$group" "$list"
   done
-  [ "$count" -ge 1 ] || die "KUNO_GPU_GROUPS names no GPU group"
+}
+
+# worker_settings <worker index> <profiles>: what worker i of a group layout gets besides the host's settings. Host
+# networking shares one loopback, so each worker's H3 runtime servers get their own ports, 10 apart per worker.
+worker_settings() {
+  printf '%s\n' "KUNO_PROFILES=$2" \
+    "KUNO_H3_FL2VA_URL=http://127.0.0.1:$((30010 + 10 * $1))" \
+    "KUNO_H3_REF2VA_URL=http://127.0.0.1:$((30011 + 10 * $1))" \
+    "KUNO_H3_TURBO_URL=http://127.0.0.1:$((30012 + 10 * $1))"
 }
 
 # Off-host checks with the same functions, touching no register or disk:
 #   kuno-app --expected-rtmr3 <image disk root hash> <image digest> [weights root hash...]   the value RTMR3 replays to
 #   kuno-app --rtmr3-events <image disk root hash> <image digest> [weights root hash...]    "<tag> <value> <digest>" per event
 #   kuno-app --check-image <worker.oci.tar> <image digest>                                  the config digest, or a refusal
-#   kuno-app --gpu-groups <groups> <profiles> <gpus-per-worker table> <GPU index>...        the worker groups
+#   kuno-app --gpu-groups <groups> <profiles> <gpus-per-worker table> <GPU index>...        "<group> <profiles>" per worker
+#   kuno-app --worker-settings <worker index> <profiles>                                    worker i's own settings
 case "${1:-}" in
   --expected-rtmr3 | --rtmr3-events)
     mode="$1"
@@ -183,6 +225,12 @@ case "${1:-}" in
   --gpu-groups)
     shift
     gpu_groups "$@"
+    exit 0
+    ;;
+  --worker-settings)
+    [ "$#" -eq 3 ] || die "usage: kuno-app --worker-settings <worker index> <profiles>"
+    [[ "$2" =~ ^(0|[1-9][0-9]?)$ ]] || die "the worker index must be a number from 0 to 99"
+    worker_settings "$2" "$3"
     exit 0
     ;;
 esac
@@ -327,11 +375,16 @@ if [ "$gpu_mode" = ppcie ]; then
   run_args+=(--volume "$nscq:/usr/lib/x86_64-linux-gnu/libnvidia-nscq.so.2:ro" --volume "$nscq:/usr/lib/x86_64-linux-gnu/libnvidia-nscq.so:ro")
 fi
 
-declare -a groups=()
+declare -a groups=() group_profiles=()
 if [ -n "${host_env[KUNO_GPU_GROUPS]:-}" ]; then
   mapfile -t gpu_indices < <(nvidia-smi --query-gpu=index --format=csv,noheader | tr -d ' ')
   layout="$(gpu_groups "${host_env[KUNO_GPU_GROUPS]}" "${host_env[KUNO_PROFILES]:-}" "$GPUS_PER_WORKER" "${gpu_indices[@]}")"
-  mapfile -t groups <<<"$layout"
+  while read -r group list; do
+    groups+=("$group")
+    group_profiles+=("$list")
+  done <<<"$layout"
+elif [[ "$(profile_lists "${host_env[KUNO_PROFILES]:-}")" == *" "* ]]; then
+  die "KUNO_PROFILES gives a profile list per GPU group, but KUNO_GPU_GROUPS is not set"
 fi
 
 if [ "${#groups[@]}" -eq 0 ]; then
@@ -353,13 +406,12 @@ for i in "${!groups[@]}"; do
   devices=()
   IFS=, read -ra members <<<"${groups[$i]}"
   for gpu in "${members[@]}"; do devices+=(--device "nvidia.com/gpu=$gpu"); done
-  # Host networking shares one loopback, so each worker's H3 runtime servers get their own ports.
-  write_env "$STATE/worker-$i.env" \
-    "KUNO_H3_FL2VA_URL=http://127.0.0.1:$((30010 + 10 * i))" "KUNO_H3_REF2VA_URL=http://127.0.0.1:$((30011 + 10 * i))"
+  mapfile -t settings < <(worker_settings "$i" "${group_profiles[$i]}")
+  write_env "$STATE/worker-$i.env" "${settings[@]}"
   podman rm --force --ignore "$worker" >/dev/null
   podman run --rm --name "$worker" "${run_args[@]}" "${devices[@]}" --env-file "$STATE/worker-$i.env" "${config_digest#sha256:}" &
   pids+=("$!"); workers+=("$worker")
-  log "started $worker on GPUs ${groups[$i]}"
+  log "started $worker on GPUs ${groups[$i]} for ${group_profiles[$i]}"
 done
 status=0
 wait -n "${pids[@]}" || status=$?
