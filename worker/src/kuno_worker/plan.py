@@ -190,26 +190,11 @@ def main() -> None:
         if mode is Mode.STORYBOARD:
             payload = storyboard_plan(task)
         elif profile.family == FAMILY_H3:
-            from .backends.h3 import TURBO_LORA, build_sglang_request
+            from .backends.h3 import build_sglang_request
 
-            if profile.runtime == "lightx2v":
-                payload = {
-                    "runtime": "lightx2v",
-                    "command": [
-                        "python", "inference_minimax_h3.py", "--jobs-json", "<job>.json", "--lora-path", TURBO_LORA,
-                        "--inference-steps", str(profile.steps), "--video-shift", "6", "--audio-shift", "3",
-                        "--lora-alpha", "128", "--seed", str(args.seed), "--output-dir", "<out>", "--no-cpu-offload",
-                    ],
-                    "job": {
-                        "prompt": task.prompt,
-                        "duration": params.duration_s,
-                        "megapixels": round(task.width * task.height / 1_000_000, 4),
-                        "aspect_ratio": params.aspect_ratio,
-                    },
-                }
-            else:
-                variant, body = build_sglang_request(task, directory)
-                payload = {"runtime": "sglang", "server": variant, "endpoint": "POST /v1/videos", "body": body}
+            # Every H3 profile, h3-turbo included, is a request to one of the SGLang servers (backends/h3.py).
+            server, body = build_sglang_request(task, directory)
+            payload = {"runtime": "sglang", "server": server, "endpoint": "POST /v1/videos", "body": body}
         else:
             from .backends.ltx import LtxPaths, build_command, pick_pipeline
 

@@ -80,6 +80,12 @@ default audit rate.
 | `h3-turbo` | `diffusers-modular-h3/1` | 8 | stage 0 | `C4.h200-141gb.x4.ulysses4`, `C4.b200-180gb.x4.ulysses4`, `C4.b300-288gb.x4.ulysses4`: each is one of the two workers in a whole-server `c8.*` TD | 3 % |
 | `h3`, `h3-reference` | `diffusers-modular-h3/1` | 50 | stage 0 | as above | 2 % |
 
+**Where commitments actually come from today.** The H3 worker serves `h3` and `h3-reference` through SGLang, which has no
+step hook, so their receipts carry no step commitment even though their profiles pin a verified runtime. Only `h3-turbo`
+commits: on a pinned class the worker runs it in process through the diffusers modular pipeline instead of its SGLang
+server (`worker/backends/h3.py`). Storyboards (PROTOCOL.md "Storyboards") never commit, on any class, and the gateway
+sends them only to confidential enclaves.
+
 Open-tier classes (`comparison: "tolerance"`, see [Tolerance mode](#tolerance-mode)) are listed
 after the confidential ones: `ltx-2.5-fast` adds `O1.rtx-4090-24gb.x1.int8`,
 `O1.rtx-5090-32gb.x1.fp8-cast`, `O1.rtx-pro-6000-bw-96gb.x1` and `O1.h100-80gb.x1`; `ltx-2.5-pro`

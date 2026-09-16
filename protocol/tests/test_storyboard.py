@@ -122,8 +122,12 @@ def test_other_jobs_serialize_exactly_as_before_storyboards():
 def test_the_sealed_payload_carries_one_non_empty_prompt_per_shot_and_the_scene_goes_first():
     payload = SealedPayload(prompt="A small blue fishing boat.", shots=[ShotPrompt(prompt="It leaves the harbor."), ShotPrompt(prompt="Night falls.")])
     assert SealedPayload.model_validate_json(payload.model_dump_json()) == payload
+    for blank in ("", "  \n\t"):
+        with pytest.raises(ValueError):
+            ShotPrompt(prompt=blank)
     with pytest.raises(ValueError):
-        ShotPrompt(prompt="")
+        GenerationParams(profile_id=FAST.id, mode=Mode.STORYBOARD, duration_s=1, resolution="720p", aspect_ratio="16:9", fps=24,
+                         shots=[ShotSpec(duration_s=2, join="fresh")] * 65)
     assert shot_prompt("A small blue fishing boat. ", " It leaves the harbor.") == "A small blue fishing boat.\n\nIt leaves the harbor."
     assert shot_prompt("", "Night falls.") == "Night falls."
 

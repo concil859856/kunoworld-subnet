@@ -72,8 +72,9 @@ class GenerationParams(BaseModel):
     audio: bool = True
     input_roles: list[InputRole] = Field(default_factory=list)
     # Storyboard mode only. Serialized only when set, so every other job's params (the encryption's associated data, and
-    # the receipt's params_digest) stay byte-identical to clients that predate storyboards.
-    shots: list[ShotSpec] | None = None
+    # the receipt's params_digest) stay byte-identical to clients that predate storyboards. The bound is a parser limit;
+    # a profile's `limits.storyboard.max_shots` is the real one (`validate_params`).
+    shots: list[ShotSpec] | None = Field(default=None, max_length=64)
 
     @model_serializer(mode="wrap")
     def _omit_absent_shots(self, handler) -> dict[str, Any]:
@@ -116,6 +117,14 @@ class ShotPrompt(BaseModel):
 
     prompt: str = Field(min_length=1)
 
+    @field_validator("prompt")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        # `shot_prompt` strips it, so a whitespace-only shot would reach the model as an empty prompt.
+        if not value.strip():
+            raise ValueError("a shot prompt can't be blank")
+        return value
+
 
 class SealedPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -130,7 +139,7 @@ class SealedPayload(BaseModel):
     # Model-specific knobs (camera motion, guidance, prompt enhancement...).
     options: dict[str, Any] = Field(default_factory=dict)
     # Storyboard mode only, one per `GenerationParams.shots`, in order. Serialized only when set.
-    shots: list[ShotPrompt] | None = None
+    shots: list[ShotPrompt] | None = Field(default=None, max_length=64)
 
     @model_serializer(mode="wrap")
     def _omit_absent_shots(self, handler) -> dict[str, Any]:

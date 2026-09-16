@@ -278,7 +278,7 @@ def _raw_shots(*prompts: str) -> bytes:
         storyboard_payload(SHOT_PROMPTS[:2]),
         storyboard_payload(SHOT_PROMPTS + ["one too many"]),
         SealedPayload(prompt=SCENE),
-        storyboard_payload(["The boat pulls away", "   ", "A gull lands"]),
+        _raw_shots("The boat pulls away", "   ", "A gull lands"),  # a blank prompt no longer parses as a ShotPrompt
         _raw_shots("The boat pulls away", "", "A gull lands"),
     ],
     ids=["too few shot prompts", "too many", "no shot prompts", "a blank shot prompt", "an empty shot prompt"],

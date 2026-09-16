@@ -109,8 +109,8 @@ Audio pins come from the first shot of the current run of joined shots, not from
 voice from drifting across many joins. The worker's research note and experiment are in the dev repo
 (`research/long-video_ltx-av-extend_2026-09-16.md`, `scripts/gpu-test/long_video/`).
 
-**Sealed payload.** `SealedPayload.shots` holds one `{"prompt"}` per shot, in the same order; it is serialized only when
-set. `prompt` is the scene every shot shares (characters, place, style), possibly empty. The model sees
+**Sealed payload.** `SealedPayload.shots` holds one non-blank `{"prompt"}` per shot, in the same order; it is serialized
+only when set. `prompt` is the scene every shot shares (characters, place, style), possibly empty. The model sees
 `shot_prompt(scene, shot) = scene + "\n\n" + shot prompt` (or the shot prompt alone when the scene is empty), and each of
 those must fit the profile's `max_prompt_chars`. `negative_prompt` applies to every shot where the profile takes one.
 Storyboards take no inputs, and shot *i* (from 0) renders with seed `(seed + i) mod 2^31`. A worker refuses a count
@@ -128,8 +128,9 @@ multiplier; the Private long-clip rule and serving envelopes look at the longest
 **Progress and receipt.** The worker reports `stage` as `shot i/N` while rendering and the usual stages after. The
 receipt is unchanged: `video` describes the stitched MP4, and `params_digest` covers the shot list.
 
-**Not verified.** Storyboards carry no step commitment. Validators don't step-audit them and don't send them as canaries
-yet; the ledger's duration check (±0.5 s of `duration_s`) applies as for any job.
+**Not verified, so confidential only.** Storyboards carry no step commitment. Validators don't step-audit them and don't
+send them as canaries yet; the ledger's check is ±0.5 s of `duration_s`, exactly. Step audits are the only integrity
+check on open-tier miners, so the gateway routes storyboards, Private and Standard alike, only to confidential enclaves.
 
 **Standard mode.** `POST /v1/standard/videos` takes `shots: [{"prompt"}]` next to `params.shots`, and `prompt` is the scene
 (`platform/gateway/STANDARD_MODE.md`).
