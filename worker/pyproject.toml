@@ -57,6 +57,8 @@ kuno-bench = "kuno_worker.bench:main"
 kuno-verified-check = "kuno_worker.determinism:main"
 # Loads the safety classifiers from KUNO_SAFETY_* and runs each once on synthetic inputs (an image self-test).
 kuno-safety-check = "kuno_worker.safety_check:main"
+# Precision, recall and false-positive rate of the safety gate over labelled prompts or videos (no content in reports).
+kuno-safety-eval = "kuno_worker.safety_eval:main"
 # The H3 image's entry point: MiniMax H3's SGLang servers and kuno-worker, supervised together.
 kuno-h3-worker = "kuno_worker.h3_servers:main"
 

@@ -176,10 +176,21 @@ classifier that crashes, drops a frame, or returns a score outside [0, 1]. The g
 in logs.
 
 **Limits.**
-- *No accuracy evaluation has been run.* Latency and benign behaviour were measured with
-  `worker/scripts/benchmark_frame_safety.py` on synthetic clips. Measuring recall on the
-  content this exists for needs a vetted evaluation set handled under the subnet owner's
-  legal process. Never assemble one ad hoc.
+- *Detection has not been measured; false positives have.*
+  - **The tool.** `kuno-safety-eval prompts|videos` runs the gate an image ships over any labelled set. It reports
+    precision, recall, false-positive rate, recall per category, near misses by score, and latency, and never includes
+    prompt text or frames.
+  - **Prompt benchmarks.** Public prompt sets work directly: ToxicChat (`--format toxicchat`) and Aegis 2.0
+    (`--format aegis`).
+  - **Violating video.** Measuring recall on the content this exists for needs a vetted evaluation set handled under
+    the subnet owner's legal process. Never assemble one ad hoc.
+  - **Benign results, 2026-09-16** (the dev repo's `research/safety/benign-false-positives_2026-09-16.md`):
+    - *Prompts.* 1 of 42 of our own prompts was falsely blocked (a dancer throwing coloured powder, which Qwen3Guard
+      rated "Controversial: Sexual").
+    - *Videos.* 0 of 80 generated videos were blocked, but with thin margins:
+      - The minor detector scored 0.3 or more on 41% of benign clips, including a canyon flight with no people.
+      - A stylised comic clip reached 0.25 `sexual`, past the 0.15 bar that applies once a minor is detected.
+      - The synthetic-clip peaks quoted in the policy table above understate real video by an order of magnitude.
 - *Zero-shot age estimation is coarse.* Expect false positives on young-looking adults,
   which block their mildly suggestive clips (swimwear, dance) at the lower minor thresholds.
   Expect false negatives on
