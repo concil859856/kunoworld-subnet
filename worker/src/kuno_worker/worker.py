@@ -106,6 +106,8 @@ class Worker:
         # Verified mode: retained step openings per job, discarded if the job fails after generation.
         self._openings: dict[str, object] = {}
         self.audits = AuditResponder(self.identity)
+        # Landmark pings go straight to the landmarks, not through the gateway; tests replace the transport.
+        self.location_transport = None
 
     # ------------------------------------------------------------ attestation
 
@@ -158,12 +160,35 @@ class Worker:
             extra["turbo_submission"] = self.turbo_submission
         if self.advertised_envelope is not None:
             extra["envelope"] = self.advertised_envelope
+        location = self._location_proof(nonce)
+        if location is not None:
+            extra["location"] = location
         self.client.register(evidence, self.miner_hotkey, self.config.capacity, proof, **extra)
         self.evidence = evidence
         self.last_attested = time.time()
         self._refresh_certificate()
         self.ready.set()
         log.info("attested enclave %s for %s", self.identity.enclave_id, ", ".join(self.profiles))
+
+    def _location_proof(self, nonce: bytes) -> dict | None:
+        """For profiles whose licence is bound to territory (MiniMax H3): signed round trips to the gateway's landmarks,
+        measured from inside this VM, so the gateway and validators can bound where it runs (kuno_protocol.location)."""
+        if not any(profile.license.region_policy for profile in self.profiles.values()):
+            return None
+        try:
+            document = self.client.landmarks()
+        except Exception as exc:  # a gateway without landmarks, or one that's down: register without a proof
+            log.warning("could not read the gateway's landmarks (%s); registering without a location proof", exc)
+            return None
+        if not document:
+            return None
+        from kuno_protocol.location import SignedLandmarks
+
+        from .location import measure
+
+        landmarks = SignedLandmarks.model_validate(document).landmarks
+        proof = measure(landmarks, nonce, self.identity.enclave_id, transport=self.location_transport)
+        return proof.model_dump(mode="json")
 
     # ------------------------------------------------------------ C2PA certificate
 

@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .attestation import AttestationEvidence
 from .canonical import canonical_json
 from .hotkey import HotkeyProof
+from .location import LocationProof
 from .profiles import InputRole, Mode
 from .receipts import Receipt
 
@@ -157,6 +158,8 @@ class MinerRegistration(BaseModel):
     capacity: int = Field(default=1, ge=1, le=64)
     hotkey_proof: HotkeyProof | None = None
     envelope: dict[str, dict[str, dict[str, dict[int, float]]]] | None = None
+    # Signed landmark round trips for profiles whose licence is bound to territory (kuno_protocol.location).
+    location: LocationProof | None = None
 
 
 class RouteResponse(BaseModel):

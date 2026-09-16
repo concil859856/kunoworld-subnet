@@ -17,6 +17,7 @@ from kuno_protocol.attestation import AttestationEvidence, AttestationPolicy, Go
 from kuno_protocol.canonical import canonical_json, sha256_hex
 from kuno_protocol.findings import MAX_FINDINGS, Finding, FindingsReport, SignedFindings, sign_findings, verify_findings
 from kuno_protocol.hotkey import HotkeySigner
+from kuno_protocol.location import LandmarkList, LocationProof, SignedLandmarks, verify_location
 from kuno_protocol.mp4 import Mp4Error, probe
 from kuno_protocol.profiles import Mode, ModelProfile, load_profiles
 from kuno_protocol.receipts import Receipt, verify_receipt
@@ -107,6 +108,7 @@ class Validator:
         main_validator_hotkey: str | None = None,
         spot_check_rate: float = DEFAULT_SPOT_CHECK_RATE,
         divergence_warning: float = DEFAULT_DIVERGENCE_WARNING,
+        require_location_proof: bool = False,
     ):
         if role not in ROLES:
             raise ValueError(f"validator role must be one of {', '.join(ROLES)}, not {role!r}")
@@ -161,6 +163,9 @@ class Validator:
         self.spot_check_rate = spot_check_rate
         self.divergence_warning = divergence_warning
         self.last_divergence: float | None = None
+        # Territory-bound profiles (MiniMax H3) count as attested only with a landmark proof this validator checked.
+        self.require_location_proof = require_location_proof
+        self._landmark_list: LandmarkList | None = None
         self._main_weights: dict[str, float] | None = None
         self.state_path = state_path
         self._load_state()
@@ -351,10 +356,51 @@ class Validator:
         if verdict.enclave_id != enclave["enclave_id"]:
             verdict.ok = False
             verdict.reasons.append("the evidence names different keys than the registered enclave")
+            return
+        problem = self.location_problem(enclave, evidence.profiles) if verdict.ok else None
+        if problem:
+            verdict.ok = False
+            verdict.reasons.append(problem)
         elif verdict.ok and verdict.tier:
             self.enclave_tiers[verdict.enclave_id] = verdict.tier
         if verdict.ok:
             self.enclave_profiles[verdict.enclave_id] = list(evidence.profiles)
+
+    def landmarks(self) -> LandmarkList | None:
+        """The gateway's landmark list, used only if the owner signed it (or, with no owner key, as served)."""
+        response = self._request("GET", "/v1/landmarks")
+        if response.status_code != 200:
+            return None
+        try:
+            signed = SignedLandmarks.model_validate(response.json())
+        except ValueError:
+            log.error("the gateway served a malformed landmark list")
+            return None
+        if self.owner_public_key is not None and not signed.verify(self.owner_public_key):
+            log.error("the gateway's landmark list is not signed by the owner key; location proofs can't be checked")
+            return None
+        return signed.landmarks
+
+    def location_problem(self, enclave: dict, profiles: list[str]) -> str | None:
+        """Why an enclave offering territory-bound profiles hasn't proven where it runs, or None (kuno_protocol.location)."""
+        policies = {self.profiles[p].license.region_policy for p in profiles if p in self.profiles} - {None}
+        if not policies or not self.require_location_proof:
+            return None
+        if self._landmark_list is None:
+            self._landmark_list = self.landmarks()
+        if self._landmark_list is None:
+            return "no owner-signed landmark list to check this enclave's location against"
+        record = enclave.get("location") or {}
+        try:
+            proof = LocationProof.model_validate(record["proof"]) if record.get("proof") else None
+        except ValueError:
+            proof = None
+        for policy in sorted(policies):
+            verdict = verify_location(proof, self._landmark_list, registration_nonce=str(record.get("nonce") or ""),
+                                      enclave_id=enclave["enclave_id"], region_policy=policy)
+            if not verdict.ok:
+                return f"location not proven for {policy}: {verdict.detail}"
+        return None
 
     # ------------------------------------------------------------ findings (main validator -> auditors)
 
@@ -753,6 +799,7 @@ class Validator:
         an auditor verifies published evidence with spot challenges, applies the main validator's signed findings,
         scores, and measures how far its weights are from the main validator's."""
         extra_penalties: dict[str, list[str]] | None = None
+        self._landmark_list = None  # the owner may publish a new landmark list between rounds
         if self.role == "auditor":
             if canary_profiles or standard_canary_profiles:
                 log.warning("auditor validators send no canaries; ignoring the canary profiles given")

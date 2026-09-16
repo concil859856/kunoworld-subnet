@@ -18,6 +18,8 @@ tdx = ["dcap-qvl>=0.6.3"]
 [project.scripts]
 kuno-devkit = "kuno_protocol.devkit:main"
 kuno-turbo = "kuno_protocol.turbo_cli:main"
+# A landmark server for latency-bounded miner location (location.py).
+kuno-landmark = "kuno_protocol.location:main"
 
 [build-system]
 requires = ["hatchling"]

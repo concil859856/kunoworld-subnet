@@ -269,6 +269,52 @@ TDX evidence without endorsements is refused by clients, not half-checked. Imple
 (Python), `verifyEvidence` with `endorsements` (JavaScript). `sdk/js/test/endorsement_vectors.json` holds cases both
 must decide identically.
 
+## Location proofs
+
+For profiles whose licence is bound to territory (a `region_policy`, today MiniMax H3), a registration can carry a
+proof of where the machine is, bounded by the speed of light (`kuno_protocol.location`).
+
+**Landmarks.** The owner signs the list of landmark servers, and gateways serve it at `GET /v1/landmarks` (404
+`no_landmarks` without one):
+
+```
+list    = {"v": 1, "issued_at": int, "landmarks": [{"id": [a-z0-9-]{1,32}, "url", "public_key": b64url Ed25519,
+            "latitude", "longitude", "clearance_km": {region_policy: km}}, ... <= 32]}
+message = "kuno/v1/landmarks\n" | canonical_json(list)                 signed = {"landmarks": list, "signature": b64url}
+```
+
+`clearance_km` is the great-circle distance from the landmark to the nearest point of that policy's excluded
+territory, islands and overseas territories included. The owner measures it.
+
+**Pings.** A landmark answers `GET /v1/ping?nonce=<64 hex>` with `{"landmark_id", "signature"}`, where the signature
+is Ed25519 over `"kuno/v1/landmark-ping\n" | landmark_id | "\n" | hex(nonce)`. Pings are single-packet GETs and
+answers single writes with Nagle off: a split write on a kept-alive connection waits on delayed ACKs (about 40 ms, a
+false 6,000 km).
+
+**Proof.** At registration, inside the confidential VM, the worker opens a connection to each landmark (untimed) and
+sends pings `i = 0..n-1`, where
+
+```
+nonce_i = SHA-256("kuno/v1/location-nonce\n" | registration nonce hex | "\n" | enclave_id | "\n" | landmark_id | "\n" | i)
+```
+
+It times each signed answer and sends each landmark's fastest as
+`MinerRegistration.location = {"v": 1, "samples": [{"landmark_id", "index", "rtt_ms", "signature"}, ... <= 32]}`.
+
+**Verdict.** A sample counts only if its landmark is in the owner's list and signed `nonce_index` for this registration
+and enclave. It places the machine within `rtt_ms / 2 × 299.792458` km of the landmark. The proof holds for a policy
+when some sample's radius is smaller than that landmark's clearance. Delay can be added in transit and never removed,
+so every error weakens a proof.
+
+A gateway with `KUNO_REQUIRE_LOCATION_PROOF=1` (which needs `KUNO_LANDMARKS`) refuses the territory-bound profiles of
+a registration whose proof doesn't hold (403 `location_unproven`). It stores the proof, the registration nonce and its
+verdicts, and publishes them as the enclave's `location`. Validators with the same setting verify that published proof
+against the owner-signed list themselves. An enclave offering a territory-bound profile without a valid proof isn't
+attested for them.
+
+Assumptions: landmark keys never leave the landmarks; a TDX guest's clock runs at its true rate (the TSC is protected
+from the host); confidential GPUs are passed through locally, so the VM's timings are the GPUs' machine's.
+
 ## Validator findings
 
 The main validator signs a report of the miners it caught each round, so auditor validators can apply those penalties

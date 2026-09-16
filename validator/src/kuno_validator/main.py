@@ -122,6 +122,7 @@ def main() -> None:
         main_validator_hotkey=args.main_validator_hotkey,
         spot_check_rate=args.spot_check_rate,
         divergence_warning=float(env.get("KUNO_DIVERGENCE_WARNING", DEFAULT_DIVERGENCE_WARNING)),
+        require_location_proof=env.get("KUNO_REQUIRE_LOCATION_PROOF", "0") == "1",
     )
 
     turbo = None

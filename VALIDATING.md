@@ -25,6 +25,7 @@ export KUNO_VALIDATOR_ROLE=auditor                 # or main (KunoWorld's own va
 export KUNO_MAIN_VALIDATOR_HOTKEY=<ss58>           # auditors: whose signed findings to apply; required to set weights
 export KUNO_SPOT_CHECK_RATE=0.1                    # auditors: share of enclaves challenged with our own nonce each round
 export KUNO_DIVERGENCE_WARNING=0.1                 # auditors: warn when this share of weight differs from the main validator's
+export KUNO_REQUIRE_LOCATION_PROOF=1               # H3 enclaves count as attested only with a landmark proof (PROTOCOL.md "Location proofs")
 export KUNO_GATEWAY_URL=<gateway-url>             # default http://127.0.0.1:8080
 export KUNO_VALIDATOR_API_KEY=...                  # required; sent on every gateway call
 export KUNO_MANIFEST=/path/to/golden-manifest.json # required

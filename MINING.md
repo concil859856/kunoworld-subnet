@@ -285,9 +285,19 @@ What the H3 image needs from the host:
   one it cannot determine, and answers `region_not_licensed`. In production it takes the country from your
   connection; on a dev network set `KUNO_MINER_COUNTRY=<two-letter code>` to declare where the worker runs.
   LTX-2.5 has no territory rule.
+- **A location proof, where the gateway requires one.** An IP address says where traffic exits, not where GPUs are.
+  - **How it works.** When a worker offers H3, it pings KunoWorld's landmark servers from inside its confidential VM at
+    registration and sends their signed, timed answers (`GET /v1/landmarks` lists them; `kuno_protocol.location`).
+  - **What passes.** Light bounds how far a fast round trip can reach, so the proof passes when some landmark answered
+    quickly enough that the machine can't be in an excluded territory. From a landmark about 950 km from the nearest
+    excluded territory, that means a round trip under about 6.3 ms, as from the same metro area.
+  - **What fails.** Slow or indirect routes, including VPNs, only weaken a proof. A gateway with
+    `KUNO_REQUIRE_LOCATION_PROOF=1` refuses H3 to a worker whose proof can't rule out the excluded territories
+    (`location_unproven`), and validators with the same setting don't count its attestation.
+  - **Where to run.** Place H3 workers close to a landmark, in a licensed country.
 
-**Neither image has run on a GPU yet.** Treat the first run as a validation run; image/CVM.md lists what is
-unverified.
+**Both images have run on rented GPUs, without confidential computing.** LTX-2.5 Fast and Pro ran on an RTX PRO 6000;
+H3 and H3 Director ran on 4× H200. Neither has run inside a confidential VM; image/CVM.md lists what is unverified.
 
 ## 4. Mainnet
 

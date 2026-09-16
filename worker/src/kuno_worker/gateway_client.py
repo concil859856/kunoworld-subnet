@@ -75,6 +75,15 @@ class GatewayClient:
     def nonce(self) -> bytes:
         return bytes.fromhex(self._send("GET", "/miner/v1/nonce", signed=False).json()["nonce"])
 
+    def landmarks(self) -> dict | None:
+        """The owner-signed landmark list (kuno_protocol.location), or None when this gateway has none."""
+        try:
+            return self._send("GET", "/v1/landmarks", signed=False).json()
+        except GatewayError as exc:
+            if exc.status == 404:
+                return None
+            raise
+
     def register(
         self,
         evidence: AttestationEvidence,
@@ -83,10 +92,14 @@ class GatewayClient:
         hotkey_proof: HotkeyProof | None = None,
         turbo_submission: dict | None = None,
         envelope: dict | None = None,
+        location: dict | None = None,
     ) -> dict:
         body = {"evidence": evidence.model_dump(mode="json"), "miner_hotkey": miner_hotkey, "capacity": capacity}
         if hotkey_proof is not None:
             body["hotkey_proof"] = hotkey_proof.model_dump(mode="json")
+        if location is not None:
+            # Signed landmark round trips for territory-bound profiles (kuno_protocol.location); older gateways ignore it.
+            body["location"] = location
         if envelope is not None:
             # The profiles this hardware cannot serve in full (kuno_protocol.envelope). Gateways from before envelopes
             # ignore the field.
