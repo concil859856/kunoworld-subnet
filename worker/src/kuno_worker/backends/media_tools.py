@@ -36,6 +36,7 @@ def encode_video(frames, fps: float, audio=None, sample_rate: int = 48000, crf: 
     if first.ndim != 3 or first.shape[2] != 3:
         raise BackendError(f"expected HxWx3 RGB frames, got shape {first.shape}")
     height, width = first.shape[:2]
+    duration = len(frames) / fps
 
     with tempfile.TemporaryDirectory(prefix="kuno-encode-") as tmp:
         out = Path(tmp) / "out.mp4"
@@ -43,12 +44,14 @@ def encode_video(frames, fps: float, audio=None, sample_rate: int = 48000, crf: 
                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", f"{fps:g}", "-i", "-"]
         if audio is not None:
             wav = Path(tmp) / "audio.wav"
-            _write_wav(wav, audio, sample_rate)
-            # The video decides the length: LTX-2.5's vocoder returns 2.010 s for 49 frames (2.042 s), and a bare
-            # -shortest cut the last frame. apad extends the audio with silence, so -shortest only trims longer audio.
-            args += ["-i", str(wav), "-c:a", "aac", "-b:a", "192k", "-af", "apad", "-shortest"]
+            # The video decides the length, to the sample: LTX-2.5's vocoder returns 2.010 s for 49 frames (2.042 s)
+            # but 11.605 s for 265 frames (11.042 s). apad with -shortest handled the first and not the second: ffmpeg
+            # cut the audio half a second late (RTX PRO 6000, 2026-09-16). So the samples are trimmed or padded with
+            # silence here, and -t caps the file at the video's length.
+            _write_wav(wav, audio, sample_rate, length=round(duration * sample_rate))
+            args += ["-i", str(wav), "-c:a", "aac", "-b:a", "192k"]
         args += ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p",
-                 "-movflags", "+faststart", str(out)]
+                 "-t", f"{duration:.6f}", "-movflags", "+faststart", str(out)]
 
         process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
@@ -65,7 +68,8 @@ def encode_video(frames, fps: float, audio=None, sample_rate: int = 48000, crf: 
         return out.read_bytes()
 
 
-def _write_wav(path: Path, audio, sample_rate: int) -> None:
+def _write_wav(path: Path, audio, sample_rate: int, length: int | None = None) -> None:
+    """Writes 16-bit PCM; `length` trims the samples, or pads them with silence, to exactly that many."""
     import wave
 
     import numpy as np
@@ -81,6 +85,9 @@ def _write_wav(path: Path, audio, sample_rate: int) -> None:
         samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
     else:
         samples = samples.astype(np.int16)
+    if length is not None:
+        samples = samples[:length] if len(samples) >= length else np.concatenate(
+            [samples, np.zeros((length - len(samples), samples.shape[1]), dtype=np.int16)])
     with wave.open(str(path), "wb") as handle:
         handle.setnchannels(samples.shape[1])
         handle.setsampwidth(2)

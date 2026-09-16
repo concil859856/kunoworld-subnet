@@ -165,6 +165,18 @@ def test_audio_shorter_than_the_video_keeps_every_frame():
         assert int(video["nb_frames"]) == 49
 
 
+def test_audio_longer_than_the_video_is_cut_to_the_video_to_the_sample():
+    # RTX PRO 6000, 2026-09-16: 265 frames at 24 fps (11.042 s) came with 11.605 s of vocoder audio, and apad plus
+    # -shortest left the audio track half a second longer than the video.
+    audio = np.zeros((int(11.605 * 48000), 2), dtype=np.float32)
+    info = probe(encode_video(frames(265), fps=24, audio=audio, sample_rate=48000))
+    if info:
+        video = next(s for s in info["streams"] if s["codec_type"] == "video")
+        sound = next(s for s in info["streams"] if s["codec_type"] == "audio")
+        assert int(video["nb_frames"]) == 265
+        assert float(sound["duration"]) == pytest.approx(265 / 24, abs=0.05)
+
+
 def test_bfloat16_audio_tensors_from_a_vocoder_are_accepted():
     # LTX2Pipeline returns its vocoder's output as a torch tensor (on the GPU, bfloat16), which numpy cannot take directly.
     torch = pytest.importorskip("torch")
