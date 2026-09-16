@@ -18,7 +18,7 @@ All sexual content (NSFW) is banned in both Private and Standard mode. The gate 
      setting that allows sexual content.
 
 Contract with worker.py: `check_request(prompt, negative_prompt)` returns None or raises
-`SafetyViolation`, which the worker reports as `safety_blocked`; `check_output(video, signals)`
+`SafetyViolation`, which the worker reports as `safety_blocked`; `check_output(video, signals, shot_frames)`
 does the same for the rendered MP4. When a configured classifier cannot give an answer, the
 gate raises `SafetyUnavailable` instead — not a SafetyViolation — so the job fails closed as
 the miner's `internal_error` rather than being blamed on the customer.
@@ -33,7 +33,8 @@ Configuration (environment, read once):
   KUNO_SAFETY_LABEL_MAP            JSON {model label: category} for the `sequence` adapter
   KUNO_SAFETY_FRAME_MODEL_PATH     sexual-content image classifier directory (unset: outputs unchecked, logged as an error)
   KUNO_SAFETY_MINOR_MODEL_PATH     CLIP directory for apparent-minor presence (unset: minors assumed in every frame)
-  KUNO_SAFETY_FRAMES               frames sampled per video, first and last included (default 10)
+  KUNO_SAFETY_FRAMES               frames sampled per video, first and last included (default 10; a storyboard: at
+                                   least 10, plus 3 inside every shot)
   KUNO_SAFETY_FRAME_THRESHOLDS     JSON lowering FramePolicy thresholds: sexual, suggestive, minor, minor_sexual, minor_suggestive
   KUNO_SAFETY_FRAME_LABEL_MAP, KUNO_SAFETY_FRAME_DTYPE, KUNO_SAFETY_THREADS   see safety_frames.load_frame_models
 """
@@ -56,6 +57,8 @@ from kuno_protocol.content_policy import ContentPolicyViolation
 from .safety_frames import POLICY_CATEGORIES, FramePolicy, RequestSignals, load_frame_models, sample_frames
 
 log = logging.getLogger("kuno.worker.safety")
+
+STORYBOARD_MIN_FRAMES = 10
 
 # The request or output breaks the acceptable use policy. The same class the shared content policy
 # raises, so a prompt blocked by the list and a video blocked by the frame check are handled alike.
@@ -274,16 +277,19 @@ class SafetyGate:
         """Booleans the output stage uses to err toward blocking. Carries no prompt text."""
         return RequestSignals(mentions_minor=self.blocklist.mentions_minor(prompt))
 
-    def check_output(self, video: bytes, signals: RequestSignals | None = None) -> None:
-        """Classifies frames sampled from the finished MP4, before it is sealed or signed."""
+    def check_output(self, video: bytes, signals: RequestSignals | None = None, shot_frames: Sequence[int] | None = None) -> None:
+        """Classifies frames sampled from the finished MP4, before it is sealed or signed. A storyboard passes its frames
+        per shot (`GenerationTask.shot_frames`), so every shot is sampled, however short."""
         models = self._frame_models()
         if self.frame_unavailable or (self.require_classifier and not models):
             raise SafetyUnavailable()
         if not models:
             return
         size = max(int(getattr(model, "input_size", 224)) for model in models)
+        # A storyboard is checked on at least 10 frames whatever KUNO_SAFETY_FRAMES says (PROTOCOL.md, "Storyboards").
+        count = max(self.frames_to_sample, STORYBOARD_MIN_FRAMES) if shot_frames else self.frames_to_sample
         try:
-            frames = sample_frames(video, self.frames_to_sample, size)
+            frames = sample_frames(video, count, size, shot_frames)
         except Exception as exc:  # ffmpeg's stderr is not echoed; keep only the type
             log.error("sampling frames for the safety check failed with %s; failing closed", type(exc).__name__)
             raise SafetyUnavailable() from None
@@ -457,5 +463,5 @@ def request_signals(prompt: str, negative_prompt: str | None = None) -> RequestS
     return default_gate().request_signals(prompt, negative_prompt)
 
 
-def check_output(video: bytes, signals: RequestSignals | None = None) -> None:
-    default_gate().check_output(video, signals)
+def check_output(video: bytes, signals: RequestSignals | None = None, shot_frames: Sequence[int] | None = None) -> None:
+    default_gate().check_output(video, signals, shot_frames)

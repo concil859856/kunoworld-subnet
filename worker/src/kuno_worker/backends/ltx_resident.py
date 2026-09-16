@@ -13,7 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
-from kuno_protocol.profiles import InputRole, Mode, ModelProfile, ltx_num_frames
+from kuno_protocol.profiles import InputRole, Mode, ModelProfile, ltx_num_frames, storyboard_frames
 from kuno_protocol.receipts import VideoInfo
 
 from ..verified import RetentionStore, context_bytes
@@ -120,6 +120,7 @@ def build_call(task: GenerationTask) -> dict[str, Any]:
 
 class LtxResidentBackend(Backend):
     name = "ltx-2.5/resident"
+    storyboards = True
 
     def __init__(
         self,
@@ -134,10 +135,12 @@ class LtxResidentBackend(Backend):
         weights_verify: str = "full",
         allow_unpinned_weights: bool = False,
         host_ram_gib: float | None = None,
+        storyboard_renderer: Callable[[Any, ModelProfile], Any] | None = None,
     ):
         """`hardware_class` turns on verified mode for profiles that pin it (see VERIFIED_MODE.md) and picks
         the weights precision (backends/quantized.py); `model_digest` is the weights identity from the
-        owner-signed manifest. `offload` is auto | none | model | group."""
+        owner-signed manifest. `offload` is auto | none | model | group. `storyboard_renderer(loaded, profile)` replaces
+        the one storyboards render through (ltx_storyboard.ExtendRenderer on the loaded pipelines) in tests."""
         if loader is None:
             if models_dir is None:
                 raise ValueError("KUNO_LTX_MODELS_DIR must point at the LTX-2.5 weights")
@@ -154,6 +157,7 @@ class LtxResidentBackend(Backend):
         self.model_digest = model_digest
         self.offload = offload
         self.host_ram_gib = host_ram_gib
+        self.storyboard_renderer = storyboard_renderer
         self._plans: dict[str, Any] = {}
         self._determinism: dict[str, Any] | None = None
 
@@ -198,6 +202,8 @@ class LtxResidentBackend(Backend):
         self.store.warm(profile)
 
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
+        if task.params.mode is Mode.STORYBOARD:
+            return self._storyboard(task, progress)
         directory = self.workdir / task.job_id
         directory.mkdir(parents=True, exist_ok=True)
         try:
@@ -249,3 +255,49 @@ class LtxResidentBackend(Backend):
             import shutil
 
             shutil.rmtree(directory, ignore_errors=True)
+
+    def _storyboard(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
+        """Shot after shot on the loaded pipelines, each joined to the ones before it from their final latents
+        (backends/ltx_storyboard.py), into one stitched video. Never verified: no step recorder and no commitment, even
+        on a class that runs verified mode for this profile's other jobs."""
+        import shutil
+
+        from .ltx_storyboard import render_storyboard
+
+        shots = task.params.shots or []
+        tasks = [task.shot_task(index) for index in range(len(shots))]
+        calls = [build_call(shot) for shot in tasks]
+        # Shots render one at a time, so the longest decides whether this class's memory holds the storyboard: refused
+        # before any GPU work, as a single clip of that length would be.
+        longest = max(range(len(calls)), key=lambda index: calls[index]["num_frames"])
+        self.admit(tasks[longest], calls[longest])
+        directory = self.workdir / task.job_id
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            with self.store.acquire(task.profile) as loaded:
+                renderer = self._storyboard_renderer(loaded, task.profile)
+                data, frames = render_storyboard(
+                    renderer, [shot.join for shot in shots], calls, directory, progress,
+                    overlap=task.profile.limits.storyboard.overlap_latent_frames, audio=task.params.audio,
+                )
+            expected = storyboard_frames(task.profile, shots, task.params.fps)
+            if frames != expected:
+                raise BackendError(f"the stitched video has {frames} frames, the storyboard's params say {expected}")
+            fps = float(task.params.fps)
+            info = VideoInfo(
+                duration_s=round(frames / fps, 3), width=task.width, height=task.height, fps=fps, frames=frames, audio=task.params.audio,
+            )
+            progress(1.0, "encoded")
+            return VideoResult(data=data, info=info)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def _storyboard_renderer(self, loaded: Any, profile: ModelProfile) -> Any:
+        if self.storyboard_renderer is not None:
+            return self.storyboard_renderer(loaded, profile)
+        pipelines = getattr(loaded, "pipelines", None)
+        if not isinstance(pipelines, dict):
+            raise BackendError("the loaded LTX-2.5 runtime has no diffusers pipelines to render a storyboard with")
+        from .ltx_storyboard import ExtendRenderer
+
+        return ExtendRenderer(pipelines, device=getattr(loaded, "device", "cuda"), overlap=profile.limits.storyboard.overlap_latent_frames)

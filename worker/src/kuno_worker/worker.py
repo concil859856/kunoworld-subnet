@@ -18,9 +18,9 @@ from kuno_protocol.crypto import DecryptionError, RecipientSession
 from kuno_protocol.envelope import CAPACITY_REFUSED, advertised, describe, fits
 from kuno_protocol.hotkey import HotkeySigner, sign_hotkey_proof
 from kuno_protocol.media import ROLE_TYPES, sniff_mime
-from kuno_protocol.profiles import ModelProfile, ParamError, load_profiles, validate_params
+from kuno_protocol.profiles import Mode, ModelProfile, ParamError, load_profiles, shot_prompt, validate_params
 from kuno_protocol.receipts import Receipt, ReceiptBody, input_digest, sign_receipt
-from kuno_protocol.schemas import MinerChallenge, MinerJob, SealedPayload, input_label, job_aad, output_label
+from kuno_protocol.schemas import GenerationParams, MinerChallenge, MinerJob, SealedPayload, input_label, job_aad, output_label
 from kuno_protocol.sealed_payload import MalformedPayload, open_payload
 from kuno_protocol.verified import MinerAudit
 
@@ -31,6 +31,7 @@ from .config import WorkerConfig
 from .gateway_client import GatewayClient, GatewayError
 from .identity import EnclaveIdentity
 from .safety import SafetyUnavailable, SafetyViolation, check_output, check_request, request_signals
+from .safety_frames import RequestSignals
 
 log = logging.getLogger("kuno.worker")
 
@@ -481,6 +482,10 @@ class Worker:
         if not fits(table, job.params):
             # Before any download or decryption. The gateway doesn't route such a job here, so this costs nothing.
             raise JobRejected(CAPACITY_REFUSED, f"This worker's hardware {describe(table, job.params)}.")
+        backend = self.backend_for(profile)
+        if job.params.mode is Mode.STORYBOARD and not getattr(backend, "storyboards", False):
+            # The cold backends would render one clip of the stitched length: refuse rather than deliver that.
+            raise JobRejected("internal_error", "This worker's backend does not render storyboards.")
 
         enc, ciphertext = b64d(job.enc), b64d(job.ciphertext)
         aad = job_aad(job.job_id, self.identity.enclave_id, job.params, job.input_blob_ids)
@@ -492,20 +497,22 @@ class Worker:
             raise JobRejected("decrypt_failed", "The request did not decrypt for this enclave (tampered or wrong key).") from None
         except (MalformedPayload, ValidationError):
             raise JobRejected("bad_payload", "The decrypted request is malformed.") from None
+        model_prompts = self._model_prompts(job.params, payload)
         self._progress(job.job_id, 0.02, "decrypted", force=True)
 
         blobs = [self.client.download_blob(blob_id) for blob_id in job.input_blob_ids]
         inputs = self._open_inputs(job, payload, session.input_key, blobs)
-        if len(payload.prompt) > profile.limits.max_prompt_chars:
+        if any(len(prompt) > profile.limits.max_prompt_chars for prompt in (payload.prompt, *model_prompts)):
             raise JobRejected("prompt_too_long", f"Prompts are limited to {profile.limits.max_prompt_chars} characters.")
         if payload.negative_prompt and not profile.limits.negative_prompt:
             raise JobRejected("unsupported_option", f"{profile.name} does not use negative prompts.")
         try:
-            check_request(payload.prompt, payload.negative_prompt)
+            for prompt in model_prompts:
+                check_request(prompt, payload.negative_prompt)
         except SafetyViolation:
             raise JobRejected("safety_blocked", "The request was blocked by the content policy.") from None
         # Booleans only (e.g. "the prompt names a minor"); the frame check uses them to err toward blocking.
-        signals = request_signals(payload.prompt, payload.negative_prompt)
+        signals = RequestSignals.combine(request_signals(prompt, payload.negative_prompt) for prompt in model_prompts)
 
         width, height = profile.size_for(job.params.resolution, job.params.aspect_ratio)
         task = GenerationTask(
@@ -519,18 +526,17 @@ class Worker:
             height=height,
             inputs=inputs,
             options=payload.options,
+            shot_prompts=model_prompts if job.params.mode is Mode.STORYBOARD else None,
         )
         self._progress(job.job_id, 0.05, "generating", force=True)
-        result = self.backend_for(profile).generate(
-            task, lambda value, stage: self._progress(job.job_id, 0.05 + 0.85 * value, stage)
-        )
+        result = backend.generate(task, lambda value, stage: self._progress(job.job_id, 0.05 + 0.85 * value, stage))
         if result.openings is not None:
             self._openings[job.job_id] = result.openings
 
         # Judge the rendered frames before anything is signed, sealed or uploaded.
         self._progress(job.job_id, 0.9, "checking", force=True)
         try:
-            check_output(result.data, signals)
+            check_output(result.data, signals, shot_frames=task.shot_frames)
         except SafetyViolation:
             raise JobRejected("safety_blocked", "The video was blocked by the content policy.") from None
         except SafetyUnavailable:
@@ -604,6 +610,21 @@ class Worker:
             # gateway replaces this with an issued certificate, or with a dev one only if the gateway has no CA.
             self._install_dev_certificate(signer, PROVISIONAL)
         return signer
+
+    @staticmethod
+    def _model_prompts(params: GenerationParams, payload: SealedPayload) -> list[str]:
+        """What the model is prompted with: the prompt, or a storyboard's `shot_prompt(scene, shot)` for every shot, in
+        order. A storyboard needs exactly one non-empty shot prompt per shot; no other job has any."""
+        if params.mode is not Mode.STORYBOARD:
+            if payload.shots is not None:
+                raise JobRejected("bad_payload", "Shot prompts are only for storyboards.")
+            return [payload.prompt]
+        shots = payload.shots or []
+        if len(shots) != len(params.shots or []):
+            raise JobRejected("bad_payload", "A storyboard needs one shot prompt per shot.")
+        if any(not shot.prompt.strip() for shot in shots):
+            raise JobRejected("bad_payload", "Every storyboard shot needs a prompt.")
+        return [shot_prompt(payload.prompt, shot.prompt) for shot in shots]
 
     def _open_inputs(self, job: MinerJob, payload: SealedPayload, input_key: bytes, blobs: list[bytes]) -> list[InputFile]:
         refs = sorted(payload.inputs, key=lambda r: r.index)

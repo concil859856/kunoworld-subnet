@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from kuno_protocol.media import EXTENSIONS
-from kuno_protocol.profiles import InputRole, ModelProfile
+from kuno_protocol.profiles import InputRole, Mode, ModelProfile, storyboard_trim_frames
 from kuno_protocol.receipts import VideoInfo
 from kuno_protocol.schemas import GenerationParams, InputRef
 from kuno_protocol.verified import StepCommitment, Tensor
@@ -43,6 +43,8 @@ class GenerationTask:
     height: int
     inputs: list[InputFile] = field(default_factory=list)
     options: dict[str, Any] = field(default_factory=dict)
+    # Storyboards: what the model sees for each shot, `profiles.shot_prompt(scene, shot)`, in order. `prompt` is the scene.
+    shot_prompts: list[str] | None = None
 
     def first(self, role: InputRole) -> InputFile | None:
         return next((i for i in self.inputs if i.ref.role is role), None)
@@ -52,7 +54,28 @@ class GenerationTask:
 
     @property
     def num_frames(self) -> int:
+        if self.params.shots:
+            return sum(self.shot_frames)
         return self.profile.num_frames(self.params.duration_s, self.params.fps)
+
+    @property
+    def shot_frames(self) -> list[int] | None:
+        """A storyboard's frames per shot in the stitched video, in order: each shot's rendered frames less the head a
+        joined shot repeats (they sum to `profiles.storyboard_frames`). None for any other job."""
+        if not self.params.shots:
+            return None
+        trim = storyboard_trim_frames(self.profile)
+        fps = self.params.fps
+        return [self.profile.num_frames(shot.duration_s, fps) - (0 if shot.join == "fresh" else trim) for shot in self.params.shots]
+
+    def shot_task(self, index: int) -> GenerationTask:
+        """Storyboard shot `index` as a text-to-video task of its own: its duration, its model prompt, and seed
+        (seed + index) mod 2^31 (PROTOCOL.md)."""
+        shots, prompts = self.params.shots or [], self.shot_prompts or []
+        if len(prompts) != len(shots) or not 0 <= index < len(shots):
+            raise ValueError("a storyboard task needs one model prompt per shot")
+        params = self.params.model_copy(update={"mode": Mode.TEXT_TO_VIDEO, "duration_s": shots[index].duration_s, "shots": None})
+        return replace(self, params=params, prompt=prompts[index], seed=(self.seed + index) % 2**31, inputs=[], shot_prompts=None)
 
 
 @dataclass
@@ -82,6 +105,9 @@ class Backend(ABC):
     # profile pins a deterministic variant for that class.
     hardware_class: str | None = None
     retention: RetentionStore | None = None
+    # Renders storyboard jobs (PROTOCOL.md, "Storyboards"). A backend without it would render one clip of the stitched
+    # length, so the worker refuses the job instead.
+    storyboards: bool = False
 
     def warm(self, profile: ModelProfile) -> None:
         """Load weights ahead of the first job. TEE model loads are slow; do it once."""
@@ -102,8 +128,9 @@ class Backend(ABC):
         )
 
     def step_recorder(self, task: GenerationTask, context: bytes = b"") -> StepRecorder | None:
-        """A recorder for this job when verified mode applies, else None."""
-        if not self.verified_enabled(task.profile):
+        """A recorder for this job when verified mode applies, else None. Storyboards carry no step commitment, whatever
+        the hardware class."""
+        if task.params.mode is Mode.STORYBOARD or not self.verified_enabled(task.profile):
             return None
         from kuno_protocol.verified import AUDIT_BINDING_OPTION
 

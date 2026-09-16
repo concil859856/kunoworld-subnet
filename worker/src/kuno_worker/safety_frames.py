@@ -31,8 +31,8 @@ import json
 import math
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -53,6 +53,12 @@ class RequestSignals:
     """What the request-level checks learned, as booleans only: never prompt text."""
 
     mentions_minor: bool = False
+
+    @classmethod
+    def combine(cls, signals: Iterable[RequestSignals]) -> RequestSignals:
+        """The signals of one video made from several prompts (a storyboard's shots): whatever any of them raised."""
+        signals = list(signals)
+        return cls(**{f.name: any(getattr(s, f.name) for s in signals) for f in fields(cls)})
 
 
 # ---------------------------------------------------------------- policy
@@ -133,19 +139,34 @@ class FramePolicy:
 # Frames at the end of the clip always decoded, so the true last frame is found even if the
 # container's sample count overstates what decodes.
 _TAIL = 8
+# A storyboard's check looks at least this many frames inside every shot (PROTOCOL.md, "Storyboards"): an even spread
+# over a long stitched video can step over a short shot entirely.
+FRAMES_PER_SHOT = 3
 
 
-def plan_frame_indices(total: int, count: int) -> list[int]:
-    """`count` indices spread evenly over `total` frames, always including the first and last."""
+def plan_frame_indices(total: int, count: int, shot_frames: Sequence[int] | None = None) -> list[int]:
+    """`count` indices spread evenly over `total` frames, always including the first and last. With `shot_frames` (a
+    storyboard's frames per shot, in order, summing to `total`), also FRAMES_PER_SHOT spread over every shot, its first and
+    last included; a mismatched sum raises, so the check fails closed rather than sample the wrong spans."""
     if total <= 0:
         return []
     if total == 1 or count <= 1:
-        return [0] if total == 1 else [0, total - 1]
-    return sorted({round(i * (total - 1) / (count - 1)) for i in range(count)})
+        indices = {0} if total == 1 else {0, total - 1}
+    else:
+        indices = {round(i * (total - 1) / (count - 1)) for i in range(count)}
+    if shot_frames:
+        if sum(shot_frames) != total or min(shot_frames) < 1:
+            raise ValueError("the video's frames do not match its shots")
+        start = 0
+        for frames in shot_frames:
+            indices.update(start + i for i in plan_frame_indices(frames, FRAMES_PER_SHOT))
+            start += frames
+    return sorted(indices)
 
 
-def sample_frames(video: bytes, count: int, size: int = 224) -> list[Any]:
-    """Evenly spaced RGB frames including the first and last, squashed to size x size.
+def sample_frames(video: bytes, count: int, size: int = 224, shot_frames: Sequence[int] | None = None) -> list[Any]:
+    """Evenly spaced RGB frames including the first and last, squashed to size x size; for a
+    storyboard, also a few inside every shot (`plan_frame_indices`).
 
     Squashing (rather than a center crop) keeps the whole picture in view: a center crop
     of a 16:9 frame drops 44% of its width, where content could sit unexamined.
@@ -158,7 +179,7 @@ def sample_frames(video: bytes, count: int, size: int = 224) -> list[Any]:
     from .backends.media_tools import ffmpeg_exe  # noqa: PLC0415
 
     total = probe(video).frames
-    planned = plan_frame_indices(total, count)
+    planned = plan_frame_indices(total, count, shot_frames)
     if not planned:
         raise ValueError("the video has no frames")
     tail_start = max(0, total - _TAIL)

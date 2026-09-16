@@ -32,6 +32,7 @@ def toy_replayer(transcript: StepTranscript, context: bytes, target: int, state:
 
 class MockBackend(Backend):
     name = "mock"
+    storyboards = True
 
     def __init__(self, ffmpeg: str | None = None, retention: RetentionStore | None = None, hardware_class: str | None = DEV_HARDWARE_CLASS):
         self.ffmpeg = ffmpeg or _ffmpeg()
@@ -40,6 +41,8 @@ class MockBackend(Backend):
         (retention or shared_retention()).register_replayer(TOY_RUNTIME, toy_replayer)
 
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
+        if task.params.mode is Mode.STORYBOARD:
+            return self._storyboard(task, progress)
         params = task.params
         w, h, fps, d = task.width, task.height, params.fps, params.duration_s
         progress(0.05, "denoising")
@@ -71,6 +74,38 @@ class MockBackend(Backend):
         info = VideoInfo(duration_s=d, width=w, height=h, fps=fps, frames=round(d * fps), audio=params.audio)
         commitment, openings = verified if verified is not None else (None, None)
         return VideoResult(data=data, info=info, step_commitment=commitment, openings=openings)
+
+    def _storyboard(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
+        """The stitched video's exact frame count, fps and duration, each shot's kept frames in a hue of its own, with
+        the real backend's `shot i/N` stages. Storyboards are never verified, so there is no toy trajectory."""
+        params = task.params
+        w, h, fps = task.width, task.height, params.fps
+        kept = task.shot_frames or []
+        frames, count = sum(kept), len(kept)
+        graph = []
+        for index, shot_frames in enumerate(kept):
+            progress(0.05 + 0.8 * index / count, f"shot {index + 1}/{count}")
+            graph.append(f"testsrc2=size={w}x{h}:rate={fps},trim=end_frame={shot_frames},hue=h={(task.seed + 47 * index) % 360},format=yuv420p[s{index}]")
+        graph.append("".join(f"[s{index}]" for index in range(count)) + f"concat=n={count}:v=1:a=0[v]")
+        progress(0.9, "encoding")
+        with tempfile.TemporaryDirectory(prefix="kuno-mock-") as tmp:
+            inputs: list[str] = []
+            audio_args: list[str] = []
+            if params.audio:
+                inputs = ["-f", "lavfi", "-t", f"{frames / fps:.6f}", "-i", f"sine=frequency={220 + task.seed % 440}:sample_rate=48000"]
+                graph.append("[0:a]aresample=48000,aformat=channel_layouts=stereo[a]")
+                audio_args = ["-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+            out = Path(tmp) / "out.mp4"
+            cmd = [
+                self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *inputs, "-filter_complex", ";".join(graph), "-map", "[v]",
+                *audio_args, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p", "-r", str(fps),
+                "-frames:v", str(frames), "-movflags", "+faststart", str(out),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+            data = out.read_bytes()
+        progress(1.0, "rendered")
+        info = VideoInfo(duration_s=round(frames / fps, 3), width=w, height=h, fps=fps, frames=frames, audio=params.audio)
+        return VideoResult(data=data, info=info)
 
     # ------------------------------------------------------------ verified mode
 
