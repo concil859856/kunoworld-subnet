@@ -552,7 +552,8 @@
         "last_frame",
         "first_last_frame",
         "keyframes",
-        "retake"
+        "retake",
+        "storyboard"
       ],
       "limits": {
         "min_duration_s": 2,
@@ -632,7 +633,12 @@
         },
         "max_prompt_chars": 4000,
         "negative_prompt": false,
-        "prompt_enhancer": true
+        "prompt_enhancer": true,
+        "storyboard": {
+          "max_shots": 12,
+          "max_total_s": 120,
+          "overlap_latent_frames": 3
+        }
       },
       "hardware_class": "C1",
       "gpus_per_worker": 1,

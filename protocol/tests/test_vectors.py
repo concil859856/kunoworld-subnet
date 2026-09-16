@@ -50,6 +50,21 @@ def test_job_aad():
     assert job_aad(case["job_id"], case["enclave_id"], params, case["input_blob_ids"]).decode() == case["encoded"]
 
 
+def test_storyboard_lengths_and_job_aad():
+    from kuno_protocol.profiles import load_profiles, storyboard_duration_s, storyboard_frames
+    from kuno_protocol.schemas import ShotSpec
+
+    profiles = load_profiles()
+    for case in VECTORS["storyboard"]["lengths"]:
+        shots = [ShotSpec.model_validate(shot) for shot in case["shots"]]
+        profile = profiles[case["profile_id"]]
+        assert storyboard_frames(profile, shots, case["fps"]) == case["frames"]
+        assert storyboard_duration_s(profile, shots, case["fps"]) == case["duration_s"]
+    aad = VECTORS["storyboard"]["job_aad"]
+    params = GenerationParams.model_validate(aad["params"])
+    assert job_aad(aad["job_id"], aad["enclave_id"], params, aad["input_blob_ids"]).decode() == aad["encoded"]
+
+
 def test_receipt_message():
     case = VECTORS["receipt"]
     assert receipt_message(ReceiptBody.model_validate(case["body"])) == b64d(case["message_b64"])

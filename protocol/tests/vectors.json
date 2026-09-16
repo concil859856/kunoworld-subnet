@@ -515,6 +515,144 @@
       }
     ]
   },
+  "storyboard": {
+    "lengths": [
+      {
+        "profile_id": "ltx-2.5-fast",
+        "fps": 24,
+        "shots": [
+          {
+            "duration_s": 5.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 5.0,
+            "join": "continue"
+          }
+        ],
+        "frames": 849,
+        "duration_s": 35.375
+      },
+      {
+        "profile_id": "ltx-2.5-fast",
+        "fps": 24,
+        "shots": [
+          {
+            "duration_s": 3.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 3.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 3.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 3.0,
+            "join": "fresh"
+          }
+        ],
+        "frames": 258,
+        "duration_s": 10.75
+      },
+      {
+        "profile_id": "ltx-2.5-fast",
+        "fps": 25,
+        "shots": [
+          {
+            "duration_s": 2.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 7.0,
+            "join": "cut"
+          },
+          {
+            "duration_s": 20.0,
+            "join": "continue"
+          }
+        ],
+        "frames": 689,
+        "duration_s": 27.56
+      },
+      {
+        "profile_id": "ltx-2.5-fast",
+        "fps": 50,
+        "shots": [
+          {
+            "duration_s": 10.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 4.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 9.0,
+            "join": "fresh"
+          }
+        ],
+        "frames": 1130,
+        "duration_s": 22.6
+      }
+    ],
+    "job_aad": {
+      "job_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+      "enclave_id": "00000000000000000000000000000000",
+      "params": {
+        "profile_id": "ltx-2.5-fast",
+        "mode": "storyboard",
+        "duration_s": 13.708333333333334,
+        "resolution": "720p",
+        "aspect_ratio": "16:9",
+        "fps": 24,
+        "audio": true,
+        "input_roles": [],
+        "shots": [
+          {
+            "duration_s": 5.0,
+            "join": "fresh"
+          },
+          {
+            "duration_s": 4.0,
+            "join": "continue"
+          },
+          {
+            "duration_s": 6.0,
+            "join": "cut"
+          }
+        ]
+      },
+      "input_blob_ids": [],
+      "encoded": "{\"enclave_id\":\"00000000000000000000000000000000\",\"inputs\":[],\"job_id\":\"3f2504e0-4f89-41d3-9a0c-0305e82c3301\",\"params\":{\"aspect_ratio\":\"16:9\",\"audio\":true,\"duration_s\":13.708333333333334,\"fps\":24,\"input_roles\":[],\"mode\":\"storyboard\",\"profile_id\":\"ltx-2.5-fast\",\"resolution\":\"720p\",\"shots\":[{\"duration_s\":5,\"join\":\"fresh\"},{\"duration_s\":4,\"join\":\"continue\"},{\"duration_s\":6,\"join\":\"cut\"}]},\"v\":1}"
+    }
+  },
   "receipt": {
     "body": {
       "v": 1,

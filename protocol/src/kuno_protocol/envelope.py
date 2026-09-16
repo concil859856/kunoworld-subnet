@@ -56,7 +56,7 @@ class EnvelopeQuery:
 
     @classmethod
     def of(cls, params: GenerationParams) -> EnvelopeQuery:
-        return cls(params.resolution, params.aspect_ratio, params.fps, params.duration_s)
+        return cls(params.resolution, params.aspect_ratio, params.fps, params.render_duration_s)
 
     @property
     def empty(self) -> bool:
@@ -93,7 +93,8 @@ def fits(table: Mapping[str, Any] | None, params: GenerationParams) -> bool:
     if table is None:
         return True
     longest = max_duration(table, params.resolution, params.aspect_ratio, params.fps)
-    return longest is not None and params.duration_s <= longest + _EPSILON
+    # A storyboard renders one shot at a time, so its longest shot is what has to fit.
+    return longest is not None and params.render_duration_s <= longest + _EPSILON
 
 
 def serves(table: Mapping[str, Any] | None, query: EnvelopeQuery) -> bool:

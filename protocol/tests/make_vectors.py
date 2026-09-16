@@ -26,9 +26,9 @@ from kuno_protocol.attestation import enclave_id_for, gpu_nonce_for, report_data
 from kuno_protocol.blobs import DEFAULT_CHUNK, V1, V2, _encrypt_stream, pad_stream, padded_stream_length, padme, sealed_size
 from kuno_protocol.canonical import b64e, canonical_json, sha256_hex
 from kuno_protocol.crypto import _EXPORT_INPUT, _EXPORT_OUTPUT, HPKE_INFO, SUITE
-from kuno_protocol.profiles import InputRole, Mode
+from kuno_protocol.profiles import InputRole, Mode, load_profiles, storyboard_duration_s, storyboard_frames
 from kuno_protocol.receipts import ReceiptBody, VideoInfo, receipt_message
-from kuno_protocol.schemas import GenerationParams, InputRef, SealedPayload, job_aad
+from kuno_protocol.schemas import GenerationParams, InputRef, SealedPayload, ShotSpec, job_aad
 from kuno_protocol.sealed_payload import (
     HEADER_LEN,
     MAX_JSON_LEN,
@@ -205,6 +205,36 @@ def _sealed_payload(aad: bytes) -> dict:
     }
 
 
+def _storyboard(job_id: str) -> dict:
+    """Stitched lengths the SDKs must compute exactly (ltx-2.5-fast, overlap 3: a joined shot loses 17 frames), and the
+    job AAD of a storyboard, whose params carry `shots`. The 8 x 5 s and mixed cases are the GPU run of 2026-09-16."""
+    fast = load_profiles()["ltx-2.5-fast"]
+    boards = [
+        (24, [(5, "fresh")] + [(5, "continue")] * 7),
+        (24, [(3, "fresh"), (3, "continue"), (3, "cut"), (3, "fresh")]),
+        (25, [(2, "fresh"), (7, "cut"), (20, "continue")]),
+        (50, [(10, "fresh"), (4, "continue"), (9, "fresh")]),
+    ]
+    lengths = []
+    for fps, shots in boards:
+        specs = [ShotSpec(duration_s=float(d), join=j) for d, j in shots]
+        lengths.append({"profile_id": fast.id, "fps": fps, "shots": [s.model_dump(mode="json") for s in specs],
+                        "frames": storyboard_frames(fast, specs, fps), "duration_s": storyboard_duration_s(fast, specs, fps)})
+    specs = [ShotSpec(duration_s=5.0, join="fresh"), ShotSpec(duration_s=4.0, join="continue"), ShotSpec(duration_s=6.0, join="cut")]
+    params = GenerationParams(profile_id=fast.id, mode=Mode.STORYBOARD, duration_s=storyboard_duration_s(fast, specs, 24),
+                              resolution="720p", aspect_ratio="16:9", fps=24, shots=specs)
+    return {
+        "lengths": lengths,
+        "job_aad": {
+            "job_id": job_id,
+            "enclave_id": "0" * 32,
+            "params": params.model_dump(mode="json"),
+            "input_blob_ids": [],
+            "encoded": job_aad(job_id, "0" * 32, params, []).decode(),
+        },
+    }
+
+
 def build() -> dict:
     params = GenerationParams(
         profile_id="h3-turbo",
@@ -269,6 +299,7 @@ def build() -> dict:
             "encoded": job_aad(job_id, "0" * 32, params, ["a" * 32, "b" * 32]).decode(),
         },
         "sealed_payload": _sealed_payload(job_aad(job_id, "0" * 32, params, ["a" * 32, "b" * 32])),
+        "storyboard": _storyboard(job_id),
         "receipt": {
             "body": receipt_body.model_dump(mode="json"),
             "message_b64": b64e(receipt_message(receipt_body)),

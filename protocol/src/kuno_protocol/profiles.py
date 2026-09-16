@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
-    from .schemas import GenerationParams
+    from .schemas import GenerationParams, ShotSpec
 
 FAMILY_H3 = "minimax-h3"
 FAMILY_LTX = "ltx-2.5"
@@ -43,6 +43,7 @@ class Mode(str, Enum):
     EXTEND_VIDEO = "extend_video"
     AUDIO_TO_VIDEO = "audio_to_video"
     RETAKE = "retake"
+    STORYBOARD = "storyboard"
 
 
 class InputRole(str, Enum):
@@ -70,6 +71,7 @@ MODE_ROLES: dict[Mode, tuple[frozenset[InputRole], frozenset[InputRole]]] = {
     Mode.EXTEND_VIDEO: (frozenset({R.SOURCE_VIDEO}), frozenset({R.SOURCE_VIDEO, R.REFERENCE_IMAGE})),
     Mode.AUDIO_TO_VIDEO: (frozenset({R.SOURCE_AUDIO}), frozenset({R.SOURCE_AUDIO, R.FIRST_FRAME, R.REFERENCE_IMAGE})),
     Mode.RETAKE: (frozenset({R.SOURCE_VIDEO}), frozenset({R.SOURCE_VIDEO})),
+    Mode.STORYBOARD: (frozenset(), frozenset()),
 }
 
 
@@ -92,6 +94,17 @@ class InputGroup(BaseModel):
     max: int
 
 
+class StoryboardLimits(BaseModel):
+    """What a profile's storyboard mode accepts. Each shot also keeps to the profile's own duration limits."""
+
+    max_shots: int
+    # The stitched video's longest length.
+    max_total_s: float
+    # A `continue` or `cut` shot's first `overlap_latent_frames` latent frames repeat the previous shot's last ones, and
+    # are trimmed from the video (LTX-2.5: 1 + 8 × (overlap − 1) frames, and the matching audio).
+    overlap_latent_frames: int = 3
+
+
 class Limits(BaseModel):
     min_duration_s: float
     max_duration_s: float
@@ -111,6 +124,8 @@ class Limits(BaseModel):
     seed: bool = True
     # fps -> a lower duration cap at that frame rate, e.g. LTX-2.5 Fast renders over 10 s only at 24/25 fps.
     max_duration_s_by_fps: dict[int, float] = Field(default_factory=dict)
+    # Set where the profile offers storyboard mode.
+    storyboard: StoryboardLimits | None = None
 
 
 class LicenseInfo(BaseModel):
@@ -304,7 +319,13 @@ class ModelProfile(BaseModel):
 
     def vcu_for(self, params: GenerationParams, seconds: float | None = None) -> float:
         """The job's VCU from its public params: its resolution's weight × its fps multiplier × the duration factor ×
-        `seconds` (the billable seconds, by default the requested duration). ParamError for a resolution without a weight."""
+        `seconds` (the billable seconds, by default the requested duration). ParamError for a resolution without a weight.
+
+        A storyboard is paid for what it renders: each shot at its own length and duration factor, overlaps included,
+        scaled by `seconds` / `duration_s` when fewer seconds are billable."""
+        if params.shots:
+            rendered = sum(self.vcu_at(params.resolution, params.fps, shot.duration_s) for shot in params.shots)
+            return rendered if seconds is None else rendered * seconds / params.duration_s
         return self.vcu_at(params.resolution, params.fps, params.duration_s if seconds is None else seconds)
 
     def vcu_at(self, resolution: str, fps: int | None, seconds: float) -> float:
@@ -352,7 +373,8 @@ class ModelProfile(BaseModel):
         if rate is None:
             raise ParamError(f"{self.name} has no {privacy} price for {params.resolution}")
         usd = rate * params.duration_s * pricing.fps_multipliers.get(params.fps, 1.0)
-        if privacy == "private" and pricing.long_clip is not None and params.duration_s > pricing.long_clip.over_s:
+        # A long clip costs more per second to render; a storyboard's shots are rendered one at a time.
+        if privacy == "private" and pricing.long_clip is not None and params.render_duration_s > pricing.long_clip.over_s:
             usd *= pricing.long_clip.multiplier
         return round(max(pricing.min_job_usd, usd), 4)
 
@@ -386,6 +408,32 @@ def ltx_num_frames(duration_s: float, fps: int) -> int:
     return 8 * max(1, round(duration_s * fps / 8)) + 1
 
 
+def storyboard_trim_frames(profile: ModelProfile) -> int:
+    """Frames a `continue` or `cut` shot repeats from the shot before, and loses from the stitched video: LTX-2.5's causal
+    VAE decodes n latent frames to 1 + 8 × (n − 1)."""
+    board = profile.limits.storyboard
+    if board is None:
+        raise ParamError(f"{profile.name} does not support storyboard")
+    return 1 + 8 * (board.overlap_latent_frames - 1)
+
+
+def storyboard_frames(profile: ModelProfile, shots: list[ShotSpec], fps: int) -> int:
+    """The stitched video's frame count: every shot's rendered frames, less the repeated head of each joined shot."""
+    trim = storyboard_trim_frames(profile)
+    return sum(profile.num_frames(shot.duration_s, fps) - (trim if shot.join != "fresh" else 0) for shot in shots)
+
+
+def storyboard_duration_s(profile: ModelProfile, shots: list[ShotSpec], fps: int) -> float:
+    """What `GenerationParams.duration_s` must be for a storyboard: its stitched frames / fps."""
+    return storyboard_frames(profile, shots, fps) / fps
+
+
+def shot_prompt(scene: str, prompt: str) -> str:
+    """The prompt the model sees for one storyboard shot: the shared scene, a blank line, then the shot's own prompt."""
+    scene = scene.strip()
+    return f"{scene}\n\n{prompt.strip()}" if scene else prompt.strip()
+
+
 class ParamError(ValueError):
     """A request doesn't fit the chosen profile."""
 
@@ -401,20 +449,53 @@ def validate_params(profile: ModelProfile, params: GenerationParams) -> None:
         raise ParamError("params.profile_id does not match profile")
     if params.mode not in profile.modes:
         raise ParamError(f"{profile.name} does not support {params.mode.value}")
-    if not lim.min_duration_s <= params.duration_s <= lim.max_duration_s:
-        raise ParamError(f"duration must be between {lim.min_duration_s:g} and {lim.max_duration_s:g} seconds")
-    steps_from_min = (params.duration_s - lim.min_duration_s) / lim.duration_step_s
-    if abs(steps_from_min - round(steps_from_min)) > 1e-6:
-        raise ParamError(f"duration must be in {lim.duration_step_s:g}-second steps")
     profile.size_for(params.resolution, params.aspect_ratio)
     if params.fps not in lim.fps:
         raise ParamError(f"fps must be one of {lim.fps}")
-    fps_max = lim.max_duration_s_by_fps.get(params.fps)
-    if fps_max is not None and params.duration_s > fps_max:
-        raise ParamError(f"at {params.fps} fps, duration must be at most {fps_max:g} seconds")
+    if params.mode is Mode.STORYBOARD:
+        _validate_storyboard(profile, params)
+    elif params.shots is not None:
+        raise ParamError("shots are only for storyboard mode")
+    else:
+        _validate_duration(lim, params.duration_s, params.fps, "duration")
     if params.audio and not lim.audio:
         raise ParamError(f"{profile.name} cannot generate audio")
     validate_roles(profile, params.mode, params.input_roles)
+
+
+def _validate_duration(lim: Limits, duration_s: float, fps: int, what: str) -> None:
+    if not lim.min_duration_s <= duration_s <= lim.max_duration_s:
+        raise ParamError(f"{what} must be between {lim.min_duration_s:g} and {lim.max_duration_s:g} seconds")
+    steps_from_min = (duration_s - lim.min_duration_s) / lim.duration_step_s
+    if abs(steps_from_min - round(steps_from_min)) > 1e-6:
+        raise ParamError(f"{what} must be in {lim.duration_step_s:g}-second steps")
+    fps_max = lim.max_duration_s_by_fps.get(fps)
+    if fps_max is not None and duration_s > fps_max:
+        raise ParamError(f"at {fps} fps, {what} must be at most {fps_max:g} seconds")
+
+
+def _validate_storyboard(profile: ModelProfile, params: GenerationParams) -> None:
+    """A storyboard: 2 to `max_shots` shots, each within the profile's own duration limits, the first `fresh`, every joined
+    shot long enough to keep frames after its trim, a stitched length within `max_total_s`, and `duration_s` exactly that
+    length."""
+    board = profile.limits.storyboard
+    if board is None:
+        raise ParamError(f"{profile.name} does not support storyboard")
+    shots = params.shots or []
+    if not 2 <= len(shots) <= board.max_shots:
+        raise ParamError(f"a storyboard needs between 2 and {board.max_shots} shots")
+    if shots[0].join != "fresh":
+        raise ParamError("a storyboard's first shot must be fresh: there is nothing before it to join")
+    trim = storyboard_trim_frames(profile)
+    for number, shot in enumerate(shots, start=1):
+        _validate_duration(profile.limits, shot.duration_s, params.fps, f"shot {number}'s duration")
+        if shot.join != "fresh" and profile.num_frames(shot.duration_s, params.fps) <= trim:
+            raise ParamError(f"shot {number} is too short to join: it would keep no frames after its {trim}-frame overlap")
+    expected = storyboard_duration_s(profile, shots, params.fps)
+    if expected > board.max_total_s + 1e-6:
+        raise ParamError(f"a storyboard's stitched video must be at most {board.max_total_s:g} seconds, these shots make {expected:.3f}")
+    if abs(params.duration_s - expected) > 1e-6:
+        raise ParamError(f"a storyboard's duration_s must be its stitched length, {expected!r} seconds")
 
 
 def validate_roles(profile: ModelProfile, mode: Mode, roles: list[InputRole]) -> None:

@@ -77,6 +77,66 @@ with a fixed ephemeral key, so both languages reproduce them (two padded request
 exported keys), the bucket table, padded plaintexts at bucket edges, and framings that authenticate but must be
 refused.
 
+## Storyboards (long videos from chained shots)
+
+A storyboard is one job of 2 or more shots, rendered one after another by one worker inside one enclave and delivered as
+one stitched video with one receipt. Shots are joined inside the enclave from each shot's final latents, which never
+leave it, so a storyboard can't be assembled from separate jobs. Mode `storyboard`; offered by profiles whose
+`limits.storyboard` is set: today `ltx-2.5-fast`, at most 12 shots and 120 s stitched, overlap 3 latent frames.
+
+**Public params.** `GenerationParams.shots` lists every shot's `duration_s` and `join`, in order. It is serialized only
+when set, so every other job's AAD and `params_digest` are byte-identical to before storyboards (vector
+`storyboard.job_aad`). Each shot keeps to the profile's own duration limits (range, step, per-fps cap), the first shot's
+join is `fresh`, and `params.duration_s` must equal the stitched length exactly:
+
+```
+trim      = 1 + 8 × (overlap_latent_frames − 1)                  17 frames for ltx-2.5-fast
+frames    = Σ num_frames(shot.duration_s, fps) − trim × (shots whose join is continue or cut)
+duration_s = frames / fps                                          ≤ max_total_s
+```
+
+`kuno_protocol.profiles.storyboard_frames` / `storyboard_duration_s` are the reference; vector `storyboard.lengths` pins
+cases both SDKs must reproduce, including the two storyboards rendered on a GPU on 2026-09-16 (849 frames, 35.375 s;
+258 frames, 10.75 s).
+
+| Join | What the shot starts from | Trimmed from the stitched video |
+|---|---|---|
+| `fresh` | nothing | nothing |
+| `continue` | the previous shot's last `overlap_latent_frames` video latent frames and the matching audio latents, held fixed (timestep 0) in every denoising pass | its first `trim` frames and the matching audio |
+| `cut` | the matching audio latents only: a new picture over the same voice and room tone | the same |
+
+Audio pins come from the first shot of the current run of joined shots, not from the shot just before, which keeps a
+voice from drifting across many joins. The worker's research note and experiment are in the dev repo
+(`research/long-video_ltx-av-extend_2026-09-16.md`, `scripts/gpu-test/long_video/`).
+
+**Sealed payload.** `SealedPayload.shots` holds one `{"prompt"}` per shot, in the same order; it is serialized only when
+set. `prompt` is the scene every shot shares (characters, place, style), possibly empty. The model sees
+`shot_prompt(scene, shot) = scene + "\n\n" + shot prompt` (or the shot prompt alone when the scene is empty), and each of
+those must fit the profile's `max_prompt_chars`. `negative_prompt` applies to every shot where the profile takes one.
+Storyboards take no inputs, and shot *i* (from 0) renders with seed `(seed + i) mod 2^31`. A worker refuses a count
+mismatch or an empty shot prompt as `bad_payload`.
+
+**Safety.** The content policy and the prompt classifier run on every shot's model prompt, inside the enclave; a gateway
+that can read the prompts (Standard mode) checks the scene and every shot prompt. The output check samples at least
+10 frames and at least 3 per shot across the stitched video.
+
+**Price and pay.** The customer pays the profile's per-second rate for the stitched `duration_s`, with the fps
+multiplier; the Private long-clip rule and serving envelopes look at the longest shot
+(`GenerationParams.render_duration_s`), because shots render one at a time. Miners are paid VCU for what they render:
+`Σ vcu_at(resolution, fps, shot.duration_s)`, overlaps included (`ModelProfile.vcu_for`).
+
+**Progress and receipt.** The worker reports `stage` as `shot i/N` while rendering and the usual stages after. The
+receipt is unchanged: `video` describes the stitched MP4, and `params_digest` covers the shot list.
+
+**Not verified.** Storyboards carry no step commitment. Validators don't step-audit them and don't send them as canaries
+yet; the ledger's duration check (±0.5 s of `duration_s`) applies as for any job.
+
+**Standard mode.** `POST /v1/standard/videos` takes `shots: [{"prompt"}]` next to `params.shots`, and `prompt` is the scene
+(`platform/gateway/STANDARD_MODE.md`).
+
+**Rollout.** A worker from before storyboards can't parse the params and fails the job, so workers are upgraded before clients
+offer the mode.
+
 ## Blobs (inputs and output video)
 
 ```

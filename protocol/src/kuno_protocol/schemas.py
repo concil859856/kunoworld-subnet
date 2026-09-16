@@ -14,7 +14,7 @@ import re
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
 from .attestation import AttestationEvidence
 from .canonical import canonical_json
@@ -44,17 +44,49 @@ class JobState(str, Enum):
 PrivacyMode = Literal["private", "standard"]
 
 
+# How a storyboard shot attaches to the one before it (PROTOCOL.md, "Storyboards"): `continue` carries the previous
+# shot's last latent frames and its sound into this one (one unbroken take), `cut` carries only the sound (a new picture,
+# the same voice and room tone), `fresh` carries nothing. The first shot is always `fresh`.
+ShotJoin = Literal["fresh", "continue", "cut"]
+
+
+class ShotSpec(BaseModel):
+    """One storyboard shot as the gateway sees it: its length and its join. Its prompt is sealed (`SealedPayload.shots`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    duration_s: float
+    join: ShotJoin
+
+
 class GenerationParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     profile_id: str
     mode: Mode
+    # For a storyboard: the stitched video's length, `profiles.storyboard_duration_s` of its shots, exactly.
     duration_s: float
     resolution: str
     aspect_ratio: str
     fps: int
     audio: bool = True
     input_roles: list[InputRole] = Field(default_factory=list)
+    # Storyboard mode only. Serialized only when set, so every other job's params (the encryption's associated data, and
+    # the receipt's params_digest) stay byte-identical to clients that predate storyboards.
+    shots: list[ShotSpec] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_shots(self, handler) -> dict[str, Any]:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("shots") is None:
+            data.pop("shots", None)
+        return data
+
+    @property
+    def render_duration_s(self) -> float:
+        """The longest single model call the job needs: its duration, or a storyboard's longest shot. Memory admission and
+        serving envelopes use this; price and billing use `duration_s`."""
+        return max(shot.duration_s for shot in self.shots) if self.shots else self.duration_s
 
 
 class InputRef(BaseModel):
@@ -77,16 +109,35 @@ class InputRef(BaseModel):
     end_s: float | None = None
 
 
+class ShotPrompt(BaseModel):
+    """A storyboard shot's private half: what happens in it. Paired by position with `GenerationParams.shots`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1)
+
+
 class SealedPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     v: Literal[1] = 1
+    # For a storyboard: the scene every shot shares (characters, place, style), put before each shot's own prompt. It may
+    # be empty there; `profiles.shot_prompt` builds what the model sees.
     prompt: str
     negative_prompt: str | None = None
     seed: int | None = None
     inputs: list[InputRef] = Field(default_factory=list)
-    # Model-specific knobs (camera motion, multi-shot list, guidance, prompt enhancement...).
+    # Model-specific knobs (camera motion, guidance, prompt enhancement...).
     options: dict[str, Any] = Field(default_factory=dict)
+    # Storyboard mode only, one per `GenerationParams.shots`, in order. Serialized only when set.
+    shots: list[ShotPrompt] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_shots(self, handler) -> dict[str, Any]:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("shots") is None:
+            data.pop("shots", None)
+        return data
 
 
 class JobCreate(BaseModel):
