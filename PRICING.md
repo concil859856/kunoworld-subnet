@@ -84,8 +84,8 @@ for the gateway, storage and validators.
 
 | Profile | Price today | Cost-based minimum | Market | Verdict |
 |---|---|---|---|---|
-| `ltx-2.5-fast` 720p | $0.05 | $0.008 | fal LTX-2.5 Fast $0.09/s | comfortable; the margin is the widest we have |
-| `ltx-2.5-pro` 720p | $0.075 | **$0.096** | fal LTX-2.5 Pro $0.12/s | **below cost-based minimum**; $0.10 works and still undercuts fal |
+| `ltx-2.5-fast` 720p | Standard $0.09; Private $0.12 | $0.008 | fal LTX-2.5 Fast $0.09/s | Standard at fal's list price; comfortable, the margin is the widest we have |
+| `ltx-2.5-pro` 720p | Standard $0.12; Private $0.16 | **$0.096** | fal LTX-2.5 Pro $0.12/s | Standard at fal's list price, above the cost-based minimum; Private covers it too |
 | `h3` 768p | Standard $0.06; Private $0.30, $0.51 over 6 s | **$0.29** at 5 s, **$0.50** at 14 s | fal MiniMax H3 $0.06/s, fal H3 Max $0.08/s, MiniMax API about $0.09/s | Standard at fal's price, **sold below cost** (by decision); Private covers cost at every length |
 | `h3-turbo` 768p | Standard $0.04; Private $0.065, $0.091 over 8 s | **$0.053** at 5 s, **$0.088** at 14 s | fal H3 Max Turbo $0.04/s ($0.02 until 2026-09-30) | same: Standard at fal's list price, below cost; Private covers it |
 | `h3-reference` 768p | Standard $0.06; Private $0.50, $0.75 over 6 s | **$0.47** at 5 s, about **$0.74** at 14 s | fal MiniMax H3 reference-to-video $0.06/s | same |
@@ -112,9 +112,11 @@ derive-rates` flags those Standard rows, and that is expected. The three paths c
 Already done in code: the measured VCU weights, `$0.0019` per VCU-second and per-family capacity pay
 ($0.80 / $1.50). What is left is the owner's:
 
-1. Set `ltx-2.5-pro` at or above **$0.10** per second at 720p; it is $0.075 today, below its own cost floor.
+1. ~~Set `ltx-2.5-pro` at or above **$0.10** per second at 720p~~: done 2026-09-16 (§4). It is $0.12 Standard and
+   $0.16 Private at 720p.
 2. ~~Choose an H3 path~~: decided 2026-09-16 (§4). Standard H3 at fal's list prices, Private above cost.
-3. Decide whether `ltx-2.5-fast` keeps a 12x margin or leads on price; it is the profile with room to move.
+3. ~~Decide whether `ltx-2.5-fast` keeps a 12x margin or leads on price~~: decided 2026-09-16 (§4). Standard is at
+   fal's list price, $0.09 at 720p, about 22x its measured cost.
 4. Then flip `"placeholder": false` on the rate card and sign it.
 
 ## 6. Measure before signing

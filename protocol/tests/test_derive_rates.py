@@ -95,20 +95,23 @@ def test_the_margin_check_flags_every_cell_priced_below_the_miner_multiple():
     pro = {"ltx-2.5-pro": ({"720p": 9.0, "1080p": 60.0}, 0.03, {48: 2.0, 50: 2.0})}
     proposal = derive([("h200.json", bench_doc(pro))], settings())
     flagged = {(row["profile"], row["resolution"], row["privacy"]) for row in proposal["margin_check"]}
-    # The H3 profiles' Standard prices are fal's list prices (2026-09-16), below what a miner must earn at the measured
-    # weights, so every H3 Standard row is flagged; their Private prices cover it at every length.
+    # Standard prices are fal's list prices (2026-09-16). The H3 ones are below what a miner must earn at the measured
+    # weights, so every H3 Standard row is flagged; their Private prices cover it at every length. At these synthetic
+    # LTX-2.5 Pro weights, 720p is covered in both modes and 1080p Private ($0.22/s) covers every cell, but 1080p
+    # Standard ($0.17/s) falls short at 48 and 50 fps, where the price rises 1.5x and the render cost 2x.
     assert flagged == {
-        ("ltx-2.5-pro", "1080p", "private"), ("ltx-2.5-pro", "1080p", "standard"),
+        ("ltx-2.5-pro", "1080p", "standard"),
         ("h3", "768p", "standard"), ("h3-reference", "768p", "standard"), ("h3-turbo", "768p", "standard"),
     }
     rate = proposal["rate_card"]["usd_per_vcu_second"]["confidential"]
-    private = next(row for row in proposal["margin_check"] if row["privacy"] == "private" and row["profile"] == "ltx-2.5-pro")
-    worst = private["worst"]
+    standard = next(row for row in proposal["margin_check"] if row["privacy"] == "standard" and row["profile"] == "ltx-2.5-pro")
+    worst = standard["worst"]
     assert worst["ratio"] < 1.15 and worst["miner_usd"] == pytest.approx(PROFILES["ltx-2.5-pro"].model_copy(
         update={"vcu_weights": VcuWeights.model_validate(proposal["vcu_weights"]["ltx-2.5-pro"])}).vcu_at("1080p", worst["fps"], worst["duration_s"]) * rate, abs=1e-4)
-    assert all(cell["customer_usd"] < cell["miner_usd"] * 1.15 for cell in private["cells"])
-    assert private["failing_cells"] == len(private["cells"]) <= private["checked_cells"]
-    assert "ltx-2.5-pro 1080p private" in render(proposal)
+    assert all(cell["customer_usd"] < cell["miner_usd"] * 1.15 for cell in standard["cells"])
+    assert standard["failing_cells"] == len(standard["cells"]) < standard["checked_cells"]
+    assert {cell["fps"] for cell in standard["cells"]} == {48, 50}
+    assert "ltx-2.5-pro 1080p standard" in render(proposal)
 
 
 def test_unmeasured_resolutions_slopes_and_frame_rates_keep_their_current_values():

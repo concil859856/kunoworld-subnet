@@ -21,12 +21,13 @@ PROFILES = load_profiles()
 
 # (Private, Standard) per second; None: the profile is Private-only.
 RATES = {
-    ("ltx-2.5-fast", "720p"): (0.05, 0.04),
-    ("ltx-2.5-fast", "1080p"): (0.08, 0.06),
-    ("ltx-2.5-pro", "720p"): (0.075, 0.055),
-    ("ltx-2.5-pro", "1080p"): (0.11, 0.085),
-    ("ltx-2.5-4k", "1440p"): (0.15, 0.12),
-    ("ltx-2.5-4k", "2160p"): (0.32, 0.25),
+    # LTX-2.5's Standard prices are fal's list prices (2026-09-16); Private is about 1.3x.
+    ("ltx-2.5-fast", "720p"): (0.12, 0.09),
+    ("ltx-2.5-fast", "1080p"): (0.17, 0.13),
+    ("ltx-2.5-pro", "720p"): (0.16, 0.12),
+    ("ltx-2.5-pro", "1080p"): (0.22, 0.17),
+    ("ltx-2.5-4k", "1440p"): (0.25, 0.19),
+    ("ltx-2.5-4k", "2160p"): (0.39, 0.30),
     # H3's Standard prices are fal's list prices (2026-09-16); Private covers the measured cost at every length.
     ("h3-turbo", "768p"): (0.065, 0.04),
     ("h3", "768p"): (0.30, 0.06),
@@ -55,16 +56,16 @@ def test_every_profile_has_a_private_rate_a_standard_rate_or_none_and_a_ten_cent
 def test_private_is_the_default_and_standard_is_priced_by_its_own_table():
     fast = PROFILES["ltx-2.5-fast"]
     job = params("ltx-2.5-fast", resolution="1080p")
-    assert fast.price_usd(job) == fast.price_usd(job, "private") == 0.40
-    assert fast.price_usd(job, "standard") == 0.30
+    assert fast.price_usd(job) == fast.price_usd(job, "private") == 0.85  # 0.17 x 5
+    assert fast.price_usd(job, "standard") == 0.65  # 0.13 x 5
     assert fast.privacy_modes == ["private", "standard"] and fast.offers("standard")
 
 
 def test_high_frame_rates_multiply_the_whole_ltx_job():
     fast = PROFILES["ltx-2.5-fast"]
-    assert fast.price_usd(params("ltx-2.5-fast", fps=24)) == fast.price_usd(params("ltx-2.5-fast", fps=25)) == 0.25
-    assert fast.price_usd(params("ltx-2.5-fast", fps=48)) == fast.price_usd(params("ltx-2.5-fast", fps=50)) == 0.375
-    assert PROFILES["ltx-2.5-4k"].price_usd(params("ltx-2.5-4k", resolution="2160p", fps=50), "standard") == 1.875
+    assert fast.price_usd(params("ltx-2.5-fast", fps=24)) == fast.price_usd(params("ltx-2.5-fast", fps=25)) == 0.60  # 0.12 x 5
+    assert fast.price_usd(params("ltx-2.5-fast", fps=48)) == fast.price_usd(params("ltx-2.5-fast", fps=50)) == 0.90  # x 1.5
+    assert PROFILES["ltx-2.5-4k"].price_usd(params("ltx-2.5-4k", resolution="2160p", fps=50), "standard") == 2.25  # 0.30 x 5 x 1.5
 
 
 def test_long_private_h3_clips_cost_more_for_the_whole_clip_and_standard_stays_flat():
@@ -76,14 +77,19 @@ def test_long_private_h3_clips_cost_more_for_the_whole_clip_and_standard_stays_f
     assert PROFILES["h3"].price_usd(params("h3", duration_s=14), "standard") == 0.84
     assert PROFILES["h3-reference"].price_usd(params("h3-reference", duration_s=6)) == 3.0
     # LTX has no long-clip rule.
-    assert PROFILES["ltx-2.5-fast"].price_usd(params("ltx-2.5-fast", duration_s=20)) == 1.0
+    assert PROFILES["ltx-2.5-fast"].price_usd(params("ltx-2.5-fast", duration_s=20)) == 2.4  # 0.12 x 20
 
 
 def test_no_job_costs_less_than_the_minimum_charge():
-    fast = PROFILES["ltx-2.5-fast"]
+    shipped = PROFILES["ltx-2.5-fast"]
     short = params("ltx-2.5-fast", duration_s=2)
+    # No shipped profile reaches the minimum today: the cheapest job, 2 s of LTX-2.5 Fast 720p in Standard, is 0.09 x 2.
+    # The rule is tested on a copy priced low enough to fall under it.
+    assert shipped.price_usd(short, "standard") == 0.18
+    fast = shipped.model_copy(update={"pricing": shipped.pricing.model_copy(update={
+        "usd_per_second": {"720p": 0.045, "1080p": 0.08}, "standard_usd_per_second": {"720p": 0.04, "1080p": 0.06}})})
     assert fast.price_usd(short, "standard") == 0.10  # 0.04 x 2 = 0.08
-    assert fast.price_usd(short) == 0.10
+    assert fast.price_usd(short) == 0.10  # 0.045 x 2 = 0.09
 
 
 def test_private_only_profiles_refuse_a_standard_price():

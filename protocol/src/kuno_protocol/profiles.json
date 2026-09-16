@@ -651,12 +651,12 @@
       },
       "pricing": {
         "usd_per_second": {
-          "720p": 0.05,
-          "1080p": 0.08
+          "720p": 0.12,
+          "1080p": 0.17
         },
         "standard_usd_per_second": {
-          "720p": 0.04,
-          "1080p": 0.06
+          "720p": 0.09,
+          "1080p": 0.13
         },
         "min_job_usd": 0.1,
         "fps_multipliers": {
@@ -911,12 +911,12 @@
       },
       "pricing": {
         "usd_per_second": {
-          "720p": 0.075,
-          "1080p": 0.11
+          "720p": 0.16,
+          "1080p": 0.22
         },
         "standard_usd_per_second": {
-          "720p": 0.055,
-          "1080p": 0.085
+          "720p": 0.12,
+          "1080p": 0.17
         },
         "min_job_usd": 0.1,
         "fps_multipliers": {
@@ -1099,12 +1099,12 @@
       },
       "pricing": {
         "usd_per_second": {
-          "1440p": 0.15,
-          "2160p": 0.32
+          "1440p": 0.25,
+          "2160p": 0.39
         },
         "standard_usd_per_second": {
-          "1440p": 0.12,
-          "2160p": 0.25
+          "1440p": 0.19,
+          "2160p": 0.3
         },
         "min_job_usd": 0.1,
         "fps_multipliers": {

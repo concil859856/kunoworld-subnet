@@ -45,8 +45,8 @@ def test_a_valid_storyboard_passes_and_prices_by_its_stitched_seconds():
     params = board(shots((5, "fresh"), (5, "continue"), (5, "cut")))
     validate_params(FAST, params)
     assert params.duration_s == pytest.approx(13.708, abs=1e-3) and params.render_duration_s == 5
-    assert FAST.price_usd(params) == round(0.05 * params.duration_s, 4)
-    assert FAST.price_usd(params, "standard") == round(0.04 * params.duration_s, 4)
+    assert FAST.price_usd(params) == round(0.12 * params.duration_s, 4)
+    assert FAST.price_usd(params, "standard") == round(0.09 * params.duration_s, 4)
 
 
 def test_miners_are_paid_for_every_rendered_shot_overlaps_included():
