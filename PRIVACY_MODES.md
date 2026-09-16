@@ -51,6 +51,16 @@ operates KunoWorld and its jurisdiction are not yet named; the terms of service 
 policy will govern, and prices on the site are placeholders. Private is priced above Standard:
 Standard follows the market's list prices, and Private covers the cost of confidential rendering.
 
+## Elements
+
+Elements are reusable characters, products, locations, styles and voices a customer attaches to videos. Everything
+that describes one (its kind, name, description, consent record, pictures and voice) is encrypted on the customer's
+device under a key derived from key sync, so KunoWorld stores ciphertext it can't open. KunoWorld can see how many
+Elements an account has, their padded sizes and when they change or are downloaded. Using an Element in a job turns it
+into ordinary job inputs: sealed to the enclave in Private mode, readable in Standard mode. Real people's likenesses
+need their consent, recorded with the Element, and public figures and minors are not allowed. The full contract is
+`platform/gateway/ELEMENTS.md` in the platform repository.
+
 ## Key sync
 
 A Private video opens only with its output key, and that key lives on your devices. Key sync lets your other devices
