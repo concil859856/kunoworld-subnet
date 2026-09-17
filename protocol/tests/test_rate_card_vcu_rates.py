@@ -66,13 +66,14 @@ def test_bad_vcu_rates_are_refused(rates):
 
 
 # Recommended confidential miner rates, USD per verified second: measured cost x 1.25 for the profiles measured on
-# 2026-09-15 (research/pricing/measured_2026-09-15.md) and h3-turbo on 2026-09-16 (measured_2026-09-16_h3-turbo.md), the
-# estimates of costs.md §8.2 for the rest. h3 and h3-turbo at 10 and 14 s scale their 5 s rate by the duration ratios
+# 2026-09-15 (research/pricing/measured_2026-09-15.md), h3-turbo on 2026-09-16 (measured_2026-09-16_h3-turbo.md) and
+# ltx-2.5-4k on 2026-09-17 (about 24 and 63 GPU-seconds per output second at $0.00087 per GPU-second: research/
+# long-video_ltx-av-extend_2026-09-16.md addenda 5-6), the estimates of costs.md §8.2 for the rest. h3 and h3-turbo at 10 and 14 s scale their 5 s rate by the duration ratios
 # measured on 2026-09-16 (h3 1.453 and 1.841, h3-turbo 1.33 and 1.65). ltx-2.5-fast 720p ($0.005) is left out: one VCU
 # rate pays it +14%.
 RESEARCH_RATES = {
     ("ltx-2.5-fast", "1080p", 5): 0.010, ("ltx-2.5-pro", "720p", 5): 0.058, ("ltx-2.5-pro", "1080p", 5): 0.147,
-    ("ltx-2.5-4k", "1440p", 5): 0.042, ("ltx-2.5-4k", "2160p", 5): 0.12,
+    ("ltx-2.5-4k", "1440p", 5): 0.026, ("ltx-2.5-4k", "2160p", 5): 0.0685,
     ("h3-turbo", "768p", 5): 0.032, ("h3-turbo", "768p", 10): 0.0426, ("h3-turbo", "768p", 14): 0.0528,
     ("h3", "768p", 5): 0.173, ("h3", "768p", 10): 0.251, ("h3", "768p", 14): 0.3185,
     ("h3-reference", "768p", 5): 0.281, ("h3-reference", "768p", 10): 0.373, ("h3-reference", "768p", 14): 0.445,

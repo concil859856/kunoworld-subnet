@@ -29,8 +29,8 @@ keeps each query to its own window inside the box. Interior chunks share one mas
 the key slab and one batched call. Query, key and value projections run per temporal chunk, with rotary positions counted
 from the grid's origin, so each element is computed by the same operations as the whole-volume path. Results equal
 diffusers' flex processor's to rounding (test_ltx_4k_render.py). Memory: one temporal chunk's projections and one batch of
-gathered keys (`budget_bytes`), not the grid squared. Speed is unmeasured: each query's box holds about 7x its window at
-stage 5, and the boxes are copied, so expect it slower than NATTEN (scripts/gpu-test/long_video/run_4k_worker.py times it).
+gathered keys (`budget_bytes`), not the grid squared. Each query's box holds about 7x its window at stage 5, and the boxes
+are copied, so expect it slower than NATTEN, which has not been compared (the speed on a GPU is at the end of this docstring).
 
 Memory (`decode_activation_bytes`, used by quantized.MemoryPlan). The decode's live tensors beside the weights, in bf16
 bytes, followed through `tiled_decode` in the order it allocates and frees them (`decode_phases`), for F = 1 + 8(T - 1)
@@ -47,6 +47,30 @@ frames of W x H (T latent frames):
                joins and the group join are copies; the previous group's rows live until this group's tiles are done; every
                group lives until the final join, which copies them all once more. Then the pipeline's `pt` output holds the
                decode, the [0, 1] rescale and its stack.
+Every 4K size is wider and taller than a tile, so a tile is at most 768 x 768 px and 80 frames at either size and in either
+orientation: past 80 frames a clip grows the features and the pixels, not a tile's work. 9:16 cuts the same tiles in another
+order (at 1440p 4 rows of 2 rather than 2 rows of 4), so more of a group's finished tiles are alive when its last full tile
+runs. The replay follows the order: up to 0.38 GiB more than 16:9 at 1440p, up to 0.13 GiB less at 2160p.
+
+Measured on a GPU (2026-09-17: RTX PRO 6000 Blackwell Server Edition, image ltx-0.1.0-25d8d065d34a,
+scripts/gpu-test/long_video/run_4k_worker.py --calibrate; text-to-video at 24 fps, 16:9). Torch's peak allocated through the
+decode, less the 66.95 GiB loaded, against the replay with this module's figures and the held latents (the "fit"), and the
+planner's whole estimate (MemoryPlan.decode_gib: 66.96 GiB of weights, the fit, DECODE_MARGIN_BYTES and 1.5 GiB of overhead):
+      clip          frames   peak    above   fit     fit - above   estimate   estimate - peak
+      1440p 4 s        97    80.90   13.95   14.23      +0.28        83.19        2.29
+      1440p 8 s       193    88.68   21.73   21.75      +0.02        90.71        2.03
+      1440p 10 s      241    91.25   24.30   24.43      +0.13        93.39        2.14
+      2160p 2 s        49    80.84   13.89   14.18      +0.29        83.14        2.30
+      2160p 3 s        73    87.06   20.11   20.22      +0.11        89.18        2.12
+      2160p 5 s       121    out of memory at 93.98 allocated, so above 27.03; the fit is 28.86 and the estimate 97.82,
+                             which admission refuses on the card's 94.47 GiB usable
+  The 1440p 4 s clip decoded twice with the same peak. At 2160p the peaks are the final join: its count alone (13.79 and
+  19.97 GiB) is 0.10 and 0.14 GiB under them, about what the audio decode shows still held (0.08 and 0.12), so the pixel
+  arithmetic holds on a GPU. At 1440p the
+  tiles peak, and those peaks fix the tile's figures (TILE_BYTES_PER_TOKEN and beside it). Why a replay: the same five
+  peaks fitted as a constant plus bytes per pixel-frame (6.29 GiB + 24.3 bytes, the line that stays above them all) miss by
+  0.00-1.68 GiB (least squares: -0.81 to +1.04), because a tile's work grows with a clip only up to 80 frames. That line
+  with a 1.5 GiB margin would refuse 1440p 10 s, which ran; the replay is within 0.29 GiB of every peak.
 Counted as live tensors (2026-09-17), with this processor and the default tiling, at the decoder's real widths in bf16:
   on the meta device (shapes only, nothing allocated; SDPA as a fused kernel that keeps no score matrix, as the GPU's
   memory-efficient and cuDNN kernels do), whole decodes and the pipeline's `pt` output, peak GiB:
@@ -57,9 +81,13 @@ Counted as live tensors (2026-09-17), with this processor and the default tiling
   a stage-5 token and no workspace above every peak, by 4-16%;
   on the CPU, allocated and run, at 256 px for 17 to 81 frames: the formulas to the byte, a production-depth tile (79
   frames) 3,900-4,700 bytes a token, and the whole decode within the plan's estimate.
-test_ltx_4k_render.py repeats the meta count at 1440p for 49 frames. Beside the counted activations, the attention's
+  The GPU allocated less than these counts: 13.95, 24.30 and 13.89 GiB where the meta count peaks at 16.42, 27.00 and
+  14.93, so the count keeps something alive a CUDA decode doesn't. Admission follows the GPU.
+test_ltx_4k_render.py repeats the meta count at 1440p for 49 frames with the count's figures (5,300 bytes a token, 16,000 a
+ghost cell); test_ltx_4k_plan.py pins the GPU's peaks against admission. Beside the counted activations, the attention's
 per-chunk projections and gathered keys and diffusers' 16,384-token MLP tiles (ATTENTION_WORKSPACE_BYTES,
-PROJECTION_BYTES_PER_PIXEL), and a fifth more per token for the GPU. Never run on a GPU.
+PROJECTION_BYTES_PER_PIXEL). The decode's speed on that card: 44.6 s for 97 frames at 1440p, 120.4 s for 241, and 65.5 s
+for 73 frames at 2160p.
 """
 
 from __future__ import annotations
@@ -95,19 +123,24 @@ class Tiling:
 
 DEFAULT_TILING = Tiling()
 # A tile's stage 4 and stage 5, bf16 bytes: TILE_BYTES_PER_TOKEN for each token stage 5 denoises (4 x 4 pixels of a frame)
-# and TILE_BYTES_PER_GHOST_CELL for each ghost cell only stage 4 sees (its blocks on 512 channels, then
-# the last upsample's projection and copy). Counted at 1440p and 2160p (module docstring): with 5,300 bytes a token the
-# plan covers each count's peak by 4-16%. The figure adds a fifth for what a count of tensors can't see, the GPU
-# allocator's rounding and cuBLAS and SDPA workspaces. (The edit modes' unchunked VAE encode measured 1.374x its CPU count
-# on a GPU, cuDNN's convolution workspaces included; the decoder has no convolutions.)
-TILE_BYTES_PER_TOKEN = 6_400
-TILE_BYTES_PER_GHOST_CELL = 16_000
+# and TILE_BYTES_PER_GHOST_CELL for each ghost cell only stage 4 sees (its blocks on 512 channels, then the last upsample's
+# projection and copy), with ATTENTION_WORKSPACE_BYTES beside them. Fitted to a GPU's decode peaks (module docstring,
+# 2026-09-17): one factor, 0.53, on the figures planned before any GPU ran (6,400, 16,000 and 2 GiB, a count of live
+# tensors plus a fifth), rounded (the workspace to 1 GiB). The count keeps more alive per token than CUDA allocated; why is
+# not known.
+TILE_BYTES_PER_TOKEN = 3_400
+TILE_BYTES_PER_GHOST_CELL = 8_500
 PIXEL_BYTES = 6
 # Keys and values one attention call gathers, at most (bf16 bytes).
 ATTENTION_BUDGET_BYTES = 1 << 30
 # Beside the counted activations: the gathered keys and values (the budget), SDPA's output, the MLP's hidden-width tile
-# (16,384 tokens x 8,192 x 3 in stage 1, 0.75 GiB) and slack.
-ATTENTION_WORKSPACE_BYTES = 2 << 30
+# (16,384 tokens x 8,192 x 3 in stage 1, 0.75 GiB) and slack. Fitted with the tile's figures above, which trade against it:
+# the GPU's peaks fix a whole 80-frame tile's work, not how it splits into a fixed and a per-token part.
+ATTENTION_WORKSPACE_BYTES = 1 << 30
+# Above the fit, for what five peaks can't pin: that split, which the unmeasured cells depend on (the fits that stay above
+# all five peaks by at most 0.5 GiB put 2160p 4 s, 1440p 9:16 10 s and the 25 and 50 fps frame counts at most 0.4 GiB above
+# this one), and 9:16's tile order, which never ran.
+DECODE_MARGIN_BYTES = 1 << 29
 # The per-temporal-chunk query, key and value projections of stages 1-3 and their rotary transients, bytes a pixel of the
 # frame size: at most stage 2's 13 frames of H/16 x W/16 x 1,024 channels, and the float32 rotation of a key slab.
 PROJECTION_BYTES_PER_PIXEL = 400
@@ -175,8 +208,20 @@ def decode_phases(width: int, height: int, frames: int, tiling: Tiling = DEFAULT
 
 
 def decode_activation_bytes(width: int, height: int, frames: int) -> int:
-    """The decode's peak beside the weights, bf16 bytes: its largest phase, plus the render's result it holds."""
-    return max(decode_phases(width, height, frames).values()) + DECODE_HELD_BYTES
+    """The decode's peak beside the weights, bf16 bytes: the largest phase of this clip or of any shorter one at the same
+    size, plus the render's result it holds and the margin above the GPU fit. The planner adds its overhead on top
+    (quantized.MemoryPlan.decode_gib).
+
+    Shorter clips count because the replay's peak can fall as a clip grows: one more latent frame can open a short last
+    tile group, and the final join then holds that group's tiles and rows instead of a long one's (2160p: 241 frames replay
+    2.6 GiB under 233). No GPU has decoded across such a boundary, and the serving envelope needs an estimate that never
+    shrinks with duration, so the estimate is the largest replay up to this length. It moves no size the card measured:
+    at 1440p it first applies at 465 frames, at 2160p at 241."""
+    latent_frames = (frames - 1) // TEMPORAL_RATIO + 1
+    peak = max(decode_phases(width, height, frames).values())
+    for shorter in range(2, latent_frames):
+        peak = max(peak, max(decode_phases(width, height, 1 + TEMPORAL_RATIO * (shorter - 1)).values()))
+    return peak + DECODE_HELD_BYTES + DECODE_MARGIN_BYTES
 
 
 # ---------------------------------------------------------------- exact neighborhood attention in chunks

@@ -37,7 +37,8 @@ until `worker/scripts/benchmark_ltx_quantized.py` runs on the class.
 A recipe that includes `diffusion_decoder` (ltx-2.5-4k) has a second peak after the render: the diffusion decode, beside the
 same resident weights, which depends on the output's size and length rather than its tokens
 (ltx_diffusion_decode.decode_activation_bytes). A request fits only where both peaks do; the envelope, admission and the
-choice of plan all check both.
+choice of plan all check both. Both were fitted to an RTX PRO 6000's peaks on 2026-09-17: the render has its own line in the
+recipe, and the decode's replay has GPU-fitted figures and a margin (that module's docstring has the residuals).
 
 Verified mode. Quantization changes how weights are stored, not what the denoising loop carries: the
 latents stay bfloat16, so the step callback, `SchedulerTrap` and `tensor_record` are unchanged. The

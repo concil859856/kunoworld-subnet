@@ -21,7 +21,7 @@ reachability, then lists which profiles the machine can serve and what is missin
 |---|---|---|---|
 | `ltx-2.5-fast` | 1 | 80 GB | cheapest confidential entry: an RTX PRO 6000 Server Edition; also H200, B200, B300 |
 | `ltx-2.5-pro` | 1 | 80 GB | an H200, B200 or B300 on the confidential tier |
-| `ltx-2.5-4k` | 1 | 141 GB | an H200, B200 or B300. An H200 serves 2160p up to 5 s (estimated); the 96 GB RTX PRO 6000 would serve only 1440p up to 4 s ([section 3b](#3b-switch-to-resident-runtimes-for-real-serving)) |
+| `ltx-2.5-4k` | 1 | 141 GB | an H200, B200 or B300. An H200 would serve 2160p up to 10 s at 24 fps (extrapolated); the 96 GB RTX PRO 6000 would serve 1440p up to 10 s and 2160p up to 4 s, 3 s of which ran ([section 3b](#3b-switch-to-resident-runtimes-for-real-serving)) |
 | `h3-turbo`, `h3`, `h3-reference` | 4 per worker | 80 GB | a whole 8-GPU H200, B200 or B300 server running two workers |
 
 The subnet README's hardware classes (C1, C2, C4) are how the network groups these profiles;
@@ -251,46 +251,63 @@ upsampling rounds are ltx-pipelines features that diffusers 0.40 doesn't have. O
     query-by-key mask and scores, which no GPU holds at 1440p, and the image has no C compiler to compile it.
   - diffusers' other choice, NATTEN, downloads its kernel from the Hub at load, which an attested image must not do.
   - So the worker computes the same attention exactly in chunks on PyTorch's `scaled_dot_product_attention`. On the CPU
-    its output equals diffusers' to rounding. Its speed on a GPU is unmeasured.
+    its output equals diffusers' to rounding. On an RTX PRO 6000 it decoded 241 frames of 1440p in 120 s and 73 frames of
+    2160p in 65 s (2026-09-17).
 - **Weights.** The recipe (`ltx-2.5-dfr/bf16/1`) hashes `diffusion_decoder/` with everything else it reads. The loader
-  builds the decoder only for a recipe that includes it. The weights digest for `ltx-2.5-4k` has not been computed yet.
-- **Memory.** The plan checks two peaks against the card:
-  - the render: the distilled recipe's line, fitted to peaks measured up to 51,000 tokens and extrapolated to 4K's
-    24,640-514,080;
-  - the decode: the decoder's own shapes, a count of its live tensors at 1440p and 2160p, and a fifth more for the GPU.
+  builds the decoder only for a recipe that includes it. The weights digest for `ltx-2.5-4k` is in `research/weights-digests/` (dev repo).
+- **Memory.** The plan checks two peaks against the card. Both were fitted on 2026-09-17 to an RTX PRO 6000 Blackwell
+  Server Edition running image `ltx-0.1.0-25d8d065d34a` (`scripts/gpu-test/long_video/run_4k_worker.py --calibrate`):
+  - **The render** has its own line in `ltx-2.5-dfr/bf16/1`: 0.5 GiB + 1.42 GiB per 10,000 latent tokens beside 66.96 GiB
+    of weights. Five text-to-video renders from 45,760 to 109,120 tokens fit 0.40 + 1.395 within 0.02 GiB; the line adds a
+    small margin. `ltx-2.5-fast`'s line was used before, and its peaks include a VAE decode this render never runs.
+  - **The decode** replays the decoder's tiles (`worker/backends/ltx_diffusion_decode.py`). Its per-token, per-ghost-cell
+    and workspace figures are fitted to the same run's decode peaks, which the replay stays above by 0.02-0.29 GiB, and it
+    adds a 0.5 GiB margin. A clip is never estimated below a shorter one at the same size.
+  - With the planner's 1.5 GiB overhead, the render's line sits 1.73-1.89 GiB above every measured render peak, and the
+    decode's estimate 2.03-2.30 GiB above every measured decode peak. (For the two shortest renders the estimate is higher
+    still: the floor is text generation with every weight on the GPU.)
 
   The serving envelope and admission refuse a request when either peak doesn't fit. A keyframe job also counts the latent
   frame each keyframe appends (8,160 tokens at 2160p).
 
-What a card would serve. Every figure is an estimate; none has run on a GPU:
+What a card serves: the longest duration admission accepts, for both aspect ratios unless a row says otherwise. Cells
+marked *measured* ran on that card. The one at 48 fps has the same 241 frames and tokens as 10 s at 24 fps. Every other
+cell is extrapolated from the fit.
 
-| Card (GiB PyTorch reports) | 1440p at 24/25 fps | 1440p at 48/50 fps | 2160p at 24/25 fps | 2160p at 48/50 fps |
-|---|---|---|---|---|
-| H200 (139.8) | 10 s | 6 s | 5 s | 2 s |
-| RTX PRO 6000 (94.97) | 4 s | 2 s | none | none |
+| Card (GiB PyTorch reports) | Size | 24 fps | 25 fps | 48 fps | 50 fps |
+|---|---|---|---|---|---|
+| RTX PRO 6000 (94.97) | 1440p 16:9 | 10 s, *measured* | 10 s | 5 s, *measured* | 5 s |
+| | 1440p 9:16 | 10 s | 10 s | 5 s | 5 s |
+| | 2160p, both | 4 s | 4 s | 2 s | 2 s |
+| H200 (139.8) | 1440p, both | 10 s | 10 s | 10 s | 10 s |
+| | 2160p, both | 10 s | 10 s | 7 s | 7 s |
+| H100 80GB (79.19) | 1440p 16:9 | 2 s | 2 s | none | none |
+| | 1440p 9:16, 2160p | none | none | none | none |
 
-- **Both cards:** the render sets the limit. Both peaks sit beside the same 66.96 GiB of weights, and the decode's
-  activations are estimated at:
-
-  | | 2 s | 4 s |
-  |---|---|---|
-  | 1440p | 16.3 GiB | 23.2 GiB |
-  | 2160p | 20.7 GiB | 30.7 GiB |
-
-- **H200:** a 2160p render of 5 s is 130,560 tokens, estimated at 131.8 GiB of its 139.3 usable; 6 s would be 155,040.
-- **RTX PRO 6000:** even 2 s of 2160p (57,120 tokens) doesn't fit, and 1440p stops at 4 s. The profile's 141 GB minimum
-  keeps `kuno-preflight` from offering it there anyway.
-- **B200 and B300:** planned from the memory the card reports, as every class without a declared VRAM is.
+- **Every card:** the decode sets each limit in the table. At 2160p, 9:16 is estimated up to 0.13 GiB below 16:9, and at
+  1440p up to 0.38 GiB above, because the same tiles are cut in another order. Only the H100's cells differ for it.
+- **RTX PRO 6000:** 1440p ran at 4, 8 and 10 s and 2160p at 2 and 3 s, all at 24 fps. 2160p for 5 s ran out of memory in
+  the decode, and admission refuses it. 2160p for 4 s never ran. It is admitted because the fit puts its decode at a
+  90.3 GiB peak, below the 91.25 GiB of the 1440p 10 s decode that ran, and its estimate (92.3 GiB) leaves 2.1 GiB of the
+  card's 94.47 usable.
+  It is the first cell to measure. The profile's 141 GB minimum keeps `kuno-preflight` from offering this card anyway.
+- **H200:** at 2160p and 48 or 50 fps, 8 s (385 frames) would decode at 142.1 GiB, over its 139.3 usable; its render
+  (399,840 tokens, 125.7 GiB) would fit. Nothing above 109,120 render tokens or 241 decoded frames has run.
+- **H100:** it keeps every weight on the GPU, because the shortest 1440p 16:9 clip fits by about 1 MiB. It is not a class
+  this profile lists.
+- **B200 and B300:** planned from the memory the card reports. Any card reporting 162.3 GiB or more fits the whole profile,
+  whose largest request is 2160p 10 s at 50 fps: 142.0 GiB to render and 161.8 GiB to decode. So it is not capped.
 
 **Only a GPU run can confirm:**
-- the render's and the decode's peak memory against these estimates (the render line was never measured above 51,000
-  tokens);
-- how long the render and the chunked attention take, against the profile's 3,600 s timeout;
-- whether CUDA's SDPA runs the boolean masks in a fused kernel (if not, the decode's peak exceeds its estimate);
+- 2160p for 4 s, 25 and 50 fps beyond the frame counts that ran, 9:16, and the H200's longer clips;
+- image-to-video and keyframes: one full-size pass of 8 sigmas, with the images encoded (the render line is text-to-video's);
 - picture quality and colour, and whether tile seams show.
 
-`scripts/gpu-test/long_video/run_4k_worker.py` renders a 1440p and a 2160p clip through the worker. It measures both peaks
-against admission's estimates and times each phase; the pictures are for a person to watch.
+The 2026-09-17 run's timings: 1440p 10 s rendered in 161 s and decoded in 120 s; 2160p 3 s in 102 s and 65 s.
+
+`scripts/gpu-test/long_video/run_4k_worker.py` renders 1440p and 2160p clips through the worker. It measures both peaks
+against admission's estimates and times each phase; the pictures are for a person to watch. With `--calibrate` it measures
+past admission, to refit the model.
 
 ## 3c. Worker images
 

@@ -16,12 +16,13 @@ PROFILES = load_profiles()
 
 # VCU per output second at 24/25 fps up to 5 s, lowest resolution first, and the duration slope. The 720p/768p weights
 # of ltx-2.5-fast, ltx-2.5-pro, h3 and h3-reference are measured (research/pricing/measured_2026-09-15.md), and so are
-# h3-turbo's weight and slope and h3's slope (measured_2026-09-16_h3-turbo.md); the rest are still the estimates of
+# h3-turbo's weight and slope and h3's slope (measured_2026-09-16_h3-turbo.md), and ltx-2.5-4k's weights and slope
+# (2026-09-17, research/long-video_ltx-av-extend_2026-09-16.md addenda 5-6); the rest are still the estimates of
 # research/pricing/costs.md §8.4.
 EXPECTED = {
     "ltx-2.5-fast": ({"720p": 3, "1080p": 5}, 0.03),
     "ltx-2.5-pro": ({"720p": 33, "1080p": 73}, 0.03),
-    "ltx-2.5-4k": ({"1440p": 22, "2160p": 60}, 0.03),
+    "ltx-2.5-4k": ({"1440p": 15, "2160p": 40}, 0.04),
     "h3-turbo": ({"768p": 19}, 0.072),
     "h3": ({"768p": 100}, 0.093),
     "h3-reference": ({"768p": 163}, 0.065),
@@ -67,7 +68,7 @@ def test_a_duration_only_caller_gets_the_lowest_resolution_at_the_default_fps():
         lowest = next(iter(weights))
         assert profile.base_vcu_resolution == lowest
         assert profile.vcu(10) == pytest.approx(weights[lowest] * (1 + slope * 5) * 10), profile_id
-    assert PROFILES["ltx-2.5-4k"].vcu(4) == pytest.approx(22 * 4)
+    assert PROFILES["ltx-2.5-4k"].vcu(4) == pytest.approx(15 * 4)
 
 
 def test_every_resolution_a_profile_sells_has_a_weight_marked_as_a_placeholder():

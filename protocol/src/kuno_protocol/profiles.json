@@ -1126,15 +1126,15 @@
       },
       "vcu_weights": {
         "per_output_second": {
-          "1440p": 22,
-          "2160p": 60
+          "1440p": 15,
+          "2160p": 40
         },
-        "duration_slope": 0.03,
+        "duration_slope": 0.04,
         "fps_multiplier": {
           "48": 2,
           "50": 2
         },
-        "note": "PLACEHOLDER GPU-cost weights (research/pricing/costs.md 8.4), not benchmarked; the duration slope is provisional"
+        "note": "GPU-cost weights measured 2026-09-17 on an RTX PRO 6000 (research/long-video_ltx-av-extend_2026-09-16.md, addenda 5-6): about 24 GPU-seconds per output second at 1440p and 63 at 2160p near 5 s, against ltx-2.5-fast 720p's 4.7 = 3 VCU; the slope from 1440p at 4, 8 and 10 s (2160p only ran 2 and 3 s)"
       },
       "timeout_s": 3600,
       "min_vram_gb": 141,
