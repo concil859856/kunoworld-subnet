@@ -141,13 +141,17 @@ def earns_job_pay(entry: Mapping) -> bool:
 def job_vcu(profile: ModelProfile, entry: Mapping, seconds: float) -> float:
     """VCU for an audited job's billable seconds (`ModelProfile.vcu_for`), from the public params `audit_ledger` bound to
     the signed digest. Rows without params use the ledger's `resolution` and `fps`; rows without either, or with a
-    resolution this validator's profiles have no weight for, the lowest resolution's weight (`ModelProfile.vcu`)."""
+    resolution this validator's profiles have no weight for, the lowest resolution's weight (`ModelProfile.vcu`). A plan
+    pays the flat `vcu_weights.plan`."""
     params = entry.get("params")
     if params is not None:
         try:
             return profile.vcu_for(GenerationParams.model_validate(params), seconds)
         except (ValidationError, ParamError):
             pass
+    if entry.get("plan"):
+        # A plan pays its flat weight whatever the row says about seconds or resolution (ledger.audit_ledger marks it).
+        return profile.vcu_weights.plan or 0.0
     resolution, fps = entry.get("resolution"), entry.get("fps")
     if isinstance(resolution, str):
         if not isinstance(fps, int) or isinstance(fps, bool):
@@ -186,7 +190,8 @@ def compute_scores(
             seconds = billable_seconds(entry)
             if seconds is not None:
                 # Paid or not, a credited confidential-tier job shows the miner can serve the family (capacity pay's gate).
-                if entry.get("tier") != OPEN:
+                # A plan doesn't: it runs the pipeline's small planner and renders nothing.
+                if entry.get("tier") != OPEN and not entry.get("plan"):
                     miner.served.add(profile.family)
                 if earns_job_pay(entry):
                     rate = float((tier_rates or {}).get(entry.get("tier") or "", 1.0))

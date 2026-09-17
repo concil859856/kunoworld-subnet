@@ -14,6 +14,7 @@ from kuno_protocol.policy import policy_from_env
 from .capacity import CapacityTracker
 from .collateral import CollateralGate
 from .open_tier import TierPolicy
+from .plan_canaries import load_briefs
 from .usd_pay import PayUnavailable, UsdPay
 from .validator import DEFAULT_DIVERGENCE_WARNING, DEFAULT_SPOT_CHECK_RATE, ROLES, Validator
 
@@ -48,6 +49,13 @@ def main() -> None:
         "--standard-canary", action="append", default=[],
         help="profile id to send a standard-mode canary to (repeatable); these reach open-tier miners and admit them",
     )
+    parser.add_argument(
+        "--plan-canary", action="append", default=[],
+        help="profile id to send a private plan canary to (repeatable); briefs from $KUNO_PLAN_CANARY_BRIEFS, else the fallback set",
+    )
+    parser.add_argument(
+        "--standard-plan-canary", action="append", default=[], help="profile id to send a standard-mode plan canary to (repeatable)",
+    )
     parser.add_argument("--netuid", type=int, help="set weights on this subnet (requires the chain extra)")
     parser.add_argument("--wallet-name", default="default")
     parser.add_argument("--wallet-hotkey", default="default")
@@ -76,8 +84,8 @@ def main() -> None:
         parser.error("refusing to set weights without KUNO_OWNER_PUBLIC_KEY (pass --allow-unsigned-switch to override)")
     # KUNO_ATTESTATION=production refuses to start without Intel DCAP and NVIDIA verifiers and an
     # owner-signed manifest, exactly as the gateway does.
-    if args.role == "auditor" and (args.canary or args.standard_canary):
-        parser.error("auditor validators send no canaries: drop --canary/--standard-canary, or run with --role main")
+    if args.role == "auditor" and (args.canary or args.standard_canary or args.plan_canary or args.standard_plan_canary):
+        parser.error("auditor validators send no canaries: drop the canary options, or run with --role main")
     if args.role == "auditor" and not args.main_validator_hotkey and args.netuid is not None and not args.dry_run:
         parser.error("an auditor needs --main-validator-hotkey (or KUNO_MAIN_VALIDATOR_HOTKEY) to apply its findings")
     policy = policy_from_env(env)
@@ -123,6 +131,7 @@ def main() -> None:
         spot_check_rate=args.spot_check_rate,
         divergence_warning=float(env.get("KUNO_DIVERGENCE_WARNING", DEFAULT_DIVERGENCE_WARNING)),
         require_location_proof=env.get("KUNO_REQUIRE_LOCATION_PROOF", "0") == "1",
+        plan_briefs=load_briefs(env["KUNO_PLAN_CANARY_BRIEFS"]) if env.get("KUNO_PLAN_CANARY_BRIEFS") else None,
     )
 
     turbo = None
@@ -148,7 +157,7 @@ def main() -> None:
         threading.Thread(target=_turbo_loop, args=(turbo, latest, args, stop), daemon=True).start()
 
     while True:
-        weights = serving_round(validator, args.canary, args.standard_canary)
+        weights = serving_round(validator, args.canary, args.standard_canary, args.plan_canary, args.standard_plan_canary)
         if weights is not None:
             latest["serving"] = weights
             print(json.dumps(weights, indent=2))
@@ -187,10 +196,15 @@ def _findings_signer(env: dict[str, str], args):
     return Wallet(**kwargs).hotkey
 
 
-def serving_round(validator: Validator, canaries: list[str], standard_canaries: list[str]) -> dict[str, float] | None:
+def serving_round(
+    validator: Validator, canaries: list[str], standard_canaries: list[str], plan_canaries: list[str] | None = None,
+    standard_plan_canaries: list[str] | None = None,
+) -> dict[str, float] | None:
     """One serving round's weights, or None when USD pay can't price the round: the previous weights then stay on chain."""
     try:
-        return validator.step(canaries, standard_canaries)
+        return validator.step(
+            canaries, standard_canaries, plan_canary_profiles=plan_canaries, standard_plan_canary_profiles=standard_plan_canaries,
+        )
     except PayUnavailable as exc:
         log.error("USD pay is unavailable this round (%s); leaving the previous serving weights in place", exc)
         return None

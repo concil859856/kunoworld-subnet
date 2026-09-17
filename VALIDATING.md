@@ -54,6 +54,10 @@ kuno-validator run --role main --interval 4320 --netuid <netuid> \
 `--canary` sends private (end-to-end encrypted) canaries, which only confidential-tier miners
 can receive. `--standard-canary` sends standard-mode canaries through `POST /v1/standard/videos`;
 those can land on open-tier miners too, and they are the admission probes (see [Open tier](#open-tier)).
+`--plan-canary <profile>` and `--standard-plan-canary <profile>` send plan jobs (Director) in each privacy mode; see
+[Plan canaries](#plan-canaries). Their briefs come from `KUNO_PLAN_CANARY_BRIEFS`, a JSON file of
+`[{"brief": "...", "must_mention": ["..."], "target_s": 30}]`; without it the public fallback set in `plan_canaries.py`
+is used.
 
 Each setting can also come from `$KUNO_DATA_DIR/dev.env` (default `data/dev.env`), which is how a
 dev network provides them.
@@ -194,6 +198,11 @@ The gateway relays the ledger; it is not trusted to tell the truth about it. For
   as the gateway, and the count is logged. The miner's own `receipt.video.duration_s` is never
   paid. If it falls outside the model's frame grid around the request (±0.5 s slack), the job
   earns nothing and the miner is flagged in the log.
+- **Plans.** A plan job's receipt carries `plan` and no `video`. A receipt whose kind contradicts the job's signed
+  params (a video for a plan job, or the reverse) is dropped. A plan bills no seconds (`billable_s` 0) and pays the
+  profile's flat `vcu_weights.plan`. It is credited only when its `gpu_seconds` is positive and at most 300, it has 2-12
+  shots, and its stitched length is above 0 and at most 120 s. `plan_failed` jobs have no receipt and are not a miner
+  fault.
 - **Duplicate rows.** A job id listed twice counts once.
 
 ### Replay policy
@@ -222,14 +231,17 @@ VCU = weight(resolution) × fps multiplier × (1 + duration slope × max(0, seco
 
 | Profile | VCU per output second | Duration slope | Where the weight comes from |
 |---|---|---|---|
-| `ltx-2.5-fast` | 720p 3, 1080p 5 | 0.03 (provisional) | 720p measured 2026-09-15; 1080p estimated |
+| `ltx-2.5-fast` | 720p 3, 1080p 5; a plan 27 flat | 0.03 (provisional) | 720p measured 2026-09-15; 1080p estimated; the plan weight is a placeholder |
 | `ltx-2.5-pro` | 720p 33, 1080p 73 | 0.03 (provisional) | 720p measured; 1080p scaled by the same factor |
 | `ltx-2.5-4k` | 1440p 22, 2160p 60 | 0.03 (provisional) | estimated |
-| `h3-turbo` | 768p 17 | 0.05 | estimated, and likely low: the other H3 profiles cost 1.7x their estimate |
-| `h3` | 768p 100 | 0.06 | measured 2026-09-15, 5 s on 4x H200 |
+| `h3-turbo` | 768p 19 | 0.072 | measured 2026-09-16, 5, 10 and 14 s on 4x H200 (8-step LoRA) |
+| `h3` | 768p 100 | 0.093 | measured 2026-09-15, 5 s on 4x H200; slope from 5, 10 and 14 s on 2026-09-16 |
 | `h3-reference` | 768p 163 | 0.065 | measured 2026-09-15, 5 s on 4x H200 |
 
 - **fps.** 48 and 50 fps count twice what 24 and 25 fps do.
+- **Storyboards** sum the VCU of every shot rendered, each at its own length, overlaps included.
+- **Plans** pay the flat `plan` weight whatever their target length. A rate card that sets only per-second USD rates
+  pays a plan nothing, because it bills 0 seconds; cards from `kuno-devkit derive-rates` set per-VCU rates.
 - **Inputs.** Seconds are the billable seconds from the ledger audit, and resolution and fps come
   from the same bound params. A row with only `duration_s` uses the row's `resolution` and `fps`
   when present; without them, or for a resolution your profiles have no weight for, it uses the
@@ -287,6 +299,27 @@ traffic. The prompts in `canaries.py` are a public fallback: miners can read the
 prompt must pass `kuno_protocol.content_policy.check_prompt`: the enclave and the gateway run
 that list on every job, and sexual content is banned in both modes, so a canary that breaks it
 comes back `safety_blocked` and tells you nothing about the miner.
+
+### Plan canaries
+
+A plan canary is a plan job (PROTOCOL.md, "Plans (Director)") sent like a customer's: Private sealed by the validator
+to a confidential enclave it attested this round, or whose published evidence it verifies; Standard through
+`POST /v1/standard/plans`. Plans are sampled text, so nothing replays them or judges their quality. The checks catch a
+worker returning canned or empty plans, or breaking the protocol (`validator/src/kuno_validator/plan_canaries.py`):
+
+1. the receipt verifies against the enclave's key, and its `plan` block describes the delivered plan;
+2. the plan decrypts, its SHA-256 equals the receipt's `content_digest`, and it passes `kuno_protocol.plans.validate`
+   for the job's params and options;
+3. its stitched length is within 0.5 s of the target, or a `repairs` entry says why not;
+4. every text in it passes the content policy;
+5. at least half the brief's must-mention terms appear in it;
+6. the planner is one the profile allows: `<precision recipe>:<component>` for a recipe of the profile's family and
+   variant that includes `limits.plan.planner`. A network whose manifest trusts the mock TEE also accepts the mock
+   worker's canned planner.
+
+The same attribution and penalty apply as for video canaries. A plan job that ends without a receipt, `plan_failed`
+included, is not attributed. Keep your brief set private and rotate it: miners can read the fallback briefs, and a
+worker that recognised them could answer with prepared plans.
 
 ## Hardware dedupe
 

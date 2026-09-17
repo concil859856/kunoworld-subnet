@@ -7,21 +7,25 @@ import os
 import random
 import secrets
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
 import httpx
 
-from kuno_protocol.attestation import AttestationEvidence, AttestationPolicy, GoldenManifest, Verdict, verify_endorsed_evidence
-from kuno_protocol.canonical import canonical_json, sha256_hex
+from kuno_protocol.attestation import AttestationEvidence, AttestationPolicy, GoldenManifest, Verdict, enclave_id_for, verify_endorsed_evidence
+from kuno_protocol.canonical import b64d, b64e, canonical_json, sha256_hex
+from kuno_protocol.crypto import DecryptionError, SenderSession
 from kuno_protocol.findings import MAX_FINDINGS, Finding, FindingsReport, SignedFindings, sign_findings, verify_findings
 from kuno_protocol.hotkey import HotkeySigner
 from kuno_protocol.location import LandmarkList, LocationProof, SignedLandmarks, verify_location
 from kuno_protocol.mp4 import Mp4Error, probe
+from kuno_protocol.plans import PLAN_FEATURE, PLAN_OPTION, Plan, PlanError, PlanOptions, open_plan
 from kuno_protocol.profiles import Mode, ModelProfile, load_profiles
 from kuno_protocol.receipts import Receipt, verify_receipt
-from kuno_protocol.schemas import GenerationParams, JobState, JobStatus
+from kuno_protocol.schemas import GenerationParams, JobCreate, JobState, JobStatus, RouteResponse, SealedPayload, job_aad
+from kuno_protocol.sealed_payload import seal_payload
 from kuno_protocol.switch import SignedSwitch, SwitchConfig
 from kuno_protocol.tiers import OPEN, tier_for_tee
 from kuno_protocol.tolerance import Calibration
@@ -32,6 +36,7 @@ from .canaries import pick_prompt
 from .capacity import CapacityTracker
 from .collateral import CollateralGate
 from .open_tier import AdmissionTracker, TierPolicy, apply_tiers, fraud_penalties, open_tier_gpus
+from .plan_canaries import PlanBrief, check_plan, pick_brief
 from .ledger import DURATION_SLACK_S, EnclaveKey, LedgerAudit, audit_ledger, duration_bounds, enclave_keys
 from .scoring import CapacityCredit, MinerScore, compute_scores, hardware_conflicts, normalize
 from .usd_pay import UsdPay
@@ -109,6 +114,7 @@ class Validator:
         spot_check_rate: float = DEFAULT_SPOT_CHECK_RATE,
         divergence_warning: float = DEFAULT_DIVERGENCE_WARNING,
         require_location_proof: bool = False,
+        plan_briefs: list[PlanBrief] | None = None,
     ):
         if role not in ROLES:
             raise ValueError(f"validator role must be one of {', '.join(ROLES)}, not {role!r}")
@@ -165,6 +171,8 @@ class Validator:
         self.last_divergence: float | None = None
         # Territory-bound profiles (MiniMax H3) count as attested only with a landmark proof this validator checked.
         self.require_location_proof = require_location_proof
+        # Plan canaries' briefs (plan_canaries.py); None: the public fallback set.
+        self.plan_briefs = plan_briefs
         self._landmark_list: LandmarkList | None = None
         self._main_weights: dict[str, float] | None = None
         self.state_path = state_path
@@ -634,6 +642,133 @@ class Validator:
             ))
         return self._record(outcome)
 
+    def run_plan_canary(self, profile_id: str, privacy: str = "private", sleep=time.sleep) -> CanaryResult:
+        """A plan canary (plan_canaries.py). Private: sealed here to a confidential enclave that lists `plan/1` and whose
+        attestation this validator verified, sent to `POST /v1/plans`, and opened with the job's output key. Standard:
+        `POST /v1/standard/plans`, read back from `GET /v1/standard/plans/{job_id}`. Plans are never step-audited.
+        A job that ends without a receipt, `plan_failed` included, proves nothing about which miner is at fault."""
+        profile = self.profiles[profile_id]
+        brief, seed = pick_brief(self.plan_briefs), secrets.randbelow(2**31)
+        resolution = next(iter(profile.limits.sizes))
+        sizes = profile.limits.sizes[resolution]
+        params = GenerationParams(
+            profile_id=profile.id, mode=Mode.PLAN, duration_s=brief.target_s, resolution=resolution,
+            aspect_ratio="16:9" if "16:9" in sizes else next(iter(sizes)), fps=profile.limits.default_fps, audio=profile.limits.audio,
+        )
+        options = PlanOptions()
+        output_key = None
+        if privacy == "standard":
+            response = self._request(
+                "POST", "/v1/standard/plans", json={"params": params.model_dump(mode="json"), "brief": brief.brief, "seed": seed}
+            )
+        else:
+            sealed = self._seal_plan(profile, params, brief.brief, seed, options)
+            if isinstance(sealed, CanaryResult):
+                return self._record(sealed)
+            job, output_key = sealed
+            response = self._request("POST", "/v1/plans", json=job.model_dump(mode="json"))
+        if response.status_code != 201:
+            return self._record(CanaryResult(profile_id, False, f"{privacy} plan canary refused ({response.status_code})"))
+        status = JobStatus.model_validate(response.json())
+        deadline = time.time() + profile.timeout_s
+        while not status.status.terminal and time.time() < deadline:
+            sleep(STANDARD_CANARY_POLL_S)
+            status = JobStatus.model_validate(self._request("GET", f"/v1/videos/{status.job_id}").raise_for_status().json())
+        job_id = status.job_id
+        if status.status != JobState.SUCCEEDED or status.receipt is None:
+            return self._record(CanaryResult(profile_id, False, f"plan: {status.error_code or status.status.value}", job_id=job_id))
+
+        receipt = status.receipt
+        body = receipt.body
+        if body.enclave_id not in self._keys:
+            self.enclaves()
+        key = self._keys.get(body.enclave_id)
+        if key is None or not verify_receipt(receipt, key.signing_public_key) or body.job_id != job_id:
+            log.error("plan canary %s: the receipt does not verify for this job; the relay may be tampering", job_id)
+            return self._record(CanaryResult(profile_id, False, "plan: receipt does not verify", job_id, body.enclave_id))
+
+        def result(detail: str | None, attributable: bool = True) -> CanaryResult:
+            ok = detail is None
+            return self._record(CanaryResult(
+                profile_id, ok, "ok" if ok else f"plan: {detail}", job_id, body.enclave_id, key.miner_hotkey, attributable,
+            ))
+
+        if body.profile_id != profile.id:
+            return result(f"enclave signed a receipt for {body.profile_id}, not {profile.id}")
+        if body.params_digest != sha256_hex(canonical_json(params.model_dump(mode="json"))):
+            return result("receipt signs different params than the canary requested")
+        if privacy == "standard":
+            fetched = self._request("GET", f"/v1/standard/plans/{job_id}")
+            # The gateway checked the plan against the receipt before keeping it, so a mismatch here is the gateway's.
+            if fetched.status_code != 200 or sha256_hex(fetched.content) != body.content_digest:
+                return result(f"the gateway serves no plan matching the receipt ({fetched.status_code})", attributable=False)
+            plan_json = fetched.content
+            try:
+                plan = Plan.model_validate_json(plan_json)
+            except ValueError:
+                return result("the gateway serves a plan that doesn't parse", attributable=False)
+        else:
+            blob = self._request("GET", f"/v1/blobs/{status.output_blob_id}")
+            if blob.status_code != 200 or sha256_hex(blob.content) != body.output_digest:
+                return result(f"the output blob is missing or not the one the receipt certifies ({blob.status_code})", attributable=False)
+            try:
+                plan, plan_json = open_plan(output_key, job_id, blob.content)
+            except (DecryptionError, PlanError):
+                return result("the certified output does not open as a plan with the job's output key")
+        return result(check_plan(plan, plan_json, receipt, profile, params, options, brief, self.manifest))
+
+    def _seal_plan(
+        self, profile: ModelProfile, params: GenerationParams, brief: str, seed: int, options: PlanOptions
+    ) -> tuple[JobCreate, bytes] | CanaryResult:
+        """A private plan job sealed exactly as a client seals one, to the first routed enclave that lists `plan/1` and
+        whose attestation this validator checked; and the job's output key."""
+        response = self._request("GET", "/v1/route", params={
+            "mode": Mode.PLAN.value, "profile_id": profile.id, "resolution": params.resolution,
+            "aspect_ratio": params.aspect_ratio, "fps": params.fps,
+        })
+        if response.status_code != 200:
+            return CanaryResult(profile.id, False, f"plan canary not routed ({response.status_code})")
+        route = RouteResponse.model_validate(response.json())
+        if route.profile_id != profile.id:
+            return CanaryResult(profile.id, False, f"plan canary routed to {route.profile_id} ({route.fallback_reason}); it did not test {profile.id}")
+        enclave = self._attested_plan_enclave(route.enclaves, profile.id)
+        if enclave is None:
+            return CanaryResult(profile.id, False, "plan canary found no attested worker that writes plans")
+        session = SenderSession(b64d(enclave["hpke_public_key"]))
+        job_id = str(uuid.uuid4())
+        payload = SealedPayload(prompt=brief, seed=seed, options={PLAN_OPTION: options.model_dump(mode="json", exclude_none=True)})
+        ciphertext = seal_payload(session, payload, job_aad(job_id, enclave["enclave_id"], params, []))
+        job = JobCreate(job_id=job_id, params=params, enclave_id=enclave["enclave_id"], enc=b64e(session.enc), ciphertext=b64e(ciphertext))
+        return job, session.output_key
+
+    def _attested_plan_enclave(self, enclaves: list[dict], profile_id: str) -> dict | None:
+        """The first confidential enclave listing `plan/1` whose keys this validator trusts: attested by its own challenge
+        this round, or else by verifying the evidence the route publishes, as auditors verify it."""
+        for enclave in enclaves:
+            enclave_id = enclave.get("enclave_id")
+            try:
+                keys = b64d(enclave["hpke_public_key"]), b64d(enclave["signing_public_key"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if enclave_id_for(*keys) != enclave_id or PLAN_FEATURE not in (enclave.get("features") or []):
+                continue
+            if self.enclave_tiers.get(enclave_id) not in (None, OPEN) and profile_id in self.enclave_profiles.get(enclave_id, []):
+                return enclave
+            try:
+                evidence = AttestationEvidence.model_validate(enclave["evidence"])
+            except (KeyError, ValueError):
+                continue
+            if evidence.tee == "tdx" and self.policy.quote_verifier is None:
+                verdict = verify_endorsed_evidence(evidence, self.manifest, enclave.get("endorsements"))
+            else:
+                verdict = self.policy.verify(evidence, self.manifest)
+            if (
+                verdict.ok and verdict.enclave_id == enclave_id and verdict.tier != OPEN and profile_id in evidence.profiles
+                and evidence.hpke_public_key == enclave["hpke_public_key"]
+            ):
+                return enclave
+        return None
+
     def _remember_canary(self, profile_id: str, result, prompt: str, seed: int, started: float) -> None:
         """Keeps what a step audit needs; the params come from the ledger so they hash to the signed digest."""
         params = next((row.get("params") for row in self.ledger(started - 60) if row.get("job_id") == result.job_id), None)
@@ -701,6 +836,8 @@ class Validator:
         hotkey = key.miner_hotkey
         if body.profile_id != profile.id:
             return fail(f"enclave signed a receipt for {body.profile_id}, not {profile.id}")
+        if body.video is None:
+            return fail("enclave signed a plan receipt for a video canary")
         if sha256_hex(video) != body.content_digest:
             return fail("output does not match the receipt's content digest")
         try:
@@ -793,7 +930,8 @@ class Validator:
 
     def step(
         self, canary_profiles: list[str] | None = None, standard_canary_profiles: list[str] | None = None,
-        window_s: float = 86400.0,
+        window_s: float = 86400.0, plan_canary_profiles: list[str] | None = None,
+        standard_plan_canary_profiles: list[str] | None = None,
     ) -> dict[str, float]:
         """One serving round. The main validator challenges, sends canaries, audits, scores and publishes its findings;
         an auditor verifies published evidence with spot challenges, applies the main validator's signed findings,
@@ -801,7 +939,7 @@ class Validator:
         extra_penalties: dict[str, list[str]] | None = None
         self._landmark_list = None  # the owner may publish a new landmark list between rounds
         if self.role == "auditor":
-            if canary_profiles or standard_canary_profiles:
+            if canary_profiles or standard_canary_profiles or plan_canary_profiles or standard_plan_canary_profiles:
                 log.warning("auditor validators send no canaries; ignoring the canary profiles given")
             verdicts = self.published_verdicts()
             extra_penalties = self.main_validator_findings(time.time(), window_s)
@@ -816,6 +954,11 @@ class Validator:
                 outcome = self.run_canary(profile_id, privacy)
                 level = logging.INFO if outcome.ok else logging.WARNING
                 log.log(level, "%s canary %s on %s: %s", privacy, profile_id, outcome.miner_hotkey or "unknown miner", outcome.detail)
+            plans = [(p, "private") for p in plan_canary_profiles or []] + [(p, "standard") for p in standard_plan_canary_profiles or []]
+            for profile_id, privacy in plans:
+                outcome = self.run_plan_canary(profile_id, privacy)
+                level = logging.INFO if outcome.ok else logging.WARNING
+                log.log(level, "%s plan canary %s on %s: %s", privacy, profile_id, outcome.miner_hotkey or "unknown miner", outcome.detail)
             self.run_audits()
         scores = self.score(verdicts, window_s, extra_penalties)
         weights = self._weights(scores)

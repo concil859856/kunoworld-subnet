@@ -198,6 +198,9 @@ def judge_outcome(
         return verdict("fraud", "receipt params digest does not match the request")
     if expected.hotkey is not None and body.miner_hotkey is not None and body.miner_hotkey != expected.hotkey:
         return verdict("fraud", "receipt names a different miner hotkey")
+    if body.video is None:
+        # The params digest matched a video benchmark, yet the enclave certified a plan (PROTOCOL.md "Plans (Director)").
+        return verdict("fraud", "receipt certifies a plan, not the video the benchmark asked for")
     if outcome.video is None:
         if outcome.output_error == "enclave":
             return verdict("failed", "output does not decrypt with the job's output key")

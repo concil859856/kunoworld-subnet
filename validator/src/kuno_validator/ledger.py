@@ -7,6 +7,12 @@ the job's public parameters (what the customer paid for), never from the miner's
 own `receipt.video.duration_s`. A content digest that shows up in more than one
 job is a replay: only its first delivery earns.
 
+Plans (PROTOCOL.md "Plans (Director)") render nothing. Their receipt carries `plan` and no `video`, they bill no
+seconds (`billable_s` 0) and are paid the flat `vcu_weights.plan` (`ModelProfile.vcu_for`), so there is no video
+length to check; instead the receipt's shot count and stitched length must be ones a plan can have, and its
+`gpu_seconds` positive and at most PLAN_MAX_GPU_SECONDS. A receipt whose kind (plan or video) contradicts the job's
+signed params is dropped.
+
 Replay policy (also in VALIDATING.md):
   * the earliest verified delivery of a digest (by finished_at, then job_id) is credited;
   * every later delivery earns nothing;
@@ -19,6 +25,7 @@ Replay policy (also in VALIDATING.md):
 from __future__ import annotations
 
 import logging
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -35,6 +42,11 @@ log = logging.getLogger("kuno.validator.ledger")
 # How far the rendered length may sit from the requested one. Models render on a frame
 # grid (H3: 17n+5 frames at 24 fps; LTX: 8k+1), so the real clip can overshoot slightly.
 DURATION_SLACK_S = 0.5
+# The most GPU time a plan receipt may report and still be credited. A plan job writes at most four replies (two drafts,
+# each with one retry). The 2026-09-16 GPU spike wrote 49-51 tokens/s with E2B on an RTX PRO 6000, so a reply at the
+# 2,048-token cap takes about 42 s and four about 170 s; 300 s leaves room for a slower card and moving the planner onto
+# the GPU, without crediting a job that stalled.
+PLAN_MAX_GPU_SECONDS = 300.0
 
 
 @dataclass
@@ -82,6 +94,19 @@ def is_storyboard(params: GenerationParams | dict | None) -> bool:
     if isinstance(params, GenerationParams):
         return params.mode is Mode.STORYBOARD or params.shots is not None
     return isinstance(params, dict) and (params.get("mode") == Mode.STORYBOARD.value or params.get("shots") is not None)
+
+
+def is_plan(params: GenerationParams | dict | None) -> bool:
+    """Whether public params (a model or their JSON) describe a plan job: mode `plan`."""
+    if isinstance(params, GenerationParams):
+        return params.mode is Mode.PLAN
+    return isinstance(params, dict) and params.get("mode") == Mode.PLAN.value
+
+
+def is_unverified(params: GenerationParams | dict | None) -> bool:
+    """Whether public params describe a job that carries no step commitment and is never step-audited: a storyboard or a
+    plan (PROTOCOL.md). Such jobs run only on confidential enclaves."""
+    return is_storyboard(params) or is_plan(params)
 
 
 @dataclass
@@ -177,6 +202,7 @@ def _verify_entry(raw: dict, keys: dict[str, EnclaveKey], profiles: dict[str, Mo
     entry = dict(raw, miner_hotkey=key.miner_hotkey)
     fps: int | None = None
     storyboard = False
+    plan = body.plan is not None
     if raw.get("params") is not None:
         # Preferred: the gateway publishes the full public params, which we bind to the signed digest.
         try:
@@ -187,6 +213,9 @@ def _verify_entry(raw: dict, keys: dict[str, EnclaveKey], profiles: dict[str, Mo
             return "params do not match the signed params digest"
         if params.profile_id != body.profile_id:
             return "receipt does not match its ledger entry"
+        if is_plan(params) != plan:
+            # Signed by the enclave for these very params, yet a video for a plan job or a plan for a video job.
+            return "receipt describes a different output than the job's mode"
         # A storyboard bills its stitched length; its VCU sums the shots it rendered (scoring.job_vcu, `vcu_for`).
         requested, fps, storyboard = params.duration_s, params.fps, is_storyboard(params)
     elif isinstance(raw.get("duration_s"), (int, float)):
@@ -195,15 +224,41 @@ def _verify_entry(raw: dict, keys: dict[str, EnclaveKey], profiles: dict[str, Mo
     else:
         return "no public duration for the job"
 
+    entry["credit"] = True
+    entry["content_digest"] = body.content_digest
+    if plan:
+        entry["plan"] = True
+        # No seconds are billed; the flat plan VCU is paid (scoring.job_vcu). `duration_s` is a target, not output.
+        entry["billable_s"] = 0.0
+        problem = plan_receipt_problem(profile, body.plan, body.gpu_seconds)
+        if problem is not None:
+            entry["credit"] = False
+            entry["flag"] = f"job {body.job_id}: {problem}"
+        return entry, receipt
+
     low, high = duration_bounds(profile, requested, fps, storyboard=storyboard)
     entry["billable_s"] = requested
-    entry["credit"] = True
     claimed = body.video.duration_s
     if not low <= claimed <= high:
         entry["credit"] = False
         entry["flag"] = f"job {body.job_id}: receipt reports {claimed:g}s for a {requested:g}s request"
-    entry["content_digest"] = body.content_digest
     return entry, receipt
+
+
+def plan_receipt_problem(profile: ModelProfile, info, gpu_seconds: float) -> str | None:
+    """Why a plan receipt's own numbers can't be credited, or None. The plan itself is sealed to the customer, so only
+    what the receipt states is checked: a shot count and stitched length a plan of this profile can have
+    (kuno_protocol.plans.validate), and `gpu_seconds` in (0, PLAN_MAX_GPU_SECONDS]."""
+    board = profile.limits.storyboard
+    if not (math.isfinite(gpu_seconds) and 0 < gpu_seconds <= PLAN_MAX_GPU_SECONDS):
+        return f"receipt reports {gpu_seconds:g} GPU-seconds for a plan (credited up to {PLAN_MAX_GPU_SECONDS:g})"
+    if board is None or profile.limits.plan is None:
+        return f"receipt reports a plan for {profile.id}, which makes none"
+    if not 2 <= info.shots <= board.max_shots:
+        return f"receipt reports a plan of {info.shots} shots"
+    if not (math.isfinite(info.duration_s) and 0 < info.duration_s <= board.max_total_s + 1e-6):
+        return f"receipt reports a {info.duration_s:g}s plan"
+    return None
 
 
 def _mark_replays(verified: list[tuple[dict, Receipt]], audit: LedgerAudit) -> None:
