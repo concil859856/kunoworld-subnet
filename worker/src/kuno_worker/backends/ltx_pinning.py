@@ -426,29 +426,37 @@ class PinnedRenderer:
 
     # -------------------------------------------------------------- sources, encoded as the pipeline's own tokens
 
-    def encode_video(self, frames: Any, width: int, height: int):
+    def encode_video(self, frames: Any, width: int, height: int, latent_frames_per_chunk: int | None = None):
         """[1, latent frames x h x w, 128] tokens of RGB uint8 frames ([frames, H, W, 3], 8k + 1 of them), in the space
         prepare_latents holds an encoded condition in: the VAE's posterior mode ("argmax"), normalized by the VAE's latent
         statistics without a scaling factor, then packed. Frames of another size are resized to width x height first (the
-        distilled recipe's half-size pass). The pixels are written to the GPU a frame at a time, so the only full-clip
-        tensors there are the VAE's input and what it makes of it (quantized.source_encode_gib counts them)."""
+        distilled recipe's half-size pass).
+
+        The clip is encoded in chunks of whole latent frames (ltx_chunked_encode, which gives the whole-clip encode's
+        latents), and each chunk's pixels are written to the GPU just before it is encoded, so the memory this takes
+        depends on the frame size, not the clip's length (quantized.source_encode_gib). `latent_frames_per_chunk` is for
+        the GPU driver's measurements; None is the worker's chunk size."""
         import torch
         import torch.nn.functional as F
+
+        from .ltx_chunked_encode import CHUNK_LATENT_FRAMES, encode_chunked
 
         pipeline = self.pipeline
         vae = pipeline.vae
         device = pipeline._execution_device  # where offload hooks run the VAE, as the pipeline itself encodes conditions
         dtype = vae.dtype
-        count = len(frames)
-        pixels = torch.empty((1, 3, count, height, width), dtype=dtype, device=device)
-        with torch.no_grad():
-            for index in range(count):
+
+        def pixels(start: int, end: int):
+            chunk = torch.empty((1, 3, end - start, height, width), dtype=dtype, device=device)
+            for index in range(start, end):
                 frame = torch.from_numpy(frames[index]).to(device).permute(2, 0, 1).to(torch.float32)
                 if frame.shape[1:] != (height, width):
                     frame = F.interpolate(frame[None], size=(height, width), mode="bilinear", align_corners=False, antialias=True)[0]
-                pixels[0, :, index] = (frame / 127.5 - 1.0).to(dtype)
-            latent = vae.encode(pixels).latent_dist.mode()
-            del pixels
+                chunk[0, :, index - start] = (frame / 127.5 - 1.0).to(dtype)
+            return chunk
+
+        with torch.no_grad():
+            latent = encode_chunked(vae, pixels, len(frames), latent_frames_per_chunk or CHUNK_LATENT_FRAMES)
             latent = pipeline._normalize_latents(latent, vae.latents_mean, vae.latents_std).to(torch.float32)
             return pipeline._pack_latents(latent, pipeline.transformer_spatial_patch_size, pipeline.transformer_temporal_patch_size)
 

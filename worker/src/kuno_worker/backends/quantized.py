@@ -133,29 +133,44 @@ def latent_tokens(width: int, height: int, num_frames: int) -> int:
     return ((num_frames - 1) // 8 + 1) * (width // 32) * (height // 32)
 
 
-# A retake encodes its source clip on the GPU before denoising (ltx_pinning.PinnedRenderer.encode_video): the clip in the
-# VAE's bf16 (2 bytes a value, written a frame at a time), plus the VAE's own patchified copy of it (another 2). Past those,
-# the encoder's activations mirror the decoder's at the same size and length: its first stage and the decoder's last are
-# both 256 channels at a quarter of the width and height over every frame, the encoder's with fewer layers. Every render
-# decodes its whole clip without tiling on a no-offload card, so the recipe's measured activation line at the clip's
-# tokens already covers that decode, and the encode runs alone, before the transformer. On an RTX PRO 6000 (94.97 GiB) this
-# costs retakes 3 s of the 18 s of 720p a clip gets (15 s: 3.9 GiB of source beside 21.9 GiB of activations), and 1080p
-# 2 s of 8. Unmeasured: the GPU driver (scripts/gpu-test/long_video/run_edit_modes_worker.py) records the encode's own
-# peak against these numbers.
-SOURCE_PIXEL_BYTES = 4
-# What either mode holds besides the pixels: the held latents (a 20 s 1080p clip's 128,520 tokens x 128 features in float32
-# are 62 MiB) and the sound's log-mel through the audio VAE (20 s of stereo at 64 bins and 100 frames a second, 128 channels,
-# tens of MiB). A round margin above both.
-SOURCE_LATENTS_GIB = 0.25
+# Audio-to-video and retake encode the customer's media on the GPU before the render (ltx_edit.render_edit), and hold
+# the tokens through it. Two costs, which never add up:
+#
+#   the encode   a retake's source clip through the video VAE's encoder, in chunks of 8 frames that give the whole-clip
+#                encode's latents (ltx_chunked_encode). It runs before the pipeline is called, and its activations free when
+#                it returns, so its peak is beside the weights alone, not the render's activations: a job peaks at the
+#                larger of the two. The first GPU run showed it: a 5 s 720p retake peaked at 78.26 GiB, which is the
+#                weights' 66.18 plus the (then unchunked) encode's 12.07, above the same clip's 77.22 GiB as text-to-video.
+#   the held     the tokens encoded (a 20 s 1080p clip's 128,520 tokens x 128 features in float32 are 62 MiB) and the
+#                sound's log-mel through the audio VAE (tens of MiB), on the GPU through both. A round margin above both.
+#
+# The encode per source pixel, which the clip's length doesn't change:
+#   measured  (GPU, 2026-09-17, unchunked) 12.07 GiB for 121 frames of 1280x704: 118.9 bytes per pixel per frame.
+#   counted   (CPU, live tensors, LTX-2's encoder layout at its real widths, bf16-sized) unchunked 86.0 bytes per pixel per
+#             frame plus 65, so 10,470 at 121 frames; chunked into 8-frame chunks 1,797 bytes per pixel at any length, of
+#             which 1,044 are the stream's cached frames.
+#   estimate  the GPU measured 1.374x the CPU count unchunked (14,387 against 10,470 bytes per pixel: the allocator's
+#             rounding and cuDNN's workspace are not tensors), so the chunked encode should take 1.374 x 1,797 = 2,469
+#             bytes per pixel there. Admission counts 2,900, 17% more for what the CPU count can't see: 2.43 GiB at
+#             1280x704, 5.64 GiB at 1920x1088 and 7.52 GiB at 2560x1088.
+# Unmeasured: the chunked encode on a GPU, and whether LTX-2.5's encoder has diffusers' default layout (its cached frames
+# grow with its layer count). The GPU driver (scripts/gpu-test/long_video/run_edit_modes_worker.py) records the encode's
+# peak against this at 5 s and near the retake cap, and the loaded encoder's cached activations per pixel against 522.
+SOURCE_ENCODE_BYTES_PER_PIXEL = 2900
+SOURCE_HELD_GIB = 0.25
 
 
-def source_encode_gib(mode: str | None, frames: int, width: int, height: int) -> float:
-    """GPU memory an audio-to-video or retake job needs beyond a render of the same tokens, to encode what it holds."""
+def source_encode_gib(mode: str | None, width: int, height: int) -> float:
+    """GPU memory beside the weights an audio-to-video or retake job's encode peaks at, before its render: a retake's
+    source clip through the chunked video encoder. Audio-to-video's sound is within SOURCE_HELD_GIB."""
     if mode == "retake":
-        return SOURCE_PIXEL_BYTES * 3 * frames * width * height / 2**30 + SOURCE_LATENTS_GIB
-    if mode == "audio_to_video":
-        return SOURCE_LATENTS_GIB
+        return SOURCE_ENCODE_BYTES_PER_PIXEL * width * height / 2**30
     return 0.0
+
+
+def source_held_gib(mode: str | None) -> float:
+    """GPU memory an audio-to-video or retake job holds through both its encode and its render: the encoded tokens."""
+    return SOURCE_HELD_GIB if mode in ("retake", "audio_to_video") else 0.0
 
 
 def _edit_mode(call: dict[str, Any]) -> str | None:
@@ -198,6 +213,9 @@ class MemoryPlan:
     overhead_gib: float
     host_ram_gib: float
     measured: bool = False
+    # The weights on the GPU while a job encodes its source, before the pipeline is called: the render's base without the
+    # activation line's fixed part. None counts the whole base.
+    resident_gib: float | None = None
 
     def estimate_gib(self, tokens: int) -> float:
         return max(self.floor_gib, self.token_base_gib + self.per_token_gib * tokens) + self.overhead_gib
@@ -208,11 +226,20 @@ class MemoryPlan:
         return self.max_tokens_with(0.0)
 
     def max_tokens_with(self, extra_gib: float) -> int:
-        """The largest request that fits with `extra_gib` more in use (source_encode_gib); -1 when nothing fits."""
+        """The largest request that fits with `extra_gib` more in use through the render (source_held_gib); -1 when
+        nothing fits."""
         room = self.usable_gib - self.overhead_gib - extra_gib
         if self.floor_gib > room or self.token_base_gib > room:
             return -1
         return int((room - self.token_base_gib) / self.per_token_gib) if self.per_token_gib > 0 else 1 << 40
+
+    def encode_gib(self, extra_gib: float) -> float:
+        """The peak while a job encodes its source: the resident weights, the encode's `extra_gib` and the overhead."""
+        resident = self.token_base_gib if self.resident_gib is None else self.resident_gib
+        return resident + extra_gib + self.overhead_gib
+
+    def fits_encode(self, extra_gib: float) -> bool:
+        return self.encode_gib(extra_gib) <= self.usable_gib
 
 
 def _plan(recipe: PrecisionRecipe, hardware: HardwareClass, mode: str, usable: float) -> MemoryPlan:
@@ -232,7 +259,7 @@ def _plan(recipe: PrecisionRecipe, hardware: HardwareClass, mode: str, usable: f
     return MemoryPlan(
         recipe_id=recipe.id, hardware_class=hardware.id, offload=mode, usable_gib=usable, floor_gib=floor, token_base_gib=base,
         per_token_gib=memory.activation_gib_per_10k_tokens / 10_000, overhead_gib=memory.overhead_gib, host_ram_gib=host,
-        measured=memory.measured,
+        measured=memory.measured, resident_gib=base - memory.activation_fixed_gib,
     )
 
 
@@ -309,32 +336,30 @@ def plan_for_class(
     return plan_memory(profile, recipe, hardware, host_ram_gib=host_ram_gib, mode=mode)
 
 
-def longest_duration(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int) -> float | None:
+def longest_duration(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int, held_gib: float = 0.0) -> float | None:
     """The longest duration on the profile's grid (min_duration_s + k × duration_step_s, up to its limit at this fps) whose
-    latent tokens fit the plan; None when not even the shortest does. Tokens only grow with duration at a fixed size and
-    frame rate, so every shorter duration fits too."""
+    latent tokens fit the plan with `held_gib` more in use; None when not even the shortest does. Tokens only grow with
+    duration at a fixed size and frame rate, so every shorter duration fits too."""
     lim = profile.limits
     cap = profile_max_duration(profile, fps)
     steps = math.floor((cap - lim.min_duration_s) / lim.duration_step_s + 1e-9)
+    most = plan.max_tokens_with(held_gib)
     for k in range(steps, -1, -1):
         duration = round(lim.min_duration_s + k * lim.duration_step_s, 6)
-        if latent_tokens(width, height, _render_frames(profile, duration, fps)) <= plan.max_tokens:
+        if latent_tokens(width, height, _render_frames(profile, duration, fps)) <= most:
             return duration
     return None
 
 
 def _longest_fitting(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int, edit: str | None = None) -> float | None:
+    """longest_duration for a job of `edit`'s mode: its encode must fit beside the weights, which is the same at every
+    duration, and its render must fit with the held tokens."""
     if edit is None:
         return longest_duration(plan, profile, width, height, fps)
-    lim = profile.limits
-    cap = profile_max_duration(profile, fps)
-    steps = math.floor((cap - lim.min_duration_s) / lim.duration_step_s + 1e-9)
-    for k in range(steps, -1, -1):
-        duration = round(lim.min_duration_s + k * lim.duration_step_s, 6)
-        frames = _render_frames(profile, duration, fps)
-        if latent_tokens(width, height, frames) <= plan.max_tokens_with(source_encode_gib(edit, frames, width, height)):
-            return duration
-    return None
+    held = source_held_gib(edit)
+    if not plan.fits_encode(source_encode_gib(edit, width, height) + held):
+        return None
+    return longest_duration(plan, profile, width, height, fps, held)
 
 
 def envelope_for_plan(plan: MemoryPlan, profile: ModelProfile) -> EnvelopeTable:
@@ -352,19 +377,21 @@ def envelope_for_plan(plan: MemoryPlan, profile: ModelProfile) -> EnvelopeTable:
 
 def admit(plan: MemoryPlan, profile: ModelProfile, call: dict[str, Any], width: int, height: int, fps: int) -> int:
     """Raises CapacityRefused when the request cannot fit; returns its latent tokens otherwise. An audio-to-video or retake
-    call also needs what encoding its source takes (source_encode_gib), so near the top of the serving envelope, which is
-    per size and frame rate, not per mode, one can be refused where a text-to-video job of the same length is not."""
+    call must also fit its source's encode beside the weights (source_encode_gib) and hold its tokens through the render
+    (source_held_gib), so near the top of the serving envelope, which is per size and frame rate, not per mode, one can be
+    refused where a text-to-video job of the same length is not."""
     tokens = call_tokens(call, width, height)
     edit = _edit_mode(call)
-    extra = source_encode_gib(edit, int(call.get("num_frames") or 0), width, height)
-    if tokens <= plan.max_tokens_with(extra):
+    encode, held = source_encode_gib(edit, width, height), source_held_gib(edit)
+    if tokens <= plan.max_tokens_with(held) and plan.fits_encode(encode + held):
         return tokens
     longest = _longest_fitting(plan, profile, width, height, fps, edit)
     what = f"a {edit} job" if edit else "it"
     hint = f"at {width}x{height} and {fps} fps {what} serves up to {longest:g} s" if longest else f"{what} cannot serve {width}x{height} at any duration"
-    source = f" and {extra:.1f} GiB to encode its source" if extra else ""
+    need = max(plan.estimate_gib(tokens), plan.encode_gib(encode) if edit else 0.0) + held
+    source = f" and {encode:.1f} GiB to encode its source" if encode else ""
     raise CapacityRefused(
-        f"{plan.hardware_class} cannot fit this request ({tokens} latent tokens{source}): about {plan.estimate_gib(tokens) + extra:.1f} GiB "
+        f"{plan.hardware_class} cannot fit this request ({tokens} latent tokens{source}): about {need:.1f} GiB "
         f"with {plan.offload} offload, {plan.usable_gib:.1f} GiB usable ({'measured' if plan.measured else 'estimated'}); {hint}"
     )
 

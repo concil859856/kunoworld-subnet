@@ -1,8 +1,8 @@
 """Audio-to-video and retake through diffusers' real LTX-2 classes with tiny random weights (backends/ltx_edit.py on
-ltx_pinning.PinnedRenderer): the held tokens are what the pipeline itself would hold, they never move, the transformer sees
-them at timestep 0, and the job returns the source's own sound wherever it is held. The pictures are noise; the shapes,
-hooks, passes and lengths are the real code's. Skips where torch and diffusers are not installed; runs in the LTX worker
-image:
+ltx_pinning.PinnedRenderer): the held tokens are what the pipeline itself would hold, a source clip encoded in chunks gives
+the whole clip's latents (ltx_chunked_encode.py), held tokens never move, the transformer sees them at timestep 0, and the
+job returns the source's own sound wherever it is held. The pictures are noise; the shapes, hooks, passes and lengths are
+the real code's. Skips where torch and diffusers are not installed; runs in the LTX worker image:
 
     S=/video/.venv/lib/python3.12/site-packages; docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e USER=kuno \\
       -v /video/subnet:/src:ro $(for m in pytest _pytest pluggy iniconfig py.py; do printf -- '-v %s/%s:/pt/%s:ro ' "$S" "$m" "$m"; done) \\
@@ -27,7 +27,7 @@ from kuno_worker.backends.base import GenerationTask, InputFile
 from kuno_worker.backends.ltx_edit import EditError, decode_audio, fit_samples, render_edit
 from kuno_worker.backends.ltx_pinning import Pins, Rendered
 from kuno_worker.backends.ltx_resident import LtxResidentBackend, build_call
-from kuno_worker.backends.media_tools import ffmpeg_exe
+from kuno_worker.backends.media_tools import BackendError, ffmpeg_exe
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("diffusers")
@@ -136,6 +136,112 @@ def test_a_sound_track_encodes_to_the_latents_the_pipeline_would_normalize_and_p
     latents = pipeline.audio_vae.encode(mel).latent_dist.mode()[:, :, :51]
     expected = pipeline.prepare_audio_latents(latents=latents, noise_scale=0.0, dtype=torch.float32, device=torch.device("cpu"))
     assert torch.equal(tokens, expected)
+
+
+# ---------------------------------------------------------------- a source clip, encoded in chunks
+
+
+def clip_and_whole(vae, frames: int, height: int, width: int, seed: int = 3):
+    generator = torch.Generator("cpu").manual_seed(seed)
+    clip = torch.rand(1, 3, frames, height, width, generator=generator) * 2 - 1
+    with torch.no_grad():
+        return clip, vae.encode(clip).latent_dist.mode()
+
+
+def close_to(chunked, whole) -> bool:
+    """Within 1e-4 of the latents' spread: convolutions over a shorter input sum in another order (ltx_chunked_encode)."""
+    return chunked.shape == whole.shape and float((chunked - whole).abs().max()) <= 1e-4 * float(whole.std())
+
+
+def ltx2_layout_vae():
+    """diffusers' LTX-2 encoder layout (layers (4, 6, 6, 2, 2); spatial, temporal, spatiotemporal, spatiotemporal
+    downsampling) at a tenth of its widths, and a tiny decoder."""
+    from diffusers import AutoencoderKLLTX2Video
+
+    torch.manual_seed(1)
+    return AutoencoderKLLTX2Video(block_out_channels=(16, 32, 64, 128), decoder_block_out_channels=(8, 16, 32), decoder_layers_per_block=(1, 1, 1, 1)).eval()
+
+
+def test_a_clip_encoded_in_chunks_gives_the_whole_clip_latents(pipelines):
+    from kuno_worker.backends.ltx_chunked_encode import encode_chunked, streaming
+
+    for vae, frames, height, width in ((pipelines["condition"].vae, 49, HEIGHT, WIDTH), (ltx2_layout_vae(), 65, 128, 192)):
+        clip, whole = clip_and_whole(vae, frames, height, width)
+        # One chunk through the streamed layers is diffusers' own encoder output to the bit.
+        with torch.no_grad():
+            reference = vae.encoder(clip)
+            with streaming(vae.encoder) as encode:
+                assert torch.equal(encode(clip), reference)
+        for chunk in (1, 2, 5):
+            assert close_to(encode_chunked(vae, lambda start, end: clip[:, :, start:end], frames, chunk), whole)
+
+
+def test_the_chunks_are_whole_latent_frames_and_pixels_arrive_a_chunk_at_a_time(pipelines):
+    from kuno_worker.backends.ltx_chunked_encode import encode_chunked
+
+    vae = pipelines["condition"].vae
+    clip, whole = clip_and_whole(vae, 49, HEIGHT, WIDTH)
+    asked = []
+
+    def pixels(start, end):
+        asked.append((start, end))
+        return clip[:, :, start:end]
+
+    assert close_to(encode_chunked(vae, pixels, 49, 2), whole)
+    assert asked == [(0, 1), (1, 17), (17, 33), (33, 49)]
+
+
+def test_a_chunked_encode_runs_the_vae_offload_hook_and_restores_its_layers(pipelines):
+    from kuno_worker.backends.ltx_chunked_encode import encode_chunked, streaming
+
+    vae = pipelines["condition"].vae
+    clip, _ = clip_and_whole(vae, 17, HEIGHT, WIDTH)
+    hooked = []
+    vae._hf_hook = type("Hook", (), {"pre_forward": lambda self, module: hooked.append(module)})()
+    try:
+        encode_chunked(vae, lambda start, end: clip[:, :, start:end], 17)
+    finally:
+        del vae._hf_hook
+    assert hooked == [vae]  # model offload moves the VAE to the GPU here, as it does for vae.encode
+    with pytest.raises(RuntimeError, match="stop"), streaming(vae.encoder):
+        raise RuntimeError("stop")
+    assert not [module for module in vae.encoder.modules() if "forward" in module.__dict__]
+    # A layer something else already wraps is refused, and the layers streamed before it are put back.
+    last = vae.encoder.conv_out
+    last.forward = last.forward
+    try:
+        with pytest.raises(BackendError, match="hooked"), streaming(vae.encoder):
+            pass
+        assert [module for module in vae.encoder.modules() if "forward" in module.__dict__] == [last]
+    finally:
+        del last.forward
+
+
+def test_the_renderer_encodes_a_source_clip_as_the_whole_clip_encode_would(pipelines):
+    renderer = TinyPinnedRenderer(pipelines)
+    pipeline, vae = renderer.pipeline, renderer.pipeline.vae
+    frames = np.random.default_rng(4).integers(0, 256, size=(49, HEIGHT, WIDTH, 3), dtype=np.uint8)
+    for width, height in ((WIDTH, HEIGHT), (WIDTH // 2, HEIGHT // 2)):  # both passes of the distilled recipe
+        pixels = torch.from_numpy(frames).permute(3, 0, 1, 2)[None].to(torch.float32)
+        if (width, height) != (WIDTH, HEIGHT):
+            pixels = torch.nn.functional.interpolate(pixels[0].transpose(0, 1), size=(height, width), mode="bilinear", align_corners=False,
+                                                     antialias=True).transpose(0, 1)[None]
+        with torch.no_grad():
+            latent = vae.encode(pixels / 127.5 - 1.0).latent_dist.mode()
+            expected = pipeline._pack_latents(pipeline._normalize_latents(latent, vae.latents_mean, vae.latents_std), 1, 1)
+        tokens = renderer.encode_video(frames, width, height)
+        assert tokens.shape == expected.shape == (1, 7 * (height // 32) * (width // 32), 128) and close_to(tokens, expected)
+
+
+def test_the_stream_keeps_what_ltx2s_encoder_layout_needs_between_chunks():
+    from diffusers.models.autoencoders.autoencoder_kl_ltx2 import LTX2VideoEncoder3d
+
+    from kuno_worker.backends.ltx_chunked_encode import encoder_cache_values
+
+    with torch.device("meta"):
+        encoder = LTX2VideoEncoder3d()  # diffusers' defaults: LTX-2's layout at its real widths
+    # Two frames at every causal convolution, per source pixel; quantized.SOURCE_ENCODE_BYTES_PER_PIXEL counts them.
+    assert encoder_cache_values(encoder) == 522
 
 
 # ---------------------------------------------------------------- audio-to-video

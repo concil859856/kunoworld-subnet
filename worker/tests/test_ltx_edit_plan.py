@@ -10,6 +10,7 @@ import random
 import subprocess
 import uuid
 import wave
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +35,7 @@ from kuno_worker.backends.ltx_edit import (
 from kuno_worker.backends.ltx_pinning import Geometry
 from kuno_worker.backends.ltx_resident import LtxResidentBackend, build_call
 from kuno_worker.backends.media_tools import BackendError, CapacityRefused, _write_wav, ffmpeg_exe
-from kuno_worker.backends.quantized import MemoryPlan, admit, latent_tokens, source_encode_gib
+from kuno_worker.backends.quantized import MemoryPlan, admit, latent_tokens, source_encode_gib, source_held_gib
 
 PROFILES = load_profiles()
 FAST, PRO = PROFILES["ltx-2.5-fast"], PROFILES["ltx-2.5-pro"]
@@ -282,28 +283,75 @@ def plan_with(max_tokens: int) -> MemoryPlan:
     )
 
 
-def test_encoding_a_retake_source_counts_against_memory(tmp_path):
-    # The clip in bf16 and the VAE's patchified copy of it: 4 bytes a value, 3 values a pixel, for every frame.
-    assert source_encode_gib("retake", 121, 1280, 704) == pytest.approx(4 * 3 * 121 * 1280 * 704 / 2**30 + 0.25)
-    assert source_encode_gib("audio_to_video", 121, 1280, 704) == 0.25 and source_encode_gib(None, 121, 1280, 704) == 0.0
+def text_call(duration_s: float) -> dict:
+    return build_call(GenerationTask(
+        job_id="j", profile=FAST, params=GenerationParams(profile_id=FAST.id, mode=Mode.TEXT_TO_VIDEO, duration_s=duration_s, resolution="720p",
+                                                          aspect_ratio="16:9", fps=24), prompt="p", negative_prompt=None, seed=1, width=1280, height=704,
+    ))
 
+
+def test_a_retake_source_encodes_in_memory_set_by_its_frame_size_not_its_length():
+    # The chunked encode: 2,900 bytes per source pixel beside the weights, whatever the clip's length; audio-to-video's
+    # sound fits in the held tokens' margin, which both modes keep through the render.
+    assert source_encode_gib("retake", 1280, 704) == pytest.approx(2900 * 1280 * 704 / 2**30) == pytest.approx(2.43, abs=0.005)
+    assert source_encode_gib("retake", 1920, 1088) == pytest.approx(5.64, abs=0.005)
+    assert source_encode_gib("audio_to_video", 1280, 704) == 0.0 and source_encode_gib(None, 1280, 704) == 0.0
+    assert source_held_gib("retake") == source_held_gib("audio_to_video") == 0.25 and source_held_gib(None) == 0.0
+
+
+def test_a_retake_holds_its_tokens_through_the_render(tmp_path):
     roles = [InputRole.SOURCE_VIDEO]
     tokens = latent_tokens(1280, 704, 121)
     plan = plan_with(tokens)
-    text = GenerationTask(
-        job_id="j", profile=FAST, params=GenerationParams(profile_id=FAST.id, mode=Mode.TEXT_TO_VIDEO, duration_s=5, resolution="720p",
-                                                          aspect_ratio="16:9", fps=24), prompt="p", negative_prompt=None, seed=1, width=1280, height=704,
-    )
-    assert admit(plan, FAST, build_call(text), 1280, 704, 24) == tokens  # a clip of this length fits exactly
-    edit = edit_task(FAST, Mode.RETAKE, tmp_path, roles=roles, duration_s=5.0)
+    assert admit(plan, FAST, text_call(5), 1280, 704, 24) == tokens  # a clip of this length fits exactly
     with pytest.raises(CapacityRefused) as refused:
-        admit(plan, FAST, build_call(edit), 1280, 704, 24)
+        admit(plan, FAST, build_call(edit_task(FAST, Mode.RETAKE, tmp_path, roles=roles, duration_s=5.0)), 1280, 704, 24)
+    # The held tokens' 0.25 GiB costs 543 of the 5 s clip's 14,080 tokens; 4 s needs 11,440.
     message = str(refused.value)
-    # 5 s encodes 1.5 GiB of source, which costs a 5 s clip 3,300 of its 14,080 tokens; 3 s needs 1.0 GiB and 8,800 tokens.
-    assert "1.5 GiB to encode its source" in message and "a retake job serves up to 3 s" in message
-    assert admit(plan, FAST, build_call(edit_task(FAST, Mode.RETAKE, tmp_path, roles=roles, duration_s=3.0)), 1280, 704, 24)
-    with pytest.raises(CapacityRefused):
-        admit(plan, FAST, build_call(edit_task(FAST, Mode.RETAKE, tmp_path, roles=roles, duration_s=4.0)), 1280, 704, 24)
+    assert "2.4 GiB to encode its source" in message and "a retake job serves up to 4 s" in message
+    assert admit(plan, FAST, build_call(edit_task(FAST, Mode.RETAKE, tmp_path, roles=roles, duration_s=4.0)), 1280, 704, 24)
+
+
+def test_the_encode_peaks_beside_the_weights_not_beside_the_render(tmp_path):
+    # The encode runs and frees before the pipeline is called, so a job needs the larger of the two peaks, not their sum:
+    # here the render leaves no room for the encode's 2.43 GiB, and the retake still fits.
+    retake = build_call(edit_task(FAST, Mode.RETAKE, tmp_path, roles=[InputRole.SOURCE_VIDEO], duration_s=5.0))
+    tokens = latent_tokens(1280, 704, 121)
+    plan = plan_with(tokens + 544)
+    assert plan.usable_gib - plan.estimate_gib(tokens) - 0.25 < source_encode_gib("retake", 1280, 704)
+    assert admit(plan, FAST, retake, 1280, 704, 24) == tokens
+    # With 2.5 GiB free beside the resident weights, the 2.43 GiB encode and 0.25 GiB of held tokens don't fit at any length.
+    crowded = replace(plan, resident_gib=plan.usable_gib - plan.overhead_gib - 2.5)
+    assert admit(crowded, FAST, text_call(5), 1280, 704, 24) == tokens
+    with pytest.raises(CapacityRefused, match=r"2\.4 GiB to encode its source\): about 17\.9 GiB .* a retake job cannot serve 1280x704 at any duration"):
+        admit(crowded, FAST, build_call(edit_task(FAST, Mode.RETAKE, tmp_path, roles=[InputRole.SOURCE_VIDEO], duration_s=2.0)), 1280, 704, 24)
+
+
+def test_a_card_plans_the_encode_beside_the_weights_a_render_keeps(tmp_path):
+    # On an RTX PRO 6000 without offload the enhancer waits in host RAM: 66.18 GiB of weights, 1.5 GiB of overhead.
+    backend = LtxResidentBackend(None, tmp_path, loader=lambda profile: None, hardware_class="C1.rtx-pro-6000-bw-se.x1", host_ram_gib=512, device_gib=94.97)
+    plan = backend.memory_plan(FAST)
+    assert plan.offload == "none" and plan.resident_gib == pytest.approx(66.18)
+    assert plan.encode_gib(source_encode_gib("retake", 1920, 1088)) == pytest.approx(66.18 + 5.64 + 1.5, abs=0.01)
+    # Retakes serve what text-to-video does at 720p (18 s at 24 fps; 15 s when the encode was counted whole and beside the
+    # render), and 7 s of 1080p's 8, where the measured line leaves 0.01 GiB.
+    from kuno_worker.backends.quantized import _longest_fitting, longest_duration
+
+    assert longest_duration(plan, FAST, 1280, 704, 24) == _longest_fitting(plan, FAST, 1280, 704, 24, "retake") == 18
+    assert (longest_duration(plan, FAST, 1920, 1088, 24), _longest_fitting(plan, FAST, 1920, 1088, 24, "retake")) == (8, 7)
+
+
+def test_a_source_clip_encodes_in_chunks_of_whole_latent_frames():
+    from kuno_worker.backends.ltx_chunked_encode import CHUNK_LATENT_FRAMES, chunk_bounds
+
+    # Frame 0 is latent frame 0 alone; every later chunk is whole latent frames of 8, so every chunk folds evenly at each of
+    # the encoder's 2x temporal downsamplings. The last chunk ends with the clip.
+    assert CHUNK_LATENT_FRAMES == 1 and chunk_bounds(25, 8) == [(0, 1), (1, 9), (9, 17), (17, 25)]
+    assert chunk_bounds(49, 8, 2) == [(0, 1), (1, 17), (17, 33), (33, 49)] and chunk_bounds(41, 8, 3) == [(0, 1), (1, 25), (25, 41)]
+    assert chunk_bounds(1, 8) == [(0, 1)]
+    for frames in (0, 24, 120):
+        with pytest.raises(BackendError, match="needs 1 \\+ 8k frames"):
+            chunk_bounds(frames, 8)
 
 
 def test_a_card_that_fits_every_clip_still_admits_retakes_by_memory(tmp_path, monkeypatch):
@@ -323,8 +371,8 @@ def test_a_card_that_fits_every_clip_still_admits_retakes_by_memory(tmp_path, mo
         return task
 
     text, retake_job = job(Mode.TEXT_TO_VIDEO, []), job(Mode.RETAKE, [InputRole.SOURCE_VIDEO])
-    backend.admit(retake_job, build_call(retake_job))  # 130 GiB for the tokens and 12 GiB for the source: it fits
-    monkeypatch.setattr(quantized, "SOURCE_PIXEL_BYTES", 400)
+    backend.admit(retake_job, build_call(retake_job))  # 130 GiB for the tokens, and 5.6 GiB beside the weights to encode the source
+    monkeypatch.setattr(quantized, "SOURCE_ENCODE_BYTES_PER_PIXEL", 290_000)
     backend.admit(text, build_call(text))
     with pytest.raises(CapacityRefused, match="to encode its source"):
         backend.admit(retake_job, build_call(retake_job))
