@@ -18,6 +18,8 @@ from typing import Any, Callable, Iterator
 
 from kuno_protocol.profiles import ModelProfile
 
+from .media_tools import BackendError
+
 log = logging.getLogger("kuno.worker.runtimes")
 
 
@@ -26,6 +28,13 @@ def _load_image(path: str):
 
     with Image.open(path) as handle:
         return handle.convert("RGB").copy()
+
+
+def video_conditions(conditions: list[dict[str, Any]]) -> list[Any]:
+    """`build_call`'s image conditions as diffusers' LTX2VideoCondition, each image loaded from its path."""
+    from diffusers.pipelines.ltx2 import LTX2VideoCondition
+
+    return [LTX2VideoCondition(frames=_load_image(c["path"]), index=c["index"], strength=c["strength"]) for c in conditions]
 
 
 def _audio_rate(pipeline: Any, result: Any) -> int:
@@ -53,10 +62,16 @@ class LtxAdapter:
     `offload` is the load plan's mode. Without offload the enhancer waits in host RAM (quantized._apply_offload) and
     `enhancer` brings it to the GPU for one piece of text; with offload, diffusers' hooks place it."""
 
-    def __init__(self, pipelines: dict[str, Any], device: str = "cuda", offload: str = "none"):
+    def __init__(
+        self, pipelines: dict[str, Any], device: str = "cuda", offload: str = "none", renderer: Callable[[dict[str, Any], str], Any] | None = None,
+    ):
+        """`renderer(pipelines, device)` builds what audio-to-video and retake render through (ltx_pinning.PinnedRenderer by
+        default); the CPU tests pass one with a stand-in text encoder."""
         self.pipelines = pipelines
         self.device = device
         self.offload = offload
+        self._renderer_factory = renderer
+        self._renderer: Any = None
 
     @contextmanager
     def enhancer(self, pipeline: Any | None = None) -> Iterator[tuple[Any, Any]]:
@@ -99,10 +114,34 @@ class LtxAdapter:
             generated = sequences[0, prompt_tokens:]
             return tokenizer.decode(generated, skip_special_tokens=True), int(generated.shape[0])
 
+    def pinned_renderer(self) -> Any:
+        """The renderer audio-to-video and retake hold the customer's media through, built once on these pipelines."""
+        if self._renderer is None:
+            if self._renderer_factory is not None:
+                self._renderer = self._renderer_factory(self.pipelines, self.device)
+            else:
+                from .ltx_pinning import PinnedRenderer
+
+                self._renderer = PinnedRenderer(self.pipelines, self.device)
+        return self._renderer
+
     def __call__(self, **call: Any) -> dict[str, Any]:
+        kind = call["pipeline"]
+        if kind == "dfr":
+            # build_call's DFR keys (spatial_upscalings, temporal_upscalings) are the ltx-pipelines CLI's: diffusers 0.40 has no
+            # LTX-2.5 DFR pipeline, and its LTX2Pipeline would raise TypeError on them after the GPU work began.
+            raise BackendError("the diffusers runtime has no LTX-2.5 DFR pipeline; ltx-2.5-4k renders on the cold ltx-pipelines backend")
+        edit = call.pop("edit", None)
+        if edit is not None:
+            if call.get("kuno_trajectory_tap") is not None:
+                raise BackendError("audio-to-video and retake carry no step commitment (LtxResidentBackend.step_recorder)")
+            from .ltx_edit import render_edit
+
+            return render_edit(self.pinned_renderer(), call, edit)
+
         import torch
 
-        kind = call.pop("pipeline")
+        call.pop("pipeline")
         pipeline = self.pipelines.get(kind) or self.pipelines["text"]
         tap = call.pop("kuno_trajectory_tap", None)
         # Verified mode draws noise on the CPU, so every GPU of a hardware class starts from identical latents.
@@ -110,15 +149,7 @@ class LtxAdapter:
 
         conditions = call.pop("conditions", None)
         if conditions:
-            from diffusers.pipelines.ltx2 import LTX2VideoCondition
-
-            call["conditions"] = [
-                LTX2VideoCondition(frames=_load_image(c["path"]), index=c["index"], strength=c["strength"])
-                for c in conditions
-            ]
-        for key in ("video_path", "audio_path"):
-            if key in call:
-                call[key] = str(call[key])
+            call["conditions"] = video_conditions(conditions)
         call.pop("generate_audio", None)  # these pipelines always produce their audio track
         second_stage = call.pop("second_stage_sigmas", None)
         upsample = self.pipelines.get("upsample")
@@ -174,6 +205,7 @@ class LtxAdapter:
     def unload(self) -> None:
         import torch
 
+        self._renderer = None  # it shares the pipelines' modules
         self.pipelines.clear()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

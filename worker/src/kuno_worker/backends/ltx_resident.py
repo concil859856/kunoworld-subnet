@@ -10,6 +10,8 @@ The loader itself (runtimes.py) is the only part that needs hardware to verify.
 
 from __future__ import annotations
 
+import logging
+import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,6 +23,8 @@ from ..verified import RetentionStore, context_bytes
 from .base import Backend, GenerationTask, PlanText, ProgressFn, VideoResult
 from .media_tools import BackendError, encode_video
 from .resident import ModelStore, PipelineResult
+
+log = logging.getLogger("kuno.worker.ltx")
 
 # The distilled transformer is trained for these sigmas; passing a step count instead
 # silently degrades quality (LTX documents this explicitly). They equal diffusers'
@@ -34,14 +38,20 @@ DISTILLED_GUIDANCE = {
     "modality_scale": 1.0, "audio_modality_scale": 1.0,
 }
 FULL_STEPS = 30
+# The keys of a `build_call` output that are the worker's, not diffusers': runtimes.LtxAdapter and
+# ltx_pinning.PinnedRenderer consume them. Every other key must be a keyword the diffusers pipeline's __call__ accepts
+# (tests/test_ltx_diffusers_signatures.py checks every call build_call can make against diffusers 0.40's signatures).
+WORKER_KEYS = ("pipeline", "seed", "conditions", "generate_audio", "second_stage_sigmas", "kuno_trajectory_tap", "edit")
+# Modes that hold tokens encoded from the customer's own media while the rest is generated (backends/ltx_edit.py).
+EDIT_MODES = (Mode.AUDIO_TO_VIDEO, Mode.RETAKE)
 
 
 def pipeline_kind(profile: ModelProfile, mode: Mode) -> str:
-    """Which diffusers pipeline class the loader should hand us."""
-    if mode is Mode.RETAKE:
+    """Which diffusers pipeline class the loader should hand us. Audio-to-video and retake render through the condition
+    pipeline's pinning subclass (ltx_pinning.LTX2PinnedPipeline): no diffusers LTX-2 pipeline takes a sound track or a
+    source clip to keep."""
+    if mode in EDIT_MODES:
         return "condition"
-    if mode is Mode.AUDIO_TO_VIDEO:
-        return "audio"
     if profile.variant == "dfr":
         return "dfr"
     if mode in (Mode.IMAGE_TO_VIDEO, Mode.LAST_FRAME, Mode.FIRST_LAST_FRAME, Mode.KEYFRAMES):
@@ -49,8 +59,34 @@ def pipeline_kind(profile: ModelProfile, mode: Mode) -> str:
     return "text"
 
 
+def _seconds(value: Any, what: str) -> float | None:
+    """A time from the sealed options: None, or a finite number of seconds. Options are the customer's JSON, so anything
+    else fails the job with the option's name, never its value."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise BackendError(f"{what} must be a number of seconds")
+    return float(value)
+
+
+def _flag(options: dict[str, Any], key: str, default: bool) -> bool:
+    value = options.get(key, default)
+    if not isinstance(value, bool):
+        raise BackendError(f"options.{key} must be true or false")
+    return value
+
+
 def build_call(task: GenerationTask) -> dict[str, Any]:
-    """The keyword arguments for one generation. Paths, not loaded media: the loader reads them."""
+    """The keyword arguments for one generation. Paths, not loaded media: the loader reads them.
+
+    Audio-to-video and retake carry `edit`, what ltx_edit.render_edit holds from the customer's media:
+      audio_to_video  {"mode", "audio_path", "start_s", "end_s"}: the sound from the source_audio input's start_s (0 by
+                      default) to its end_s (the clip's end by default), held under the whole render
+      retake          {"mode", "video_path", "start_s", "end_s", "regenerate_video", "regenerate_audio"}: the source_video
+                      clip from its first frame, regenerated in [start_s, end_s) (options.retake's, else the input's; the
+                      whole clip by default); `regenerate_video` (default true) and `regenerate_audio` (default: whether
+                      the job has audio) come from the options, and a modality not regenerated is held entirely
+    Both render `num_frames` from `duration_s`, like every other mode, so the receipt's length is the job's."""
     profile, params = task.profile, task.params
     distilled = profile.variant != "pro"
     frames = ltx_num_frames(params.duration_s, params.fps)
@@ -100,18 +136,21 @@ def build_call(task: GenerationTask) -> dict[str, Any]:
         elif role is InputRole.KEYFRAME:
             index = min(max(round((item.ref.time_s or 0.0) * call["frame_rate"]), 0), last_index)
         elif role is InputRole.SOURCE_VIDEO:
-            window = task.options.get("retake", {})
-            call["video_path"] = item.path
-            call["start_time"] = float(window.get("start_s", item.ref.start_s or 0.0))
-            call["end_time"] = float(window.get("end_s", item.ref.end_s or params.duration_s))
-            call["regenerate_video"] = bool(task.options.get("regenerate_video", True))
-            call["regenerate_audio"] = bool(task.options.get("regenerate_audio", params.audio))
+            window = task.options.get("retake")
+            if window is None:
+                window = {}
+            if not isinstance(window, dict):
+                raise BackendError("options.retake must be an object with start_s and end_s")
+            start = _seconds(window["start_s"], "options.retake.start_s") if "start_s" in window else item.ref.start_s
+            end = _seconds(window["end_s"], "options.retake.end_s") if "end_s" in window else item.ref.end_s
+            call["edit"] = {
+                "mode": Mode.RETAKE.value, "video_path": item.path, "start_s": start or 0.0, "end_s": end,
+                "regenerate_video": _flag(task.options, "regenerate_video", True),
+                "regenerate_audio": _flag(task.options, "regenerate_audio", params.audio),
+            }
             continue
         elif role is InputRole.SOURCE_AUDIO:
-            call["audio_path"] = item.path
-            call["audio_start_time"] = float(item.ref.start_s or 0.0)
-            call["audio_max_duration"] = params.duration_s
-            call.pop("num_frames", None)  # mutually exclusive with audio_max_duration
+            call["edit"] = {"mode": Mode.AUDIO_TO_VIDEO.value, "audio_path": item.path, "start_s": item.ref.start_s or 0.0, "end_s": item.ref.end_s}
             continue
         else:
             continue
@@ -146,8 +185,9 @@ class LtxResidentBackend(Backend):
         """`hardware_class` turns on verified mode for profiles that pin it (see VERIFIED_MODE.md) and picks
         the weights precision (backends/quantized.py); `model_digest` is the weights identity from the
         owner-signed manifest. `offload` is auto | none | model | group. `storyboard_renderer(loaded, profile)` replaces
-        the one storyboards render through (ltx_storyboard.ExtendRenderer on the loaded pipelines) in tests. `device_gib`
-        replaces reading the GPU's memory (quantized.probe_device) for the memory plan."""
+        the one storyboards render through (ltx_storyboard.ExtendRenderer on the loaded pipelines) in tests; audio-to-video
+        and retake render through the loaded runtime's own (runtimes.LtxAdapter.pinned_renderer). `device_gib` replaces
+        reading the GPU's memory (quantized.probe_device) for the memory plan."""
         if loader is None:
             if models_dir is None:
                 raise ValueError("KUNO_LTX_MODELS_DIR must point at the LTX-2.5 weights")
@@ -202,12 +242,36 @@ class LtxResidentBackend(Backend):
         return envelope_for_plan(plan, profile)
 
     def admit(self, task: GenerationTask, call: dict[str, Any]) -> None:
-        """Refuses, before any GPU work, a request larger than this class's memory plan allows."""
+        """Refuses, before any GPU work, a request larger than this class's memory plan allows. Audio-to-video and retake
+        also encode the customer's media on the GPU first (quantized.source_encode_gib), so on a card whose plan holds every
+        clip the profile allows, they are checked against the whole-GPU plan that `memory_plan` leaves out."""
         plan = self.memory_plan(task.profile)
+        if plan is None and call.get("edit") is not None:
+            plan = self._edit_plan(task.profile)
         if plan is not None:
             from .quantized import admit
 
             admit(plan, task.profile, call, task.width, task.height, task.params.fps)
+
+    def _edit_plan(self, profile: ModelProfile):
+        key = f"{profile.id}#edit"
+        if key not in self._plans:
+            from .quantized import host_memory_gib, plan_for_class
+
+            ram = host_memory_gib() if self.host_ram_gib is None else self.host_ram_gib
+            self._plans[key] = plan_for_class(
+                profile, self.hardware_class, host_ram_gib=ram, mode=self.offload, device_gib=self._device_gib(), keep_covering=True,
+            )
+        return self._plans[key]
+
+    def step_recorder(self, task: GenerationTask, context: bytes = b""):
+        """None for audio-to-video and retake, as for storyboards: no step commitment on any class. Their held tokens are
+        encoded from the customer's own media, which the transcript's conditioning digest (the prompt embeddings) doesn't
+        describe and a validator can't replay: validators step-audit only their text-to-video canaries and Standard jobs
+        without inputs (kuno_validator.audits.standard_record), so a commitment here would never be opened."""
+        if task.params.mode in EDIT_MODES:
+            return None
+        return super().step_recorder(task, context)
 
     def _pin(self, profile: ModelProfile) -> None:
         """Determinism must be pinned before weights touch the GPU (cuBLAS reads its workspace config once)."""
@@ -305,6 +369,13 @@ class LtxResidentBackend(Backend):
                 if recorder is not None:
                     recorder.abort()
                 raise
+            edit = raw.get("edit") if isinstance(raw, dict) else None
+            if isinstance(edit, dict):  # counts and timings only
+                log.info(
+                    "%s: held %d of %d latent frames and %d of %d audio latents, pins exact %s, %s",
+                    edit.get("mode"), edit.get("held_latent_frames", 0), edit.get("latent_frames", 0), edit.get("held_audio_latents", 0),
+                    edit.get("audio_latents", 0), edit.get("pins_exact"), edit.get("timings"),
+                )
             result = PipelineResult.from_pipeline(raw)
             if not len(result.frames):
                 raise BackendError("pipeline returned no frames")

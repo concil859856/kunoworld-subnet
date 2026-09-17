@@ -11,26 +11,18 @@ ComfyUI-JoyLTX25 (MIT):
 The held head is trimmed from the shot's decoded frames and samples before it joins the stitched video. The latents
 never leave the process, so a storyboard can't be assembled from separate jobs.
 
-How the pin is held, from diffusers 0.40 (pipelines/ltx2/pipeline_ltx2_condition.py, transformer_ltx2.py):
-  video  LTX2ConditionPipeline's native conditioning. prepare_latents returns a per-token conditioning_mask; the loop
-         passes the transformer `timestep * (1 - mask)`, so masked tokens are clean context at t = 0, and blends
-         x0 = denoised * (1 - mask) + clean * mask, so their Euler step is exactly zero. It is how the pipeline holds an
-         image-to-video first frame; LTX2ExtendPipeline puts an earlier shot's tokens there instead of encoded pixels.
-  audio  no pipeline has an audio mask, but the transformer accepts `audio_timestep` per token. A forward pre-hook makes
-         it `t * (1 - audio_mask)`, prepare_audio_latents writes the tail, and since nothing blends the audio x0, the
-         `audio_scheduler` (a PinnedScheduler) writes the pinned tokens back after every step.
-  both   PinnedScheduler keeps each pass's final tokens: the pipeline's own normalized, packed space, so nothing is
-         decoded, re-encoded or re-normalized between shots. The distilled recipe's two passes (half size, x2 latent
-         upsampler, refine; runtimes.LtxAdapter._two_stage) are each pinned from the same pass of the earlier shot, so
-         the refine can't redraw the join.
+How the pin is held is ltx_pinning.py's, shared with audio-to-video and retake: video through LTX2ConditionPipeline's
+native conditioning mask, audio through a per-token audio timestep and a scheduler that writes the held tokens back after
+every step. The tails are each pass's final scheduler tokens, the pipeline's own normalized, packed space, so nothing is
+decoded, re-encoded or re-normalized between shots. The distilled recipe's two passes (half size, x2 latent upsampler,
+refine; runtimes.LtxAdapter._two_stage) are each pinned from the same pass of the earlier shot, so the refine can't redraw
+the join.
 
-Geometry, read from the loaded pipeline (these are LTX-2.5's): the video VAE is causal, 8x in time and 32x in space, so
-n latent frames decode to 1 + 8(n - 1) frames. Audio is 16 kHz mel at hop 160, 4x in time (25 latents a second); the
-audio VAE is causal too (n latents decode to 4n - 3 mel frames), and the vocoder gives 480 samples per mel frame at
-48 kHz.
+Geometry (ltx_pinning.Geometry), read from the loaded pipeline: n latent frames decode to 1 + 8(n - 1) frames; audio is 25
+latents a second, n latents decode to 4n - 3 mel frames, and the vocoder gives 480 samples per mel frame at 48 kHz.
 
-Plain data first (Geometry, Timeline, assemble_audio, StitchWriter, render_storyboard: no torch), then the torch parts,
-imported only when a real storyboard renders.
+Plain data first (Timeline, assemble_audio, StitchWriter, render_storyboard: no torch), then the torch parts, imported
+only when a real storyboard renders.
 
 Status: the experiment this is ported from rendered a seamless 35.375 s take from 8 x 5 s shots on an RTX PRO 6000
 (dev repo, research/long-video_ltx-av-extend_2026-09-16.md). This module has run on the CPU only, against diffusers'
@@ -45,9 +37,25 @@ import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from .base import ProgressFn
+
+# Storyboards pinned first: their tests and doubles import the shared pinning names from here, hence the re-exports.
+from .ltx_pinning import (
+    Geometry,
+    PinnedRenderer,
+    Pins,
+    Rendered,
+    Renderer,
+    all_exact,  # noqa: F401
+    audio_array,  # noqa: F401
+    clean_head,  # noqa: F401
+    head_matches,  # noqa: F401
+    pin_failure,
+    pinned_classes,
+    pinned_timesteps,  # noqa: F401
+)
 from .media_tools import BackendError, _write_wav, ffmpeg_exe
 
 log = logging.getLogger("kuno.worker.storyboard")
@@ -65,64 +73,6 @@ SHOTS_FROM, SHOTS_TO = 0.05, 0.85
 
 class StoryboardError(BackendError):
     """A storyboard can't be planned or rendered as asked. Messages carry counts only, never request content."""
-
-
-# ------------------------------------------------------------------ geometry (plain data)
-
-
-@dataclass(frozen=True)
-class Geometry:
-    """Where latents sit in time. The defaults are LTX-2.5's; `from_pipeline` reads a loaded pipeline."""
-
-    fps: float = 24.0
-    temporal_ratio: int = 8  # video VAE: frames per latent frame after the first (the first latent frame is one frame)
-    spatial_ratio: int = 32
-    mel_sample_rate: int = 16000
-    mel_hop: int = 160
-    audio_ratio: int = 4  # audio VAE: mel frames per latent after the first
-    sample_rate: int = 48000  # the vocoder's output
-
-    @classmethod
-    def from_pipeline(cls, pipeline: Any, fps: float) -> Geometry:
-        config = getattr(getattr(pipeline, "vocoder", None), "config", None)
-        return cls(
-            fps=float(fps),
-            temporal_ratio=int(pipeline.vae_temporal_compression_ratio),
-            spatial_ratio=int(pipeline.vae_spatial_compression_ratio),
-            mel_sample_rate=int(pipeline.audio_sampling_rate),
-            mel_hop=int(pipeline.audio_hop_length),
-            audio_ratio=int(pipeline.audio_vae_temporal_compression_ratio),
-            sample_rate=int(getattr(config, "output_sampling_rate", None) or 48000),
-        )
-
-    @property
-    def audio_latents_per_second(self) -> float:
-        return self.mel_sample_rate / self.mel_hop / float(self.audio_ratio)
-
-    @property
-    def samples_per_mel(self) -> Fraction:
-        return Fraction(self.mel_hop * self.sample_rate, self.mel_sample_rate)
-
-    @property
-    def samples_per_frame(self) -> Fraction:
-        return Fraction(self.sample_rate) / Fraction(self.fps).limit_denominator(1001)
-
-    def latent_frames(self, frames: int) -> int:
-        return (frames - 1) // self.temporal_ratio + 1
-
-    def pixel_frames(self, latent_frames: int) -> int:
-        """Frames `latent_frames` decode to when they start a clip: the causal first one is a single frame."""
-        return 1 + self.temporal_ratio * (latent_frames - 1) if latent_frames > 0 else 0
-
-    def audio_latents(self, frames: int) -> int:
-        # The pipelines' own arithmetic, float then round, so the count is always theirs.
-        return round(frames / float(self.fps) * self.audio_latents_per_second)
-
-    def mel_frames(self, audio_latents: int) -> int:
-        return self.audio_ratio * audio_latents - (self.audio_ratio - 1) if audio_latents > 0 else 0
-
-    def audio_samples(self, audio_latents: int) -> int:
-        return round(self.mel_frames(audio_latents) * self.samples_per_mel)
 
 
 # ------------------------------------------------------------------ the join plan (plain data)
@@ -332,31 +282,7 @@ def assemble_audio(joins: list[Join], audios: list, total_samples: int, fade_sam
     return out
 
 
-def audio_array(audio: Any):
-    """(channels, samples) float32 from what a pipeline returns: diffusers' vocoder gives a bfloat16 tensor on the GPU."""
-    import numpy as np
-
-    if hasattr(audio, "detach"):
-        audio = audio.detach().to("cpu").float().numpy()
-    array = np.asarray(audio, dtype=np.float32)
-    while array.ndim > 2:
-        array = array[0]
-    if array.ndim == 1:
-        array = array[None]
-    if array.shape[0] > array.shape[1]:
-        array = array.T
-    return np.ascontiguousarray(array)
-
-
 # ------------------------------------------------------------------ pins and tails
-
-
-@dataclass
-class Pins:
-    """Tokens held at the head of one pass: [1, tokens, features], in the pipeline's normalized, packed space."""
-
-    video: Any = None
-    audio: Any = None
 
 
 @dataclass
@@ -372,26 +298,6 @@ def pins_for(join: Join, tails: dict[int, dict[str, Tail]], stage: str) -> Pins:
     video = tails[join.video_source][stage].video if join.video_pin else None
     audio = tails[join.audio_source][stage].audio[:, -join.audio_pin :] if join.audio_pin else None
     return Pins(video=video, audio=audio)
-
-
-@dataclass
-class Rendered:
-    frames: Any  # the shot's frames in order: PIL images or HxWx3 uint8 arrays
-    audio: Any  # (channels, samples) float32
-    sample_rate: int
-    tails: dict[str, Tail]  # per pass
-    pins_exact: dict[str, bool | None]  # per pass: the pinned tokens came out of denoising bit-identical
-    # per pass and modality: the transformer's first call saw the pinned head at timestep 0 and the rest above it
-    seen_clean: dict[str, dict[str, bool | None]]
-    timings: dict[str, float] = field(default_factory=dict)
-
-
-class Renderer(Protocol):
-    def geometry(self, fps: float) -> Geometry: ...
-
-    def stages(self, call: dict[str, Any]) -> tuple[str, ...]: ...
-
-    def render(self, call: dict[str, Any], pins: dict[str, Pins]) -> Rendered: ...
 
 
 # ------------------------------------------------------------------ the stitched video
@@ -508,27 +414,14 @@ def render_storyboard(
 
 
 def _check_pins(index: int, stages: tuple[str, ...], pins: dict[str, Pins], rendered: Rendered) -> None:
-    """A join whose pinned tokens moved, or that the model didn't see as clean context, can show at the seam. It means the
-    runtime changed under this module (a diffusers upgrade), so the job fails rather than deliver it."""
-    for stage in stages:
-        pin = pins[stage]
-        if (pin.video is not None or pin.audio is not None) and rendered.pins_exact.get(stage) is not True:
-            raise StoryboardError(f"shot {index + 1}: the pinned {stage}-pass tokens changed during denoising")
-        for modality, head in (("video", pin.video), ("audio", pin.audio)):
-            if head is not None and (rendered.seen_clean.get(stage) or {}).get(modality) is not True:
-                raise StoryboardError(f"shot {index + 1}: the model was not shown the pinned {modality} head at timestep 0 in the {stage} pass")
+    """A join whose pinned tokens moved, or that the model didn't see as clean context, can show at the seam
+    (ltx_pinning.pin_failure): the job fails rather than deliver it."""
+    failure = pin_failure(stages, pins, rendered)
+    if failure is not None:
+        raise StoryboardError(f"shot {index + 1}: {failure}")
 
 
 # ------------------------------------------------------------------ torch
-
-
-def pinned_timesteps(timestep: Any, tokens: int, head: int):
-    """Per-token timesteps for one modality: 0 on the pinned head, so the transformer reads it as clean context."""
-    import torch
-
-    mask = torch.zeros(tokens, device=timestep.device, dtype=timestep.dtype)
-    mask[:head] = 1
-    return timestep.reshape(-1, 1) * (1 - mask)[None]
 
 
 def take_tail(video_tokens: Any, audio_tokens: Any, latent_frames: int, tokens_per_frame: int, overlap: int) -> Tail:
@@ -542,193 +435,21 @@ def take_tail(video_tokens: Any, audio_tokens: Any, latent_frames: int, tokens_p
     return Tail(video=video, audio=audio_tokens.detach().to("cpu", copy=True))
 
 
-def head_matches(tokens: Any, head: Any) -> bool | None:
-    import torch
-
-    if head is None:
-        return None
-    return bool(torch.equal(tokens[:, : head.shape[1]].to("cpu"), head.to("cpu", tokens.dtype)))
+extend_classes = pinned_classes  # PinnedScheduler and the pinning pipeline, by their storyboard-era name
 
 
-def clean_head(timestep: Any, head: Any) -> bool | None:
-    """Whether per-token timesteps show the transformer the pinned head at t = 0 and everything after it as noise."""
-    if head is None:
-        return None
-    if timestep is None or timestep.ndim != 2:
-        return False
-    n = head.shape[1]
-    return bool((timestep[:, :n] == 0).all()) and bool((timestep[:, n:] > 0).all())
-
-
-def all_exact(*checks: bool | None) -> bool | None:
-    present = [c for c in checks if c is not None]
-    return all(present) if present else None
-
-
-_EXTEND_CLASSES: tuple | None = None
-
-
-def extend_classes() -> tuple:
-    """PinnedScheduler and LTX2ExtendPipeline, defined on first use so the plain-data parts import without diffusers."""
-    global _EXTEND_CLASSES
-    if _EXTEND_CLASSES is not None:
-        return _EXTEND_CLASSES
-    from diffusers import FlowMatchEulerDiscreteScheduler, LTX2ConditionPipeline
-    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteSchedulerOutput
-
-    class PinnedScheduler(FlowMatchEulerDiscreteScheduler):
-        """The Euler step, then the pinned head written back exactly. Keeps the pass's final tokens in `final`."""
-
-        pin = None
-        final = None
-
-        def start(self, pin: Any) -> None:
-            self.pin, self.final = pin, None
-
-        def step(self, model_output, timestep, sample, *args, return_dict: bool = True, **kwargs):
-            prev = super().step(model_output, timestep, sample, *args, return_dict=False, **kwargs)[0]
-            if self.pin is not None:
-                prev[:, : self.pin.shape[1]] = self.pin.to(prev.device, prev.dtype)
-            if self.step_index is not None and self.step_index >= len(self.timesteps):
-                self.final = prev.detach().clone()
-            return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev) if return_dict else (prev,)
-
-    class LTX2ExtendPipeline(LTX2ConditionPipeline):
-        """LTX2ConditionPipeline with `pins` written at the head, where it would put an encoded first frame."""
-
-        pins: Pins | None = None
-
-        def prepare_latents(self, *args, **kwargs):
-            latents, mask, clean, keyframe_coords = super().prepare_latents(*args, **kwargs)
-            head = getattr(self.pins, "video", None)
-            if head is not None:
-                n = head.shape[1]
-                head = head.to(latents.device, latents.dtype)
-                # mask 1: the loop's timestep * (1 - mask) shows these to the transformer at t = 0, and its x0 blend keeps
-                # them, so the Euler step moves them by exactly nothing.
-                latents[:, :n] = head
-                clean[:, :n] = head
-                mask[:, :n] = 1.0
-            return latents, mask, clean, keyframe_coords
-
-        def prepare_audio_latents(self, *args, **kwargs):
-            latents = super().prepare_audio_latents(*args, **kwargs)
-            head = getattr(self.pins, "audio", None)
-            if head is not None:
-                latents[:, : head.shape[1]] = head.to(latents.device, latents.dtype)
-            return latents
-
-    _EXTEND_CLASSES = (PinnedScheduler, LTX2ExtendPipeline)
-    return _EXTEND_CLASSES
-
-
-def _clock(cuda: bool) -> float:
-    if cuda:
-        import torch
-
-        torch.cuda.synchronize()
-    return time.perf_counter()
-
-
-class ExtendRenderer:
-    """One shot at a time on the pipelines the worker's loader built (runtimes.ltx_loader), through an LTX2ExtendPipeline
-    that shares their loaded modules: no second copy of the weights."""
+class ExtendRenderer(PinnedRenderer):
+    """One shot at a time on the pipelines the worker's loader built (ltx_pinning.PinnedRenderer), keeping each pass's tail
+    for the shots after it: the last `overlap` video latent frames and all of the audio, on the CPU."""
 
     def __init__(self, pipelines: dict[str, Any], device: str, overlap: int):
-        Scheduler, Pipeline = extend_classes()
-        source = pipelines.get("condition") or pipelines["text"]
-        components = dict(source.components)
-        # Its own schedulers, so the pins never touch the pipelines other jobs use. from_config keeps the recipe's schedule
-        # (build_ltx_pipelines gives the full model dynamic shifting).
-        components["scheduler"] = Scheduler.from_config(source.scheduler.config)
-        components["audio_scheduler"] = Scheduler.from_config(source.scheduler.config)
-        self.pipeline = Pipeline(**components)
-        self.upsample = pipelines.get("upsample")
-        self.device = device
+        super().__init__(pipelines, device)
         self.overlap = overlap
 
-    def geometry(self, fps: float) -> Geometry:
-        return Geometry.from_pipeline(self.pipeline, fps)
-
-    def stages(self, call: dict[str, Any]) -> tuple[str, ...]:
-        return ("half", "full") if call.get("second_stage_sigmas") and self.upsample is not None else ("full",)
-
-    def prepare_call(self, call: dict[str, Any]) -> dict[str, Any]:
-        """The pipeline's keyword arguments; the CPU tests replace the text encoder here."""
-        return call
-
-    def render(self, call: dict[str, Any], pins: dict[str, Pins]) -> Rendered:
-        import torch
-
-        from .resident import PipelineResult
-        from .runtimes import _audio_rate
-
-        call = dict(call)
-        for key in ("pipeline", "kuno_trajectory_tap", "conditions", "generate_audio"):  # as runtimes.LtxAdapter does
-            call.pop(key, None)
-        generator = torch.Generator(device=self.device).manual_seed(int(call.pop("seed")))
-        second = call.pop("second_stage_sigmas", None)
-        call = self.prepare_call(call)
-        cuda = str(self.device).startswith("cuda") and torch.cuda.is_available()
-        record: dict[str, dict] = {"timings": {}, "tails": {}, "exact": {}, "seen": {}}
-        width, height = call.pop("width"), call.pop("height")
-        if second and self.upsample is not None:
-            # runtimes.LtxAdapter._two_stage, with the pins held in both passes.
-            latents, audio_latents = self._pass(
-                "half", call, pins, generator, record, cuda, width=width // 2, height=height // 2, output_type="latent", return_dict=False,
-            )
-            started = _clock(cuda)
-            upsampled = self.upsample(latents=latents, output_type="latent", return_dict=False)[0]
-            record["timings"]["upsample_s"] = round(_clock(cuda) - started, 3)
-            result = self._pass(
-                "full", {**call, "sigmas": second}, pins, generator, record, cuda, width=width, height=height,
-                latents=upsampled, audio_latents=audio_latents, noise_scale=second[0],
-            )
-        else:
-            result = self._pass("full", call, pins, generator, record, cuda, width=width, height=height)
-        normalized = PipelineResult.from_pipeline(
-            {"videos": result.frames, "audio": result.audio, "sampling_rate": _audio_rate(self.pipeline, result)}
-        )
-        audio = None if normalized.audio is None else audio_array(normalized.audio)
-        return Rendered(normalized.frames, audio, normalized.sample_rate, record["tails"], record["exact"], record["seen"], record["timings"])
-
-    def _pass(self, stage: str, call: dict[str, Any], pins: dict[str, Pins], generator: Any, record: dict, cuda: bool, **extra) -> Any:
+    def finished_pass(self, stage: str, video: Any, audio: Any, call: dict[str, Any], extra: dict[str, Any], record: dict) -> None:
         pipeline = self.pipeline
-        pin = pins.get(stage) or Pins()
-        pin = Pins(*(None if t is None else t.to(self.device) for t in (pin.video, pin.audio)))  # once, not every step
-        pipeline.pins = pin
-        pipeline.scheduler.start(pin.video)
-        pipeline.audio_scheduler.start(pin.audio)
-        seen: dict[str, bool | None] = {}
-
-        def timesteps(module, args, kwargs):
-            audio_t, audio_tokens = kwargs.get("audio_timestep"), kwargs.get("audio_hidden_states")
-            if pin.audio is not None and audio_t is not None and audio_t.ndim == 1 and audio_tokens is not None:
-                # One timestep per batch row becomes one per audio token, 0 on the pinned head. audio_sigma (prompt AdaLN,
-                # cross-modal modulation) stays per row, as it does for video.
-                kwargs["audio_timestep"] = audio_t = pinned_timesteps(audio_t, audio_tokens.shape[1], pin.audio.shape[1])
-            if not seen:  # the pass's first transformer call: what the model is actually shown
-                seen.update(video=clean_head(kwargs.get("timestep"), pin.video), audio=clean_head(audio_t, pin.audio))
-            return args, kwargs
-
-        hook = pipeline.transformer.register_forward_pre_hook(timesteps, with_kwargs=True)
-        started = _clock(cuda)
-        try:
-            output = pipeline(generator=generator, **call, **extra)
-            video, audio = pipeline.scheduler.final, pipeline.audio_scheduler.final
-        finally:
-            hook.remove()
-            pipeline.pins = None
-            pipeline.scheduler.start(None)
-            pipeline.audio_scheduler.start(None)
-        record["timings"][f"{stage}_s"] = round(_clock(cuda) - started, 3)
-        if video is None or audio is None:
-            raise StoryboardError(f"the {stage} pass finished without a final scheduler step")
-        record["seen"][stage] = seen
-        record["exact"][stage] = all_exact(head_matches(video, pin.video), head_matches(audio, pin.audio))
         p = int(pipeline.transformer_spatial_patch_size)
         ratio = pipeline.vae_spatial_compression_ratio
         tokens_per_frame = (extra["height"] // ratio // p) * (extra["width"] // ratio // p)
         latent_frames = (call["num_frames"] - 1) // pipeline.vae_temporal_compression_ratio + 1
         record["tails"][stage] = take_tail(video, audio, latent_frames, tokens_per_frame, self.overlap)
-        return output

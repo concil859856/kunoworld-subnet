@@ -261,6 +261,36 @@ time out. Standard mode (`POST /v1/standard/plans`) is specified in the design n
 **Rollout.** Protocol, then validators (plan receipts have no `video`), then workers (they advertise `plan/1`), then
 gateways (route by the feature, learn `plan_failed`), then SDKs and the studio.
 
+## Edits: retake and audio-to-video
+
+Two LTX-2.5 modes render around media the customer supplies. The worker holds part of the model's latents fixed for the
+whole render (the storyboard pinning mechanism) and regenerates the rest. The output is always
+`num_frames(params.duration_s, fps)` frames, the length validators credit; the source is fitted to it.
+
+**`retake`** (`ltx-2.5-fast`, `ltx-2.5-pro`): one `source_video` input.
+- **Window:** `[start_s, end_s)` on the input ref, overridden by sealed `options.retake: {start_s, end_s}`.
+- **Regenerated span:** every video latent frame and audio latent whose time overlaps the window, so the span rounds
+  outward. Video latent frame 0 is pixel frame 0, and latent frame k covers pixel frames 8k−7 to 8k. Audio latent j
+  covers mel frames 4j−3 to 4j, at 10 ms each.
+- **Options:** sealed `regenerate_video` and `regenerate_audio` (default true, audio only when `params.audio`). When
+  one is false, every token of that kind is held.
+- **Refused:** both options false, an empty window, a window starting after the clip, or a clip more than 8 frames
+  short of the output.
+- **Source fitting:** the clip is decoded from its first frame at the job's fps, scaled to cover the job's size and
+  centre-cropped. The last frame is repeated when up to 8 frames are missing.
+- **Output sound:** the source's samples outside the regenerated span and the render's inside it, with a 20 ms crossfade
+  inside the span. A source without sound keeps the render's.
+- **Output picture:** frames outside the span are decoded from the held latents, so they are close to the source but
+  not bit-identical.
+
+**`audio_to_video`** (`ltx-2.5-pro`): one `source_audio` input, optionally a `first_frame`.
+- **Source:** read from the input's `start_s` to its `end_s` or the end of the file, at 48 kHz stereo, and padded with
+  silence to the output length.
+- **Model input:** every audio token is held in every pass; the picture is generated to match.
+- **Output sound:** the source's own samples, not a VAE round trip.
+
+Neither mode carries a step commitment on any class, like storyboards. Validators don't replay jobs with inputs.
+
 ## Blobs (inputs and output video)
 
 ```

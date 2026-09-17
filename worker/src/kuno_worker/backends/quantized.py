@@ -133,6 +133,36 @@ def latent_tokens(width: int, height: int, num_frames: int) -> int:
     return ((num_frames - 1) // 8 + 1) * (width // 32) * (height // 32)
 
 
+# A retake encodes its source clip on the GPU before denoising (ltx_pinning.PinnedRenderer.encode_video): the clip in the
+# VAE's bf16 (2 bytes a value, written a frame at a time), plus the VAE's own patchified copy of it (another 2). Past those,
+# the encoder's activations mirror the decoder's at the same size and length: its first stage and the decoder's last are
+# both 256 channels at a quarter of the width and height over every frame, the encoder's with fewer layers. Every render
+# decodes its whole clip without tiling on a no-offload card, so the recipe's measured activation line at the clip's
+# tokens already covers that decode, and the encode runs alone, before the transformer. On an RTX PRO 6000 (94.97 GiB) this
+# costs retakes 3 s of the 18 s of 720p a clip gets (15 s: 3.9 GiB of source beside 21.9 GiB of activations), and 1080p
+# 2 s of 8. Unmeasured: the GPU driver (scripts/gpu-test/long_video/run_edit_modes_worker.py) records the encode's own
+# peak against these numbers.
+SOURCE_PIXEL_BYTES = 4
+# What either mode holds besides the pixels: the held latents (a 20 s 1080p clip's 128,520 tokens x 128 features in float32
+# are 62 MiB) and the sound's log-mel through the audio VAE (20 s of stereo at 64 bins and 100 frames a second, 128 channels,
+# tens of MiB). A round margin above both.
+SOURCE_LATENTS_GIB = 0.25
+
+
+def source_encode_gib(mode: str | None, frames: int, width: int, height: int) -> float:
+    """GPU memory an audio-to-video or retake job needs beyond a render of the same tokens, to encode what it holds."""
+    if mode == "retake":
+        return SOURCE_PIXEL_BYTES * 3 * frames * width * height / 2**30 + SOURCE_LATENTS_GIB
+    if mode == "audio_to_video":
+        return SOURCE_LATENTS_GIB
+    return 0.0
+
+
+def _edit_mode(call: dict[str, Any]) -> str | None:
+    edit = call.get("edit")
+    return edit.get("mode") if isinstance(edit, dict) else None
+
+
 def _render_frames(profile: ModelProfile, duration_s: float, fps: int) -> int:
     """Frames the transformer renders (DFR renders 48/50 fps requests at half rate, as build_call does)."""
     if profile.variant == "dfr" and fps >= 48:
@@ -142,7 +172,7 @@ def _render_frames(profile: ModelProfile, duration_s: float, fps: int) -> int:
 
 def call_tokens(call: dict[str, Any], width: int, height: int) -> int:
     frames = call.get("num_frames")
-    if frames is None:  # audio-to-video: the clip length follows the audio
+    if frames is None:  # a call shaped for the ltx-pipelines CLI's audio-to-video; build_call always sets num_frames now
         frames = ltx_num_frames(float(call.get("audio_max_duration", 0)), round(float(call["frame_rate"])))
     return latent_tokens(width, height, int(frames))
 
@@ -175,7 +205,11 @@ class MemoryPlan:
     @property
     def max_tokens(self) -> int:
         """The largest request this plan fits; -1 when nothing fits."""
-        room = self.usable_gib - self.overhead_gib
+        return self.max_tokens_with(0.0)
+
+    def max_tokens_with(self, extra_gib: float) -> int:
+        """The largest request that fits with `extra_gib` more in use (source_encode_gib); -1 when nothing fits."""
+        room = self.usable_gib - self.overhead_gib - extra_gib
         if self.floor_gib > room or self.token_base_gib > room:
             return -1
         return int((room - self.token_base_gib) / self.per_token_gib) if self.per_token_gib > 0 else 1 << 40
@@ -243,9 +277,11 @@ def host_memory_gib() -> float | None:
 
 def plan_for_class(
     profile: ModelProfile, hardware_class: str | None, *, host_ram_gib: float | None, mode: str = "auto", device_gib: float | None = None,
+    keep_covering: bool = False,
 ) -> MemoryPlan | None:
     """The plan admission uses, or None: nothing to plan against (neither the class nor a device reading gives the VRAM),
-    or, with `auto`, a card that fits every request of the profile with every component on the GPU.
+    or, with `auto`, a card that fits every request of the profile with every component on the GPU. `keep_covering`
+    returns that card's plan instead of None, for the jobs that need memory beyond their tokens (source_encode_gib).
 
     `device_gib` is the GPU's own total (probe_device): it plans the classes that declare no VRAM (the confidential ones)
     and a worker with no class, and caps a class's figure, since a "96 GB" card reports 94.97 GiB.
@@ -267,7 +303,7 @@ def plan_for_class(
         whole = _plan(recipe, hardware, "none", vram - VRAM_RESERVE_GIB)
         low, high = profile_token_range(profile)
         if whole.max_tokens >= high:
-            return None
+            return whole if keep_covering else None
         if whole.max_tokens >= low:
             return whole
     return plan_memory(profile, recipe, hardware, host_ram_gib=host_ram_gib, mode=mode)
@@ -287,8 +323,18 @@ def longest_duration(plan: MemoryPlan, profile: ModelProfile, width: int, height
     return None
 
 
-def _longest_fitting(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int) -> float | None:
-    return longest_duration(plan, profile, width, height, fps)
+def _longest_fitting(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int, edit: str | None = None) -> float | None:
+    if edit is None:
+        return longest_duration(plan, profile, width, height, fps)
+    lim = profile.limits
+    cap = profile_max_duration(profile, fps)
+    steps = math.floor((cap - lim.min_duration_s) / lim.duration_step_s + 1e-9)
+    for k in range(steps, -1, -1):
+        duration = round(lim.min_duration_s + k * lim.duration_step_s, 6)
+        frames = _render_frames(profile, duration, fps)
+        if latent_tokens(width, height, frames) <= plan.max_tokens_with(source_encode_gib(edit, frames, width, height)):
+            return duration
+    return None
 
 
 def envelope_for_plan(plan: MemoryPlan, profile: ModelProfile) -> EnvelopeTable:
@@ -305,15 +351,21 @@ def envelope_for_plan(plan: MemoryPlan, profile: ModelProfile) -> EnvelopeTable:
 
 
 def admit(plan: MemoryPlan, profile: ModelProfile, call: dict[str, Any], width: int, height: int, fps: int) -> int:
-    """Raises CapacityRefused when the request cannot fit; returns its latent tokens otherwise."""
+    """Raises CapacityRefused when the request cannot fit; returns its latent tokens otherwise. An audio-to-video or retake
+    call also needs what encoding its source takes (source_encode_gib), so near the top of the serving envelope, which is
+    per size and frame rate, not per mode, one can be refused where a text-to-video job of the same length is not."""
     tokens = call_tokens(call, width, height)
-    if tokens <= plan.max_tokens:
+    edit = _edit_mode(call)
+    extra = source_encode_gib(edit, int(call.get("num_frames") or 0), width, height)
+    if tokens <= plan.max_tokens_with(extra):
         return tokens
-    longest = _longest_fitting(plan, profile, width, height, fps)
-    hint = f"at {width}x{height} and {fps} fps it serves up to {longest:g} s" if longest else f"it cannot serve {width}x{height} at any duration"
+    longest = _longest_fitting(plan, profile, width, height, fps, edit)
+    what = f"a {edit} job" if edit else "it"
+    hint = f"at {width}x{height} and {fps} fps {what} serves up to {longest:g} s" if longest else f"{what} cannot serve {width}x{height} at any duration"
+    source = f" and {extra:.1f} GiB to encode its source" if extra else ""
     raise CapacityRefused(
-        f"{plan.hardware_class} cannot fit this request ({tokens} latent tokens): about {plan.estimate_gib(tokens):.1f} GiB with "
-        f"{plan.offload} offload, {plan.usable_gib:.1f} GiB usable ({'measured' if plan.measured else 'estimated'}); {hint}"
+        f"{plan.hardware_class} cannot fit this request ({tokens} latent tokens{source}): about {plan.estimate_gib(tokens) + extra:.1f} GiB "
+        f"with {plan.offload} offload, {plan.usable_gib:.1f} GiB usable ({'measured' if plan.measured else 'estimated'}); {hint}"
     )
 
 

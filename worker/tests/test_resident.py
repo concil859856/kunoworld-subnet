@@ -226,12 +226,19 @@ def test_frames_and_keyframes_become_conditions(tmp_path):
 
 
 def test_retake_and_audio_to_video_calls(tmp_path):
+    # No diffusers LTX-2 pipeline takes video_path, start_time, audio_path or audio_max_duration: both modes render through
+    # the pinned condition pipeline (backends/ltx_edit.py), and what they hold travels in `edit`, which diffusers never sees.
     retake = ltx_call(task_for("ltx-2.5-fast", Mode.RETAKE, tmp_path, options={"retake": {"start_s": 1, "end_s": 3}}))
-    assert (retake["start_time"], retake["end_time"]) == (1.0, 3.0) and retake["video_path"]
+    assert retake["pipeline"] == "condition" and retake["num_frames"] == 49
+    assert retake["edit"] == {
+        "mode": "retake", "video_path": retake["edit"]["video_path"], "start_s": 1.0, "end_s": 3.0, "regenerate_video": True, "regenerate_audio": True,
+    }
+    assert retake["edit"]["video_path"] and not {"video_path", "start_time", "end_time", "regenerate_video"} & set(retake)
 
     a2v = ltx_call(task_for("ltx-2.5-pro", Mode.AUDIO_TO_VIDEO, tmp_path, duration_s=6))
-    assert a2v["audio_path"] and a2v["audio_max_duration"] == 6
-    assert "num_frames" not in a2v  # the CLI rejects both together
+    assert a2v["pipeline"] == "condition" and a2v["edit"]["mode"] == "audio_to_video" and a2v["edit"]["audio_path"]
+    assert a2v["num_frames"] == 145  # always set: without it LTX-2.5's pipelines predict a duration of their own
+    assert not {"audio_path", "audio_start_time", "audio_max_duration"} & set(a2v)
 
 
 def test_4k_renders_at_half_rate_then_interpolates(tmp_path):

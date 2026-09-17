@@ -6,6 +6,8 @@
                 is shown: proves the tail, pin, trim and stitch arithmetic end to end.
   TinyRenderer  ExtendRenderer on diffusers' real LTX-2 classes with tiny random weights: proves the integration with
                 diffusers (hooks, shapes, both passes, the real audio VAE and vocoder), not the pictures.
+  TinyPinnedRenderer  the same for audio-to-video and retake (ltx_pinning.PinnedRenderer), on tiny_pipelines with an audio
+                VAE that downsamples 4x like LTX-2.5's, so sound encodes to the latents the transformer takes.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from kuno_worker.backends.ltx_pinning import PinnedRenderer
 from kuno_worker.backends.ltx_storyboard import (
     ExtendRenderer,
     Geometry,
@@ -229,10 +232,14 @@ class FakeRenderer:
         return np.stack([wave, wave]), sample_clock
 
 
-def tiny_pipelines(seed: int = 0) -> dict[str, Any]:
+def tiny_pipelines(seed: int = 0, audio_ch_mult: tuple[int, ...] = (1,)) -> dict[str, Any]:
     """LTX2ConditionPipeline and the latent upsampler with tiny random weights, LTX-2.5's geometry (32x/8x video VAE, 16 kHz
     mel at hop 160, 4x audio VAE, 48 kHz vocoder with bandwidth extension) and 128-feature tokens for both modalities. No
-    text encoder: TinyRenderer passes prompt embeddings."""
+    text encoder: TinyRenderer passes prompt embeddings.
+
+    The default audio VAE has one resolution: its decoder crops and pads to LTX-2.5's 4n - 3 mel frames, but its encoder
+    doesn't downsample, which a storyboard never needs. Audio-to-video and retake encode sound, so their tests pass
+    `audio_ch_mult=(1, 1, 1)`: two 2x downsamples, as LTX-2.5's encoder has, keeping 128 channels for the latent statistics."""
     import torch
     from diffusers import (
         AutoencoderKLLTX2Audio,
@@ -253,7 +260,7 @@ def tiny_pipelines(seed: int = 0) -> dict[str, Any]:
         layers_per_block=(1, 1, 1, 1, 1), decoder_layers_per_block=(1, 1, 1, 1), patch_size=4, patch_size_t=1,
         spatial_compression_ratio=32, temporal_compression_ratio=8,
     )
-    audio_vae = AutoencoderKLLTX2Audio(base_channels=128, ch_mult=(1,), num_res_blocks=1, latent_channels=8, mel_bins=64)
+    audio_vae = AutoencoderKLLTX2Audio(base_channels=128, ch_mult=audio_ch_mult, num_res_blocks=1, latent_channels=8, mel_bins=64)
     # Non-trivial normalization, so a token taken or written in the wrong space would show.
     for module in (vae, audio_vae):
         module.latents_mean.copy_(torch.randn_like(module.latents_mean) * 0.1)
@@ -305,3 +312,14 @@ class TinyRenderer(ExtendRenderer):
             call["negative_prompt_embeds"] = torch.zeros(shape)
             call["negative_prompt_attention_mask"] = torch.ones(1, self.text_tokens, dtype=torch.long)
         return call
+
+
+class TinyPinnedRenderer(PinnedRenderer):
+    """PinnedRenderer on tiny_pipelines(audio_ch_mult=(1, 1, 1)), on the CPU, with TinyRenderer's stand-in text encoder."""
+
+    text_channels, text_layers, text_tokens = TinyRenderer.text_channels, TinyRenderer.text_layers, TinyRenderer.text_tokens
+    prepare_call = TinyRenderer.prepare_call
+
+    def __init__(self, pipelines: dict[str, Any], device: str = "cpu"):
+        super().__init__(pipelines, device="cpu")
+        self.pipeline.set_progress_bar_config(disable=True)
