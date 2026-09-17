@@ -41,19 +41,20 @@ FULL_STEPS = 30
 # The keys of a `build_call` output that are the worker's, not diffusers': runtimes.LtxAdapter and
 # ltx_pinning.PinnedRenderer consume them. Every other key must be a keyword the diffusers pipeline's __call__ accepts
 # (tests/test_ltx_diffusers_signatures.py checks every call build_call can make against diffusers 0.40's signatures).
-WORKER_KEYS = ("pipeline", "seed", "conditions", "generate_audio", "second_stage_sigmas", "kuno_trajectory_tap", "edit")
+WORKER_KEYS = ("pipeline", "seed", "conditions", "generate_audio", "second_stage_sigmas", "kuno_trajectory_tap", "edit", "video_decoder")
 # Modes that hold tokens encoded from the customer's own media while the rest is generated (backends/ltx_edit.py).
 EDIT_MODES = (Mode.AUDIO_TO_VIDEO, Mode.RETAKE)
+# `video_decoder` of a call whose latents LTX-2.5's diffusion decoder turns into frames (ltx-2.5-4k): the loaded
+# LTX2VideoDiffusionDecodePipeline, not the video VAE the pipeline would decode with (runtimes.LtxAdapter._diffusion_decode).
+DIFFUSION_DECODER = "diffusion"
 
 
 def pipeline_kind(profile: ModelProfile, mode: Mode) -> str:
     """Which diffusers pipeline class the loader should hand us. Audio-to-video and retake render through the condition
     pipeline's pinning subclass (ltx_pinning.LTX2PinnedPipeline): no diffusers LTX-2 pipeline takes a sound track or a
-    source clip to keep."""
+    source clip to keep. ltx-2.5-4k renders through the same classes as ltx-2.5-fast; only its decoder differs."""
     if mode in EDIT_MODES:
         return "condition"
-    if profile.variant == "dfr":
-        return "dfr"
     if mode in (Mode.IMAGE_TO_VIDEO, Mode.LAST_FRAME, Mode.FIRST_LAST_FRAME, Mode.KEYFRAMES):
         return "condition"
     return "text"
@@ -118,12 +119,11 @@ def build_call(task: GenerationTask) -> dict[str, Any]:
         if task.negative_prompt:
             call["negative_prompt"] = task.negative_prompt
     if profile.variant == "dfr":
-        call["spatial_upscalings"] = 1
-        call["temporal_upscalings"] = 1 if params.fps >= 48 else 0
-        if call["temporal_upscalings"]:
-            # Rendered at half rate, then interpolated to the requested playback rate.
-            call["frame_rate"] = params.fps / 2
-            call["num_frames"] = ltx_num_frames(params.duration_s, params.fps // 2)
+        # ltx-2.5-4k: ltx-2.5-fast's render (text: 8 sigmas at half size, the latents upsampled x2, 3 at full size; frames
+        # and keyframes: 8 at full size) at 1440p or 2160p, decoded by LTX-2.5's diffusion decoder. That decoder has the
+        # VAE's 8x temporal ratio and interpolates nothing, so 48 and 50 fps render every frame at that rate, as they do on
+        # ltx-2.5-fast; nothing renders at half rate.
+        call["video_decoder"] = DIFFUSION_DECODER
 
     conditions = []
     last_index = call["num_frames"] - 1
@@ -376,6 +376,8 @@ class LtxResidentBackend(Backend):
                     edit.get("mode"), edit.get("held_latent_frames", 0), edit.get("latent_frames", 0), edit.get("held_audio_latents", 0),
                     edit.get("audio_latents", 0), edit.get("pins_exact"), edit.get("timings"),
                 )
+            if call.get("video_decoder") is not None and isinstance(raw, dict):  # seconds (and GiB) per phase only
+                log.info("diffusion decode of %dx%d: %s %s", task.width, task.height, raw.get("timings"), raw.get("memory_gib") or "")
             result = PipelineResult.from_pipeline(raw)
             if not len(result.frames):
                 raise BackendError("pipeline returned no frames")

@@ -21,7 +21,7 @@ reachability, then lists which profiles the machine can serve and what is missin
 |---|---|---|---|
 | `ltx-2.5-fast` | 1 | 80 GB | cheapest confidential entry: an RTX PRO 6000 Server Edition; also H200, B200, B300 |
 | `ltx-2.5-pro` | 1 | 80 GB | an H200, B200 or B300 on the confidential tier |
-| `ltx-2.5-4k` | 1 | 141 GB | an H200, B200 or B300; the 96 GB RTX PRO 6000 is too small |
+| `ltx-2.5-4k` | 1 | 141 GB | an H200, B200 or B300. An H200 serves 2160p up to 5 s (estimated); the 96 GB RTX PRO 6000 would serve only 1440p up to 4 s ([section 3b](#3b-switch-to-resident-runtimes-for-real-serving)) |
 | `h3-turbo`, `h3`, `h3-reference` | 4 per worker | 80 GB | a whole 8-GPU H200, B200 or B300 server running two workers |
 
 The subnet README's hardware classes (C1, C2, C4) are how the network groups these profiles;
@@ -104,7 +104,7 @@ directory:
 - `model_index.json`, `scheduler/`, `tokenizer/`, `text_encoder/`, `connectors/`;
 - `transformer/` (distilled) or `transformer_full/` (`ltx-2.5-pro`);
 - `vae/`, `audio_vae/`, `vocoder/`, `latent_upsampler/`, `prompt_enhancer/`;
-- for `ltx-2.5-4k`, also `temporal_latent_upsampler/` and `diffusion_decoder/`.
+- for `ltx-2.5-4k`, also `diffusion_decoder/` (0.83 GB). It no longer reads `temporal_latent_upsampler/`.
 
 Those files are what the weights digest covers (`kuno-devkit weights-digest`, below).
 
@@ -233,6 +233,64 @@ feature when a served profile offers plans (`ltx-2.5-fast`), and the gateway sen
 that list it. A plan takes the worker's one job slot for about 8-19 s of GPU time on an RTX PRO 6000 (2026-09-16). A plan
 whose planner writes nothing usable fails as `plan_failed`, which is refunded and not counted against you. `mock` writes a
 canned plan from the brief; `cold` backends write none and don't advertise the feature.
+
+**4K (`ltx-2.5-4k`).** The `real` backend renders it with the same diffusers pipelines as `ltx-2.5-fast`. It then decodes
+the latents with LTX-2.5's diffusion decoder (`diffusion_decoder/`) instead of the video VAE
+(`worker/backends/ltx_diffusion_decode.py`). This is not Lightricks' DFR pipeline: its detailing IC-LoRA and temporal
+upsampling rounds are ltx-pipelines features that diffusers 0.40 doesn't have. Only `KUNO_BACKEND=cold` runs DFR.
+- **Render.** Text-to-video runs 8 distilled sigmas at half size, upsamples the latents x2, then runs 3 sigmas at 2560x1408
+  or 3840x2176: the profile's 8 + 3 steps. Image-to-video and keyframes run the 8 sigmas in one pass at full size. The passes
+  stop at latents.
+- **Decode.** `LTX2VideoDiffusionDecodePipeline` denoises the frames in one step from noise seeded with the job's seed, in
+  diffusers' default tiles (768 px every 704 px, 80 frames every 56). The same seed gives the same frames. The sound goes
+  through the audio VAE and the vocoder, as on the other LTX-2.5 profiles.
+- **Frame rate.** The decoder has the VAE's 8x temporal ratio and interpolates nothing. So 48 and 50 fps render every frame
+  at that rate, with twice the latent tokens of 24 fps, as `ltx-2.5-fast` does. Nothing renders at half rate.
+- **Attention.**
+  - diffusers' default attention for this decoder is FlexAttention. Without `torch.compile` it materializes the full
+    query-by-key mask and scores, which no GPU holds at 1440p, and the image has no C compiler to compile it.
+  - diffusers' other choice, NATTEN, downloads its kernel from the Hub at load, which an attested image must not do.
+  - So the worker computes the same attention exactly in chunks on PyTorch's `scaled_dot_product_attention`. On the CPU
+    its output equals diffusers' to rounding. Its speed on a GPU is unmeasured.
+- **Weights.** The recipe (`ltx-2.5-dfr/bf16/1`) hashes `diffusion_decoder/` with everything else it reads. The loader
+  builds the decoder only for a recipe that includes it. The weights digest for `ltx-2.5-4k` has not been computed yet.
+- **Memory.** The plan checks two peaks against the card:
+  - the render: the distilled recipe's line, fitted to peaks measured up to 51,000 tokens and extrapolated to 4K's
+    24,640-514,080;
+  - the decode: the decoder's own shapes, a count of its live tensors at 1440p and 2160p, and a fifth more for the GPU.
+
+  The serving envelope and admission refuse a request when either peak doesn't fit. A keyframe job also counts the latent
+  frame each keyframe appends (8,160 tokens at 2160p).
+
+What a card would serve. Every figure is an estimate; none has run on a GPU:
+
+| Card (GiB PyTorch reports) | 1440p at 24/25 fps | 1440p at 48/50 fps | 2160p at 24/25 fps | 2160p at 48/50 fps |
+|---|---|---|---|---|
+| H200 (139.8) | 10 s | 6 s | 5 s | 2 s |
+| RTX PRO 6000 (94.97) | 4 s | 2 s | none | none |
+
+- **Both cards:** the render sets the limit. Both peaks sit beside the same 66.96 GiB of weights, and the decode's
+  activations are estimated at:
+
+  | | 2 s | 4 s |
+  |---|---|---|
+  | 1440p | 16.3 GiB | 23.2 GiB |
+  | 2160p | 20.7 GiB | 30.7 GiB |
+
+- **H200:** a 2160p render of 5 s is 130,560 tokens, estimated at 131.8 GiB of its 139.3 usable; 6 s would be 155,040.
+- **RTX PRO 6000:** even 2 s of 2160p (57,120 tokens) doesn't fit, and 1440p stops at 4 s. The profile's 141 GB minimum
+  keeps `kuno-preflight` from offering it there anyway.
+- **B200 and B300:** planned from the memory the card reports, as every class without a declared VRAM is.
+
+**Only a GPU run can confirm:**
+- the render's and the decode's peak memory against these estimates (the render line was never measured above 51,000
+  tokens);
+- how long the render and the chunked attention take, against the profile's 3,600 s timeout;
+- whether CUDA's SDPA runs the boolean masks in a fused kernel (if not, the decode's peak exceeds its estimate);
+- picture quality and colour, and whether tile seams show.
+
+`scripts/gpu-test/long_video/run_4k_worker.py` renders a 1440p and a 2160p clip through the worker. It measures both peaks
+against admission's estimates and times each phase; the pictures are for a person to watch.
 
 ## 3c. Worker images
 

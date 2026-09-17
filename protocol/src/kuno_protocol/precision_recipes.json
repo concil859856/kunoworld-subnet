@@ -66,23 +66,25 @@
       "precision": "bf16",
       "runtime": "diffusers-ltx2/1",
       "transformer_subfolder": "transformer",
-      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "temporal_latent_upsampler", "diffusion_decoder", "prompt_enhancer", "processor"],
+      "include": ["model_index.json", "scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder", "latent_upsampler", "diffusion_decoder", "prompt_enhancer", "processor"],
       "components": {
         "transformer": {"method": "none"},
         "text_encoder": {"method": "none"}
       },
       "packages": {"diffusers": ">=0.40.0", "torch": ">=2.7"},
       "memory": {
-        "components_gib": {"transformer": 35.37, "text_encoder": 22.28, "prompt_enhancer": 9.51, "other": 11.89},
+        "components_gib": {"transformer": 35.37, "text_encoder": 22.28, "prompt_enhancer": 9.51, "other": 9.31},
         "group_onload_gib": 1.7,
-        "activation_fixed_gib": 8.0,
-        "activation_gib_per_10k_tokens": 1.6,
+        "activation_fixed_gib": 3.32,
+        "activation_gib_per_10k_tokens": 4.6,
         "overhead_gib": 1.5,
         "measured": false,
-        "basis": "weights as measured for the distilled bf16 recipe, plus 3.36 GiB assumed for the temporal upsampler and diffusion decoder (sizes unknown); activation terms are unmeasured guesses, 4K decode is the peak"
+        "basis": "ltx-2.5-fast's render (the distilled transformer, its two-stage text path and its single-stage frame conditioning) at 1440p and 2160p, decoded by LTX-2.5's diffusion decoder (diffusion_decoder/, 417,133,616 parameters, 0.78 GiB in bf16) instead of the video VAE; nothing else is read (temporal_latent_upsampler/ was listed for an ltx-pipelines DFR path the diffusers runtime doesn't have). Weights as measured for the distilled bf16 recipe on 2026-09-16, other 8.53 plus the decoder. Activations: the distilled recipe's measured line, unmeasured at these token counts (24,640 to 514,080 for text-to-video). That line fitted peaks which included the VAE's decode, so for the transformer alone it is likely high; the render at 1440p and 2160p is what scripts/gpu-test/long_video/run_4k_worker.py measures. The diffusion decode is planned apart by the worker (kuno_worker.backends.ltx_diffusion_decode.decode_activation_bytes), from the decoder's shapes and a CPU count of its live tensors"
       },
       "sources": [
-        "https://huggingface.co/Lightricks/LTX-2.5"
+        "https://huggingface.co/Lightricks/LTX-2.5",
+        "https://huggingface.co/Lightricks/LTX-2.5-Diffusers",
+        "https://github.com/huggingface/diffusers/releases/tag/v0.40.0"
       ]
     },
     {

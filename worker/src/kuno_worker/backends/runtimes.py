@@ -55,6 +55,38 @@ def _empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
+class _Clock:
+    """Seconds of each phase of a render (`lap` ends one), synchronized with the GPU. With `measure` on a CUDA device, also
+    each phase's peak allocated and reserved GiB: torch's peak counters are reset when the clock starts and at every lap."""
+
+    def __init__(self, device: str, measure: bool = False):
+        import time
+
+        import torch
+
+        self._time, self._torch = time, torch
+        self._cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+        self._measure = measure and self._cuda
+        self.seconds: dict[str, float] = {}
+        self.peaks: dict[str, dict[str, float]] = {}
+        if self._cuda:
+            torch.cuda.synchronize()
+        if self._measure:
+            torch.cuda.reset_peak_memory_stats()
+        self._last = time.perf_counter()
+
+    def lap(self, name: str) -> None:
+        if self._cuda:
+            self._torch.cuda.synchronize()
+        now = self._time.perf_counter()
+        self.seconds[name] = round(now - self._last, 3)
+        self._last = now
+        if self._measure:
+            cuda = self._torch.cuda
+            self.peaks[name] = {"allocated": round(cuda.max_memory_allocated() / 2**30, 2), "reserved": round(cuda.max_memory_reserved() / 2**30, 2)}
+            cuda.reset_peak_memory_stats()
+
+
 class LtxAdapter:
     """Turns `ltx_resident.build_call` output into diffusers calls on loaded pipelines, and writes text with the pipeline's
     bundled prompt enhancer.
@@ -72,6 +104,10 @@ class LtxAdapter:
         self.offload = offload
         self._renderer_factory = renderer
         self._renderer: Any = None
+        # A diffusion-decoded call's result reports each phase's peak GPU memory (the latent render, the video decode, the audio
+        # decode) when this is set (the GPU driver scripts/gpu-test/long_video/run_4k_worker.py sets it). It resets torch's peak
+        # counters between phases, so it stays off wherever something else reads them around a job (kuno-bench).
+        self.measure_memory = False
 
     @contextmanager
     def enhancer(self, pipeline: Any | None = None) -> Iterator[tuple[Any, Any]]:
@@ -127,14 +163,22 @@ class LtxAdapter:
 
     def __call__(self, **call: Any) -> dict[str, Any]:
         kind = call["pipeline"]
-        if kind == "dfr":
-            # build_call's DFR keys (spatial_upscalings, temporal_upscalings) are the ltx-pipelines CLI's: diffusers 0.40 has no
-            # LTX-2.5 DFR pipeline, and its LTX2Pipeline would raise TypeError on them after the GPU work began.
-            raise BackendError("the diffusers runtime has no LTX-2.5 DFR pipeline; ltx-2.5-4k renders on the cold ltx-pipelines backend")
+        decoder = call.pop("video_decoder", None)
+        if decoder is not None:
+            from .ltx_resident import DIFFUSION_DECODER
+
+            if decoder != DIFFUSION_DECODER:
+                raise BackendError(f"unknown LTX-2.5 video decoder {decoder!r}")
+            if self.pipelines.get("decode") is None:
+                # Refused before any GPU work: the load built no LTX2VideoDiffusionDecodePipeline, because the recipe's include
+                # (what the weights check hashed) has no diffusion_decoder/ (quantized.build_ltx_pipelines).
+                raise BackendError("this LTX-2.5 runtime loaded no diffusion decoder, which ltx-2.5-4k decodes with")
         edit = call.pop("edit", None)
         if edit is not None:
             if call.get("kuno_trajectory_tap") is not None:
                 raise BackendError("audio-to-video and retake carry no step commitment (LtxResidentBackend.step_recorder)")
+            if decoder is not None:
+                raise BackendError("audio-to-video and retake decode with the video VAE; no profile serves them with the diffusion decoder")
             from .ltx_edit import render_edit
 
             return render_edit(self.pinned_renderer(), call, edit)
@@ -144,8 +188,9 @@ class LtxAdapter:
         call.pop("pipeline")
         pipeline = self.pipelines.get(kind) or self.pipelines["text"]
         tap = call.pop("kuno_trajectory_tap", None)
+        seed = int(call.pop("seed"))
         # Verified mode draws noise on the CPU, so every GPU of a hardware class starts from identical latents.
-        generator = torch.Generator(device="cpu" if tap is not None else self.device).manual_seed(int(call.pop("seed")))
+        generator = torch.Generator(device="cpu" if tap is not None else self.device).manual_seed(seed)
 
         conditions = call.pop("conditions", None)
         if conditions:
@@ -153,6 +198,10 @@ class LtxAdapter:
         call.pop("generate_audio", None)  # these pipelines always produce their audio track
         second_stage = call.pop("second_stage_sigmas", None)
         upsample = self.pipelines.get("upsample")
+        if decoder is not None:
+            # The pipeline stops at its denormalized latents (both modalities); the diffusion decoder makes the frames.
+            call["output_type"], call["return_dict"] = "latent", False
+        clock = _Clock(self.device, self.measure_memory) if decoder is not None else None
         if tap is not None:
             from .verified_gpu import ltx_verified
 
@@ -163,11 +212,36 @@ class LtxAdapter:
             result = self._two_stage(pipeline, upsample, generator, second_stage, call)
         else:
             result = pipeline(generator=generator, **call)
+        if decoder is not None:
+            return self._diffusion_decode(pipeline, result, seed, clock)
         return {
             "videos": getattr(result, "frames", None),
             "audio": getattr(result, "audio", None),
             "sampling_rate": _audio_rate(pipeline, result),
         }
+
+    def _diffusion_decode(self, pipeline: Any, latents: tuple[Any, Any], seed: int, clock: _Clock) -> dict[str, Any]:
+        """ltx-2.5-4k's frames from the render's latents: LTX2VideoDiffusionDecodePipeline (tiled, with the chunked
+        neighborhood attention of backends/ltx_diffusion_decode.py), then the sound as the pipeline itself decodes it. The
+        decoder denoises from noise of its own, drawn from a generator seeded with the job's seed on the render's device, so a
+        seed repeats its frames; it is not the render's generator, whose state after the render depends on the path taken."""
+        import torch
+
+        from .ltx_diffusion_decode import decode_audio, decode_frames
+
+        video_latents, audio_latents = latents
+        clock.lap("latent_render")
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        frames = decode_frames(self.pipelines["decode"], video_latents, generator)
+        del video_latents
+        clock.lap("video_decode")
+        with torch.no_grad():
+            audio = decode_audio(pipeline, audio_latents)
+        clock.lap("audio_decode")
+        result = {"videos": [frames], "audio": audio, "sampling_rate": _audio_rate(pipeline, None), "timings": clock.seconds}
+        if clock.peaks:
+            result["memory_gib"] = clock.peaks
+        return result
 
     def enhance_prompt(self, call: dict[str, Any]) -> str:
         """The prompt `call` would condition on had it passed `enable_prompt_enhancement=True`, computed apart from the
@@ -190,10 +264,12 @@ class LtxAdapter:
     @staticmethod
     def _two_stage(pipeline: Any, upsample: Any, generator: Any, second_stage: list[float], call: dict[str, Any]) -> Any:
         """The distilled recipe diffusers documents for LTX-2.5: the first sigmas at half size, the video latents
-        upsampled x2, then the second-stage sigmas at full size, continuing from the same audio latents."""
+        upsampled x2, then the second-stage sigmas at full size, continuing from the same audio latents. The call's own
+        `output_type` and `return_dict` (a diffusion-decoded call asks for latents) apply to the second pass."""
         width, height = call.pop("width"), call.pop("height")
+        first = {key: value for key, value in call.items() if key not in ("output_type", "return_dict")}
         latents, audio_latents = pipeline(
-            generator=generator, width=width // 2, height=height // 2, output_type="latent", return_dict=False, **call
+            generator=generator, width=width // 2, height=height // 2, output_type="latent", return_dict=False, **first
         )
         upsampled = upsample(latents=latents, output_type="latent", return_dict=False)[0]
         stage_two = {**call, "sigmas": second_stage}

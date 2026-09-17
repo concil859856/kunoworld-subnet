@@ -241,10 +241,14 @@ def test_retake_and_audio_to_video_calls(tmp_path):
     assert not {"audio_path", "audio_start_time", "audio_max_duration"} & set(a2v)
 
 
-def test_4k_renders_at_half_rate_then_interpolates(tmp_path):
+def test_4k_renders_every_frame_at_the_requested_rate_and_decodes_with_the_diffusion_decoder(tmp_path):
+    # LTX-2.5's diffusion decoder has the VAE's 8x temporal ratio and interpolates nothing, so 48 fps renders 48 fps.
     call = ltx_call(task_for("ltx-2.5-4k", Mode.TEXT_TO_VIDEO, tmp_path, duration_s=4, fps=48, resolution="2160p"))
-    assert call["temporal_upscalings"] == 1 and call["frame_rate"] == 24
-    assert (call["width"], call["height"]) == (3840, 2176)
+    assert call["frame_rate"] == 48 and call["num_frames"] == 193 and call["video_decoder"] == "diffusion"
+    assert (call["width"], call["height"]) == (3840, 2176) and call["pipeline"] == "text"
+    assert call["sigmas"] == DISTILLED_SIGMAS and call["second_stage_sigmas"] == SECOND_STAGE_SIGMAS  # ltx-2.5-fast's 8 + 3
+    assert not {"spatial_upscalings", "temporal_upscalings"} & set(call)
+    assert pipeline_kind(PROFILES["ltx-2.5-4k"], Mode.KEYFRAMES) == "condition"
 
 
 # ---------------------------------------------------------------- H3 calls

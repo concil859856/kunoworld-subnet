@@ -34,6 +34,11 @@ tokens, `((frames - 1) // 8 + 1) × (width // 32) × (height // 32)`:
 the mode with the largest envelope, and requests beyond it are refused. The estimates are unmeasured
 until `worker/scripts/benchmark_ltx_quantized.py` runs on the class.
 
+A recipe that includes `diffusion_decoder` (ltx-2.5-4k) has a second peak after the render: the diffusion decode, beside the
+same resident weights, which depends on the output's size and length rather than its tokens
+(ltx_diffusion_decode.decode_activation_bytes). A request fits only where both peaks do; the envelope, admission and the
+choice of plan all check both.
+
 Verified mode. Quantization changes how weights are stored, not what the denoising loop carries: the
 latents stay bfloat16, so the step callback, `SchedulerTrap` and `tensor_record` are unchanged. The
 class id (which encodes the precision) and the recipe's weights digest go into the transcript, and
@@ -70,6 +75,8 @@ from .media_tools import CapacityRefused
 log = logging.getLogger("kuno.worker.quantized")
 
 OFFLOAD_MODES = ("none", "model", "group")
+# The subfolder of LTX-2.5-Diffusers holding the diffusion decoder (ltx-2.5-4k decodes with it; backends/ltx_diffusion_decode.py).
+DIFFUSION_DECODER_FOLDER = "diffusion_decoder"
 # Left free on every card: the display, other processes, allocator fragmentation.
 VRAM_RESERVE_GIB = 0.5
 # Host memory kept for the OS, the worker and the CVM's own buffers when weights live in RAM.
@@ -178,26 +185,31 @@ def _edit_mode(call: dict[str, Any]) -> str | None:
     return edit.get("mode") if isinstance(edit, dict) else None
 
 
-def _render_frames(profile: ModelProfile, duration_s: float, fps: int) -> int:
-    """Frames the transformer renders (DFR renders 48/50 fps requests at half rate, as build_call does)."""
-    if profile.variant == "dfr" and fps >= 48:
-        return ltx_num_frames(duration_s, fps // 2)
-    return ltx_num_frames(duration_s, fps)
-
-
-def call_tokens(call: dict[str, Any], width: int, height: int) -> int:
+def call_frames(call: dict[str, Any]) -> int:
     frames = call.get("num_frames")
     if frames is None:  # a call shaped for the ltx-pipelines CLI's audio-to-video; build_call always sets num_frames now
         frames = ltx_num_frames(float(call.get("audio_max_duration", 0)), round(float(call["frame_rate"])))
-    return latent_tokens(width, height, int(frames))
+    return int(frames)
+
+
+def call_tokens(call: dict[str, Any], width: int, height: int) -> int:
+    """The transformer's video tokens for `call`. LTX2ConditionPipeline replaces the first latent frame's tokens with an
+    image condition at index 0, but appends every other image condition (a last frame, a keyframe) as one latent frame of
+    tokens more (`prepare_latents`), which the render carries through every step: 8 keyframes at 2160p are 65,280 more."""
+    appended = sum(1 for condition in call.get("conditions") or () if int(condition.get("index", 0)) > 0)
+    return latent_tokens(width, height, call_frames(call)) + appended * (width // 32) * (height // 32)
 
 
 def profile_token_range(profile: ModelProfile) -> tuple[int, int]:
     lim = profile.limits
     sizes = [tuple(size) for ratios in lim.sizes.values() for size in ratios.values()]
-    low = min(latent_tokens(w, h, _render_frames(profile, lim.min_duration_s, fps)) for w, h in sizes for fps in lim.fps)
-    high = max(latent_tokens(w, h, _render_frames(profile, lim.max_duration_s, fps)) for w, h in sizes for fps in lim.fps)
+    low = min(latent_tokens(w, h, ltx_num_frames(lim.min_duration_s, fps)) for w, h in sizes for fps in lim.fps)
+    high = max(latent_tokens(w, h, ltx_num_frames(lim.max_duration_s, fps)) for w, h in sizes for fps in lim.fps)
     return low, high
+
+
+def profile_sizes(profile: ModelProfile) -> list[tuple[int, int]]:
+    return sorted({tuple(size) for ratios in profile.limits.sizes.values() for size in ratios.values()})  # type: ignore[misc]
 
 
 @dataclass(frozen=True)
@@ -216,9 +228,24 @@ class MemoryPlan:
     # The weights on the GPU while a job encodes its source, before the pipeline is called: the render's base without the
     # activation line's fixed part. None counts the whole base.
     resident_gib: float | None = None
+    # The recipe decodes with LTX-2.5's diffusion decoder (ltx-2.5-4k): after the render, beside the same resident weights,
+    # the decode needs ltx_diffusion_decode.decode_activation_bytes for the output's size and length, whatever its tokens.
+    diffusion_decode: bool = False
 
     def estimate_gib(self, tokens: int) -> float:
         return max(self.floor_gib, self.token_base_gib + self.per_token_gib * tokens) + self.overhead_gib
+
+    def decode_gib(self, width: int, height: int, frames: int) -> float:
+        """The diffusion decode's peak: 0 for a recipe that decodes with the VAE (inside the render's line)."""
+        if not self.diffusion_decode:
+            return 0.0
+        from .ltx_diffusion_decode import decode_activation_bytes
+
+        resident = self.token_base_gib if self.resident_gib is None else self.resident_gib
+        return resident + decode_activation_bytes(width, height, frames) / 2**30 + self.overhead_gib
+
+    def fits_decode(self, width: int, height: int, frames: int) -> bool:
+        return self.decode_gib(width, height, frames) <= self.usable_gib
 
     @property
     def max_tokens(self) -> int:
@@ -259,8 +286,33 @@ def _plan(recipe: PrecisionRecipe, hardware: HardwareClass, mode: str, usable: f
     return MemoryPlan(
         recipe_id=recipe.id, hardware_class=hardware.id, offload=mode, usable_gib=usable, floor_gib=floor, token_base_gib=base,
         per_token_gib=memory.activation_gib_per_10k_tokens / 10_000, overhead_gib=memory.overhead_gib, host_ram_gib=host,
-        measured=memory.measured, resident_gib=base - memory.activation_fixed_gib,
+        measured=memory.measured, resident_gib=base - memory.activation_fixed_gib, diffusion_decode=decodes_with_diffusion(recipe),
     )
+
+
+def decodes_with_diffusion(recipe: PrecisionRecipe) -> bool:
+    """Whether the recipe loads LTX-2.5's diffusion decoder: its include names `diffusion_decoder`, so the weights check
+    hashed it (build_ltx_pipelines loads it only then)."""
+    return DIFFUSION_DECODER_FOLDER in recipe.include
+
+
+def serves_smallest(plan: MemoryPlan, profile: ModelProfile) -> bool:
+    """The plan fits the profile's shortest request at some size and frame rate: its tokens and, for a diffusion-decoding
+    recipe, its decode."""
+    low, _ = profile_token_range(profile)
+    if plan.max_tokens < low:
+        return False
+    frames = min(ltx_num_frames(profile.limits.min_duration_s, fps) for fps in profile.limits.fps)
+    return any(plan.fits_decode(width, height, frames) for width, height in profile_sizes(profile))
+
+
+def covers_profile(plan: MemoryPlan, profile: ModelProfile) -> bool:
+    """The plan fits the profile's largest request at every size and frame rate."""
+    _, high = profile_token_range(profile)
+    if plan.max_tokens < high:
+        return False
+    frames = max(ltx_num_frames(profile.limits.max_duration_s, fps) for fps in profile.limits.fps)
+    return all(plan.fits_decode(width, height, frames) for width, height in profile_sizes(profile))
 
 
 def plan_memory(
@@ -277,15 +329,19 @@ def plan_memory(
         if plan.host_ram_gib and host_ram_gib is not None and host_ram_gib < plan.host_ram_gib + HOST_RAM_MARGIN_GIB:
             notes.append(f"{candidate} offload needs {plan.host_ram_gib + HOST_RAM_MARGIN_GIB:.0f} GiB of host RAM, this host has {host_ram_gib:.0f}")
             continue
-        if plan.max_tokens < low:
-            notes.append(f"{candidate} offload needs about {plan.estimate_gib(low):.1f} GiB for the smallest request")
+        if not serves_smallest(plan, profile):
+            need = plan.estimate_gib(low)
+            if plan.diffusion_decode:
+                frames = min(ltx_num_frames(profile.limits.min_duration_s, fps) for fps in profile.limits.fps)
+                need = max(need, min(plan.decode_gib(width, height, frames) for width, height in profile_sizes(profile)))
+            notes.append(f"{candidate} offload needs about {need:.1f} GiB for the smallest request")
             continue
         viable.append(plan)
     if not viable:
         raise PrecisionError(
             f"{hardware.id} cannot serve {profile.id} with {recipe.precision} weights on {usable:.1f} GiB usable: " + "; ".join(notes)
         )
-    covering = [p for p in viable if p.max_tokens >= high]
+    covering = [p for p in viable if covers_profile(p, profile)]
     chosen = covering[0] if covering else max(viable, key=lambda p: p.max_tokens)
     if not covering:
         log.warning(
@@ -328,25 +384,26 @@ def plan_for_class(
         hardware = hardware.model_copy(update={"vram_gb": vram})
     if mode == "auto" and vram >= recipe.memory.weights_gib + recipe.memory.overhead_gib:
         whole = _plan(recipe, hardware, "none", vram - VRAM_RESERVE_GIB)
-        low, high = profile_token_range(profile)
-        if whole.max_tokens >= high:
+        if covers_profile(whole, profile):
             return whole if keep_covering else None
-        if whole.max_tokens >= low:
+        if serves_smallest(whole, profile):
             return whole
     return plan_memory(profile, recipe, hardware, host_ram_gib=host_ram_gib, mode=mode)
 
 
 def longest_duration(plan: MemoryPlan, profile: ModelProfile, width: int, height: int, fps: int, held_gib: float = 0.0) -> float | None:
     """The longest duration on the profile's grid (min_duration_s + k × duration_step_s, up to its limit at this fps) whose
-    latent tokens fit the plan with `held_gib` more in use; None when not even the shortest does. Tokens only grow with
-    duration at a fixed size and frame rate, so every shorter duration fits too."""
+    latent tokens fit the plan with `held_gib` more in use, and whose diffusion decode fits where the recipe has one; None
+    when not even the shortest does. Tokens and the decode's estimate only grow with duration at a fixed size and frame
+    rate, so every shorter duration fits too."""
     lim = profile.limits
     cap = profile_max_duration(profile, fps)
     steps = math.floor((cap - lim.min_duration_s) / lim.duration_step_s + 1e-9)
     most = plan.max_tokens_with(held_gib)
     for k in range(steps, -1, -1):
         duration = round(lim.min_duration_s + k * lim.duration_step_s, 6)
-        if latent_tokens(width, height, _render_frames(profile, duration, fps)) <= most:
+        frames = ltx_num_frames(duration, fps)
+        if latent_tokens(width, height, frames) <= most and plan.fits_decode(width, height, frames):
             return duration
     return None
 
@@ -381,17 +438,20 @@ def admit(plan: MemoryPlan, profile: ModelProfile, call: dict[str, Any], width: 
     (source_held_gib), so near the top of the serving envelope, which is per size and frame rate, not per mode, one can be
     refused where a text-to-video job of the same length is not."""
     tokens = call_tokens(call, width, height)
+    frames = call_frames(call)
     edit = _edit_mode(call)
     encode, held = source_encode_gib(edit, width, height), source_held_gib(edit)
-    if tokens <= plan.max_tokens_with(held) and plan.fits_encode(encode + held):
+    decode = plan.decode_gib(width, height, frames)
+    if tokens <= plan.max_tokens_with(held) and plan.fits_encode(encode + held) and decode <= plan.usable_gib:
         return tokens
     longest = _longest_fitting(plan, profile, width, height, fps, edit)
     what = f"a {edit} job" if edit else "it"
     hint = f"at {width}x{height} and {fps} fps {what} serves up to {longest:g} s" if longest else f"{what} cannot serve {width}x{height} at any duration"
-    need = max(plan.estimate_gib(tokens), plan.encode_gib(encode) if edit else 0.0) + held
+    need = max(plan.estimate_gib(tokens), plan.encode_gib(encode) if edit else 0.0, decode) + held
     source = f" and {encode:.1f} GiB to encode its source" if encode else ""
+    decoded = f" and {decode:.1f} GiB to decode {frames} frames" if decode else ""
     raise CapacityRefused(
-        f"{plan.hardware_class} cannot fit this request ({tokens} latent tokens{source}): about {need:.1f} GiB "
+        f"{plan.hardware_class} cannot fit this request ({tokens} latent tokens{source}{decoded}): about {need:.1f} GiB "
         f"with {plan.offload} offload, {plan.usable_gib:.1f} GiB usable ({'measured' if plan.measured else 'estimated'}); {hint}"
     )
 
@@ -590,7 +650,7 @@ def build_ltx_pipelines(models_dir: Path, plan: LoadPlan, device: str = "cuda") 
     _apply_offload(base, plan.offload, device)
     # The condition pipeline shares the loaded (and offload-hooked) modules rather than loading a second copy.
     condition = LTX2ConditionPipeline(**base.components)
-    pipelines = {"text": base, "condition": condition, "audio": base, "dfr": base}
+    pipelines = {"text": base, "condition": condition, "audio": base}
     if (Path(models_dir) / "latent_upsampler").is_dir():
         # The distilled two-stage recipe's x2 latent upsampler (runtimes.LtxAdapter), sharing the loaded VAE.
         from diffusers import LTX2LatentUpsamplePipeline
@@ -598,4 +658,32 @@ def build_ltx_pipelines(models_dir: Path, plan: LoadPlan, device: str = "cuda") 
 
         upsampler = LTX2LatentUpsamplerModel.from_pretrained(str(models_dir), subfolder="latent_upsampler", torch_dtype=dtype)
         pipelines["upsample"] = LTX2LatentUpsamplePipeline(vae=base.vae, latent_upsampler=upsampler.to(device))
+    if decodes_with_diffusion(recipe):
+        pipelines["decode"] = diffusion_decode_pipeline(Path(models_dir), plan, device)
     return pipelines
+
+
+def diffusion_decode_pipeline(models_dir: Path, plan: LoadPlan, device: str = "cuda") -> Any:
+    """ltx-2.5-4k's decoder: diffusers' LTX2VideoDiffusionDecodePipeline on `diffusion_decoder/` in bf16, with the chunked
+    neighborhood attention and diffusers' default tiling (backends/ltx_diffusion_decode.py). Loaded only for a recipe whose
+    include names the folder, so `prepare_load` hashed exactly what is read here before anything reached the GPU. It takes no
+    VAE: the render's latents arrive denormalized, and the decoder carries LTX-2's latent statistics itself. It stays on the
+    GPU with the render's weights (0.78 GiB); with model offload it visits the GPU only to decode."""
+    import torch
+    from diffusers import FlowMatchEulerDiscreteScheduler, LTX2VideoDiffusionDecodePipeline, LTX2VideoDiffusionDecoderModel
+
+    from .ltx_diffusion_decode import prepare_decoder
+
+    if not decodes_with_diffusion(plan.recipe):
+        raise PrecisionError(f"{plan.recipe.id} does not include {DIFFUSION_DECODER_FOLDER}, so its weights were not verified")
+    if not (Path(models_dir) / DIFFUSION_DECODER_FOLDER).is_dir():
+        raise PrecisionError(f"{plan.recipe.id} needs {DIFFUSION_DECODER_FOLDER}/ under {models_dir}, which is missing")
+    decoder = LTX2VideoDiffusionDecoderModel.from_pretrained(str(models_dir), subfolder=DIFFUSION_DECODER_FOLDER, torch_dtype=torch.bfloat16)
+    # The pipeline registers a scheduler it never steps (as LTX-2.5 ships it the decoder denoises in one x0 pass, in its own
+    # `denoise`), so a default one stands in.
+    pipeline = LTX2VideoDiffusionDecodePipeline(diffusion_decoder=prepare_decoder(decoder.eval()), scheduler=FlowMatchEulerDiscreteScheduler())
+    if plan.offload == "model":
+        pipeline.enable_model_cpu_offload(device=device)
+    else:
+        decoder.to(device)
+    return pipeline

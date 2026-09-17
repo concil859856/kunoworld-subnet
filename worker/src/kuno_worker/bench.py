@@ -352,15 +352,17 @@ class Bench:
         tokens, estimate = None, None
         if profile.family == FAMILY_LTX:
             from .backends.ltx_resident import build_call
-            from .backends.quantized import call_tokens
+            from .backends.quantized import call_frames, call_tokens
 
-            tokens = call_tokens(build_call(task), width, height)
+            call = build_call(task)
+            tokens = call_tokens(call, width, height)
             plan_for = getattr(self.backend_for(profile), "memory_plan", None)
             try:
                 plan = plan_for(profile) if plan_for else None
             except Exception:  # a class that cannot serve the profile already failed its load
                 plan = None
-            estimate = round(plan.estimate_gib(tokens), 2) if plan is not None else None
+            # A job peaks at its render or, on ltx-2.5-4k, at its diffusion decode (0 elsewhere), whichever is larger.
+            estimate = round(max(plan.estimate_gib(tokens), plan.decode_gib(width, height, call_frames(call))), 2) if plan is not None else None
         ok = [r for r in runs if r["outcome"] == "ok"]
         walls = [r["wall_s"] for r in ok]
         wall = _stats(walls)
