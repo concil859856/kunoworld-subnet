@@ -9,7 +9,7 @@ Capabilities follow the official inference code (see research/research_model_cap
               Ref2VA checkpoint: up to 9 images / 3 videos / 3 audio (12 total),
               which also covers video edit, extend and audio-driven video.
               24 fps, 5–14 s (345-frame cap), frames = 17n+5, ≤ 1,032,192 px, audio always on.
-  LTX-2.5     distilled / full / DFR pipelines: text, first/last frame, any number
+  LTX-2.5     distilled / full / 4K (diffusion decoder) pipelines: text, first/last frame, any number
               of keyframes, retake of a time window, audio-to-video (full), 4K (DFR).
               frames = 8k+1, sizes divisible by 64 (128 for DFR).
 """

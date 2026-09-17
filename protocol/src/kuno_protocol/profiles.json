@@ -1051,7 +1051,7 @@
       "name": "LTX-2.5 4K",
       "tagline": "Production-grade 4K with detail refinement",
       "variant": "dfr",
-      "checkpoint": "Lightricks/LTX-2.5 DFR pipeline (distilled + pixel detailing IC-LoRA)",
+      "checkpoint": "Lightricks/LTX-2.5 distilled at 1440p/2160p, decoded by the LTX-2.5 diffusion decoder",
       "runtime": "ltx-pipelines",
       "modes": [
         "text_to_video",
