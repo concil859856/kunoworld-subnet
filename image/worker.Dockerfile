@@ -166,9 +166,9 @@ RUN set -eu; \
     cd /tmp/sage \
     && CUDA_HOME="$cuda" LIBRARY_PATH=/tmp/cudalib TORCH_CUDA_ARCH_LIST="${SAGE_ARCH}" MAX_JOBS=32 EXT_PARALLEL=4 \
        NVCC_APPEND_FLAGS='--threads 8 -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK' \
-       python3 -m pip --python /opt/sglang/bin/python install --no-deps --no-build-isolation --no-compile --no-cache-dir . \
+       /usr/local/bin/python3 -m pip --python /opt/sglang/bin/python install --no-deps --no-build-isolation --no-compile --no-cache-dir . \
     && cd / \
-    && python3 -m pip --python /opt/sglang/bin/python show -f sageattention | grep -q 'sm90_compile\.py' \
+    && /usr/local/bin/python3 -m pip --python /opt/sglang/bin/python show -f sageattention | grep -q 'sm90_compile\.py' \
     && ls /opt/sglang/lib/python3.12/site-packages/sageattention/_qattn_sm90*.so \
     && rm -rf /tmp/sage /tmp/sage.tar.gz /tmp/cudalib /root/.cache
 # The package cannot be imported here: its kernels link libcuda.so.1, which the VM's driver provides and a build
