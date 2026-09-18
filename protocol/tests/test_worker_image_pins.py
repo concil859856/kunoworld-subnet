@@ -160,6 +160,21 @@ def test_sageattention_is_built_from_a_pinned_commit_and_is_not_the_default():
 
 
 @pytest.mark.skipif(tomllib is None, reason="tomllib needs Python 3.11")
+def test_the_three_leaks_that_broke_reproducible_builds_stay_closed():
+    # 2026-09-18: `build.sh --check` failed on three things (image/CVM.md §1). Each fix is one line to lose by accident.
+    # 1. nvcc names temporary files after its process id and gcc copies the name into each SageAttention kernel's
+    #    symbol table; --objdir-as-tempdir gives them fixed names, and the build refuses a kernel that still has one.
+    h3 = stage("h3")
+    assert "--objdir-as-tempdir" in h3 and "tmpxft_" in h3
+    # 2. Cached dependency stages kept their real build times while fresh ones got SOURCE_DATE_EPOCH; they are all dated
+    #    DEPS_MTIME instead, fixed and independent of the commit, so they stay cacheable and byte-identical.
+    assert "ARG DEPS_MTIME=315532800" in DOCKERFILE
+    for name, root in (("build", "/opt/kuno"), ("safety-models", "/opt/kuno-safety"), ("sglang-build", "/opt/sglang")):
+        assert f'find {root} -exec touch -h -d "@${{DEPS_MTIME}}" {{}} +' in stage(name), name
+    # 3. Building an sdist in the SGLang venv imported half of it and wrote 398 .pyc files stamped with build-time mtimes.
+    assert stage_env("sglang-build").get("PYTHONDONTWRITEBYTECODE") == "1"
+
+
 def test_base_images_python_environments_and_debian_packages_are_pinned():
     for arg in ("PYTHON_IMAGE", "UV_IMAGE"):
         assert re.search(rf"^ARG {arg}=\S+@sha256:[0-9a-f]{{64}}$", DOCKERFILE, re.M)

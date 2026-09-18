@@ -115,10 +115,35 @@ shows the published digest. That needs Docker's containerd image store. `KUNO_IM
 archive of a single image, which the CVM build packs onto the worker image disk (§3). `KUNO_IMAGE_NO_GIT=1` with
 `SOURCE_DATE_EPOCH` set builds without calling git.
 
-**Reproducibility.** `--check` rebuilds without cache and compares digests. For these images that means
-downloading and writing about 10 GB of CUDA wheels (H3: about 12 GB more) and 3.4 GB of weights a second time, so
-run it in CI or before a release. It has not been run on these images; the layers follow the same rules as the
-worker image before them.
+**Reproducibility.** `--check` builds once with the build cache and once without, and compares digests. For these
+images the second build downloads and writes about 10 GB of CUDA wheels (H3: about 12 GB more) and 3.4 GB of
+weights again, so run it in CI or before a release. What keeps the digest independent of the cache:
+- **Timestamps.** `build.sh` exports with `rewrite-timestamp`, which lowers every timestamp newer than
+  `SOURCE_DATE_EPOCH` (the last commit's time) to it and leaves older ones alone.
+  - The `ltx` and `h3` stages take `SOURCE_DATE_EPOCH`, so every commit rebuilds them. What they write is newer
+    than the commit and is lowered to the epoch.
+  - The dependency stages don't: `build` (`/opt/kuno`), `safety-models` (`/opt/kuno-safety`) and `sglang-build`
+    (`/opt/sglang`). They stay cached across commits, so a new commit does not download those gigabytes again.
+    Instead of the time they were built, they date every file they write at `DEPS_MTIME`, 1980-01-01.
+  - Before that, a cached venv kept the time it was built. `/opt/kuno-safety` built on 2026-09-14 was dated
+    2026-09-14 in the image of a 2026-09-17 commit, where a clean build dates it 2026-09-17. The digest depended on
+    how old the cache was, and `--check` failed whenever the cache predated the commit.
+- **No bytecode** (H3 only). Building the `antlr4-python3-runtime` sdist runs `/opt/sglang`'s Python. setuptools
+  then imports the `egg_info.writers` entry point that `kernels` registers, which pulls in huggingface_hub, httpx
+  and rich. The H3 image built on 2026-09-17 carries the 398 `.pyc` files this wrote, each recording its source's
+  build-time mtime. Two clean builds differed in 397 of them. `sglang-build` now sets `PYTHONDONTWRITEBYTECODE=1`, and
+  two clean builds of `/opt/sglang` match file for file (68,686 files, no `.pyc`). Those modules are now compiled
+  in memory when imported, like every other module in the images.
+- **SageAttention's kernels** (H3 only): nvcc's temporary file names ("The MiniMax H3 image", below).
+
+Checked on 2026-09-18 with `KUNO_IMAGE_NO_GIT=1` and `SOURCE_DATE_EPOCH` set to the time each check started:
+- `ltx`: two identical builds, `sha256:72cdfb6baa7c07c85fabcc99b8211802ca95e211cad18ffb08e51315a4726a5c`
+  (epoch 1789698016).
+- `h3`: two identical builds, `sha256:c30f69cd45bfe5882129402e894e73455d7602cf787ad9af4ca5e277be40f5df`
+  (epoch 1789701594). Its first build reused all three dependency stages, built before its epoch (the case that
+  used to fail), and rebuilt everything from `ltx` on; its second built everything.
+
+A digest depends on `SOURCE_DATE_EPOCH`, so these values are for those epochs, not for any commit.
 
 ### Safety classifier weights (in both images)
 
@@ -243,6 +268,15 @@ The `h3` target adds SGLang's side:
   (`-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK`, and a libcuda stub for the link); it took 234 s on 12 cores on a
   development box. Only SM90 is built, so on B200 and B300 the setting must stay at its default until the image is
   rebuilt with `SAGE_ARCH="9.0 10.0"`. Verified mode does not use it: the diffusers recipe pins `sdpa`.
+  - **Reproducible build.** nvcc runs with `--objdir-as-tempdir`. By default nvcc names its temporary files after its
+    process id (`/tmp/tmpxft_<pid>_00000000-6_<source>.cudafe1.cpp`), and gcc copies that name into each object's
+    symbol table. SageAttention's four extensions compile in parallel, so which process id each nvcc gets is a race.
+    Two builds of the step differed only there: 2–4 bytes of `.strtab` in each of the four kernels, and so pip's
+    `RECORD`. Everything else was byte-identical, including the build IDs, `direct_url.json` and the Python files. With
+    the flag, nvcc writes those files beside each object, named after it (`qk_int_sv_f8_cuda_sm90.o.cudafe1.cpp`), and
+    deletes them. Two parallel builds then install identical files (all 27), and the build fails if a `tmpxft_` name is
+    ever found in a kernel again. The flag changes only symbol names, and the build ID computed over them: code,
+    constants and the embedded GPU binaries (`.nv_fatbin`) are the same bytes as without it (2026-09-18).
 - **g++**, from the Debian snapshot. Triton builds its CUDA launcher with gcc the first time a kernel runs, and
   SGLang's diffusion kernels include Triton and JIT-compiled ones. The H3 DiT calls `fused_inplace_qknorm`.
 - **`kuno-h3-worker`**, the entry point (`worker/src/kuno_worker/h3_servers.py`). kuno-app starts one container per
@@ -312,9 +346,10 @@ names exist (both fixed in `worker.Dockerfile`). **Not verified**, in particular
 - **`h3-turbo` through the worker:** the Turbo server started by `kuno-h3-worker` **on one GPU**. The four-GPU Turbo
   server and its requests at 9 points ran through the worker and a real gateway on 2026-09-17; one-GPU serving has run
   only straight against SGLang, and never with the memory of a 10 s clip checked against the envelope.
-- **SageAttention in this image:** it was built and measured in a container committed from the published image, not
-  by `worker.Dockerfile`, and only for SM90. A rebuild has to show that `image/build.sh --check` still gives two
-  identical digests and that the SM90 kernels are installed.
+- **SageAttention in this image:** `worker.Dockerfile` builds it reproducibly (`image/build.sh --variant h3 --check`
+  gave two identical digests on 2026-09-18) and installs the SM90 kernels. The measurements above came from a build
+  in a container committed from the published image. The kernels `worker.Dockerfile` builds have not been imported
+  on a GPU, and only SM90 is built.
 - SGLang's JIT kernels compiling with the CUDA 13 toolkit that pip wheels put in `/opt/sglang`. `kuno-h3-worker` sets
   the servers' `CUDA_HOME` to it (`site-packages/nvidia/cu13`, holding `nvcc` and the runtime headers), and g++ is
   the host compiler. Whether those wheels hold everything the kernels include and link is unchecked.

@@ -14,18 +14,28 @@
 # Reproducible by construction: base images pinned by digest, Python dependencies frozen by image/uv.lock
 # and image/sglang/uv.lock (hashes included), classifier weights fetched at pinned revisions and checked
 # against image/safety-models/SHA256SUMS, SageAttention's source pinned by commit and checked by the digest of
-# its contents, Debian packages from a fixed snapshot, no bytecode compiled at build time, timestamps clamped
-# to SOURCE_DATE_EPOCH. Nothing is downloaded when a container runs: model
-# weights are mounted (image/CVM.md) and HF_HUB_OFFLINE keeps the Hugging Face libraries off the network.
+# its contents and its kernels compiled with no per-build temporary file names in them, Debian packages from a fixed
+# snapshot, no bytecode compiled at build time, timestamps clamped to SOURCE_DATE_EPOCH, and the dependency stages'
+# files dated DEPS_MTIME whether they come from cache or a fresh build. Nothing is downloaded when a container runs:
+# model weights are mounted (image/CVM.md) and HF_HUB_OFFLINE keeps the Hugging Face libraries off the network.
 # The CUDA libraries come as wheels; the NVIDIA driver comes from the VM. NVIDIA's nvattest is in neither image.
 
 ARG PYTHON_IMAGE=python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.19@sha256:b46b03ddfcfbf8f547af7e9eaefdf8a39c8cebcba7c98858d3162bd28cf536f6
+# The dependency stages (build, safety-models, sglang-build) date every file they produce at DEPS_MTIME,
+# 1980-01-01, the earliest time a zip archive can hold. They do not take SOURCE_DATE_EPOCH, so their cache
+# survives from one commit to the next, and image/build.sh's rewrite-timestamp only lowers timestamps newer than
+# SOURCE_DATE_EPOCH. Left alone, a cached venv kept the time it was built: /opt/kuno-safety from a 2026-09-14
+# build was dated 2026-09-14 in an image of a 2026-09-17 commit, where a clean build dates it 2026-09-17. So the
+# digest depended on the age of the cache, and `build.sh --check` failed on 2026-09-18 for that reason as well as
+# for SGLang's bytecode and the SageAttention kernels (both below).
+ARG DEPS_MTIME=315532800
 
 FROM ${UV_IMAGE} AS uv
 
 # ------------------------------------------------------------------ the worker venv, /opt/kuno
 FROM ${PYTHON_IMAGE} AS build
+ARG DEPS_MTIME
 COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_PROJECT_ENVIRONMENT=/opt/kuno \
     UV_PYTHON_DOWNLOADS=never \
@@ -37,16 +47,18 @@ COPY protocol ./protocol
 COPY worker ./worker
 COPY image/pyproject.toml image/uv.lock ./image/
 # uv_cache.json records when the local packages were built, the only per-build bytes in the
-# tree; drop it and its RECORD line so the layer is byte-identical across builds.
+# tree; drop it and its RECORD line so the layer is byte-identical across builds. Then date every file DEPS_MTIME.
 RUN uv sync --project image --frozen --no-dev --no-editable --no-install-project \
     && rm -f /opt/kuno/lib/python3.12/site-packages/*.dist-info/uv_cache.json \
-    && sed -i '/uv_cache\.json/d' /opt/kuno/lib/python3.12/site-packages/*.dist-info/RECORD
+    && sed -i '/uv_cache\.json/d' /opt/kuno/lib/python3.12/site-packages/*.dist-info/RECORD \
+    && find /opt/kuno -exec touch -h -d "@${DEPS_MTIME}" {} +
 
 # ------------------------------------------------------------------ the content safety classifiers, /opt/kuno-safety
 # Fetched at pinned revisions; a file that differs from SHA256SUMS fails the build. Licenses:
 # Freepik/nsfw_image_detector MIT, openai/clip-vit-large-patch14 MIT, Qwen/Qwen3Guard-Gen-0.6B Apache-2.0
 # (its LICENSE ships beside the weights). Only safetensors weights: no pickled checkpoint is fetched.
 FROM ${PYTHON_IMAGE} AS safety-models
+ARG DEPS_MTIME
 COPY image/safety-models/SHA256SUMS image/safety-models/fetch.py /src/
 RUN python3 /src/fetch.py /src/SHA256SUMS /opt/kuno-safety \
         nsfw_image_detector=Freepik/nsfw_image_detector@15b85477e4fd2000db76ae9aae0f89a72f95e2e3 \
@@ -54,7 +66,8 @@ RUN python3 /src/fetch.py /src/SHA256SUMS /opt/kuno-safety \
         qwen3guard-gen-0.6b=Qwen/Qwen3Guard-Gen-0.6B@fada3b2f655b89601929198343c94cd2f64d93cc \
     && cp /src/SHA256SUMS /opt/kuno-safety/SHA256SUMS \
     && cd /opt/kuno-safety \
-    && sha256sum --check --strict SHA256SUMS
+    && sha256sum --check --strict SHA256SUMS \
+    && find /opt/kuno-safety -exec touch -h -d "@${DEPS_MTIME}" {} +
 
 # ------------------------------------------------------------------ LTX-2.5
 FROM ${PYTHON_IMAGE} AS ltx
@@ -94,17 +107,24 @@ ENTRYPOINT ["kuno-worker"]
 # Its own venv: SGLang pins torch 2.13.0 (CUDA 13), transformers 5.12.1 and diffusers 0.37.0, which would
 # replace the worker venv's CUDA 12.8 torch and diffusers 0.40.
 FROM ${PYTHON_IMAGE} AS sglang-build
+ARG DEPS_MTIME
 COPY --from=uv /uv /usr/local/bin/uv
+# PYTHONDONTWRITEBYTECODE: building the antlr4 sdist runs this venv's Python, and setuptools then imports every
+# package's egg_info.writers entry point (kernels registers one, which pulls in huggingface_hub, httpx and rich).
+# That wrote 398 .pyc files into /opt/sglang, each holding its source's mtime at build time, so two clean builds
+# differed in 397 of them (2026-09-18). Without them Python compiles those modules in memory, like all the others.
 ENV UV_PROJECT_ENVIRONMENT=/opt/sglang \
     UV_PYTHON_DOWNLOADS=never \
     UV_COMPILE_BYTECODE=0 \
     UV_LINK_MODE=copy \
-    UV_NO_CACHE=1
+    UV_NO_CACHE=1 \
+    PYTHONDONTWRITEBYTECODE=1
 WORKDIR /src
 COPY image/sglang/pyproject.toml image/sglang/uv.lock ./sglang/
 RUN uv sync --project sglang --frozen --no-dev --no-install-project \
     && rm -f /opt/sglang/lib/python3.12/site-packages/*.dist-info/uv_cache.json \
-    && sed -i '/uv_cache\.json/d' /opt/sglang/lib/python3.12/site-packages/*.dist-info/RECORD
+    && sed -i '/uv_cache\.json/d' /opt/sglang/lib/python3.12/site-packages/*.dist-info/RECORD \
+    && find /opt/sglang -exec touch -h -d "@${DEPS_MTIME}" {} +
 
 # ------------------------------------------------------------------ MiniMax H3
 FROM ltx AS h3
@@ -151,6 +171,14 @@ RUN set -e; cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
 #   -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK says the major versions match; setup.py links -lcuda, which the pip toolkit
 #   does not ship, so an empty stub carrying the driver's soname satisfies the link and the VM's real libcuda.so.1 is
 #   what loads at run time. The build took 234 s on 12 cores on 2026-09-17.
+#   Reproducible because of --objdir-as-tempdir. Without it nvcc names its temporary files after its process id
+#   (/tmp/tmpxft_<pid>_00000000-6_<source>.cudafe1.cpp), and gcc copies that name into the object's symbol table: the
+#   FILE symbol and the _GLOBAL__sub_I_ constructor's name. The four extensions compile in parallel threads, so which
+#   nvcc gets which pid is a race, and two builds of this step differed only there: 2-4 bytes of .strtab in each of the
+#   four kernels (so pip's RECORD too), nothing else (2026-09-18). With --objdir-as-tempdir nvcc writes those files beside
+#   each object, named after it (qk_int_sv_f8_cuda_sm90.o.cudafe1.cpp), and deletes them. The object paths are fixed,
+#   since pip builds in /tmp/sage, so the kernels come out byte for byte the same. The grep below fails the build if a
+#   temporary name is ever in a kernel again.
 ARG SAGE_REF=d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4
 ARG SAGE_TREE_SHA256=9ec4a895ec9905423e4d9b8c908fcb2bc829046d0c036e3c8dcafa7b3fd0b408
 ARG SAGE_ARCH=9.0
@@ -165,11 +193,14 @@ RUN set -eu; \
     echo | gcc -shared -x c - -Wl,-soname,libcuda.so.1 -o /tmp/cudalib/libcuda.so; \
     cd /tmp/sage \
     && CUDA_HOME="$cuda" LIBRARY_PATH=/tmp/cudalib TORCH_CUDA_ARCH_LIST="${SAGE_ARCH}" MAX_JOBS=32 EXT_PARALLEL=4 \
-       NVCC_APPEND_FLAGS='--threads 8 -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK' \
+       NVCC_APPEND_FLAGS='--threads 8 -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK --objdir-as-tempdir' \
        /usr/local/bin/python3 -m pip --python /opt/sglang/bin/python install --no-deps --no-build-isolation --no-compile --no-cache-dir . \
     && cd / \
     && /usr/local/bin/python3 -m pip --python /opt/sglang/bin/python show -f sageattention | grep -q 'sm90_compile\.py' \
     && ls /opt/sglang/lib/python3.12/site-packages/sageattention/_qattn_sm90*.so \
+    && if grep -l -a 'tmpxft_' /opt/sglang/lib/python3.12/site-packages/sageattention/*.so; then \
+           echo "nvcc's temporary file names are in the kernels above: the image would not be reproducible" >&2; exit 1; \
+       fi \
     && rm -rf /tmp/sage /tmp/sage.tar.gz /tmp/cudalib /root/.cache
 # The package cannot be imported here: its kernels link libcuda.so.1, which the VM's driver provides and a build
 # container has not got. So the check above is that the files are installed — the SM90 binding SGLang looks for and
