@@ -8,7 +8,7 @@
 #                Entry point: kuno-worker.
 #   target h3    MiniMax H3. Everything in ltx, plus SGLang in a venv of its own (/opt/sglang: CUDA 13 torch),
 #                a C/C++ toolchain for the kernels SGLang and Triton compile, and SageAttention built from a pinned
-#                commit and off unless KUNO_H3_ATTENTION=sage. Entry point: kuno-h3-worker, which runs the SGLang
+#                commit and on by default for the Turbo server on H200s. Entry point: kuno-h3-worker, which runs the SGLang
 #                servers beside the worker.
 #
 # Reproducible by construction: base images pinned by digest, Python dependencies frozen by image/uv.lock
@@ -154,16 +154,18 @@ RUN set -e; cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
     [ -e "$cuda/lib64" ] || ln -s lib "$cuda/lib64"; \
     for f in "$cuda"/lib/lib*.so.[0-9]*; do name="${f%%.so.*}.so"; [ -e "$name" ] || ln -s "$(basename "$f")" "$name"; done; \
     test -e "$cuda/lib64/libcudart.so"
-# SageAttention: 8-bit attention for the H3 DiT, built in but NOT the default. KUNO_H3_ATTENTION=sage runs the SGLang
-# servers with `--attention-backend sage_attn` (worker/src/kuno_worker/h3_servers.py); anything else leaves SGLang's own
-# choice, which is FlashAttention on Hopper and what every measurement and clip so far used. Measured on one H200
+# SageAttention: 8-bit attention for the H3 DiT. KUNO_H3_ATTENTION=auto, the default, runs the Turbo server with
+# `--attention-backend sage_attn` on GPUs these kernels are built for, and leaves SGLang's own choice (FlashAttention on
+# Hopper) on every other server and GPU; `default` and `sage` choose for every server (worker/src/kuno_worker/h3_servers.py).
+# The owner compared the two Turbo clips by eye on 2026-09-18 and could not tell which was better. Measured on one H200
 # (h3-turbo, 8 passes, 5 s, seed 1234, research/h3-image-check_2026-09-17.md §3): 47.95 s against FlashAttention's
 # 51.26 s, so 6.5% faster, for about 2 GB more GPU memory and a different picture — 30.2 dB PSNR and 0.925 SSIM between
 # the two clips, each backend repeating bit-identically. SGLang falls back to FlashAttention with only a log line when
 # the package is missing, which is why kuno-h3-worker refuses `sage` in an image without it rather than serving
 # something else.
-#   SAGE_ARCH is 9.0 (Hopper: H200), the only architecture this has been built or measured for. B200 and B300 need
-#   "9.0 10.0" here and a rebuild; until then leave KUNO_H3_ATTENTION at its default on them.
+#   SAGE_ARCH is 9.0 (Hopper: H200), the only architecture this has been built or measured for, and h3_servers.py's
+#   SAGE_COMPUTE_CAPABILITIES must match it. B200 and B300 need "9.0 10.0" here and a rebuild; until then `auto` gives
+#   them SGLang's default.
 #   SAGE_REF is the commit SGLang 0.5.19 names for the SM90 binding it looks for. The image has no git, so the source
 #   comes as GitHub's tarball of that commit and is checked by the digest of the extracted tree, which re-gzipping
 #   does not change:  find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum

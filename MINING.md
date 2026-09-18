@@ -361,7 +361,8 @@ not by tag. No digest is published yet.
   - `KUNO_H3_TURBO_LORA`: the Turbo LoRA's path, required for `h3-turbo`.
   - `KUNO_H3_NUM_GPUS`: the GPUs per SGLang server. The default is what each server's own profiles need: 4 for `h3`
     and `h3-reference`, 1 for `h3-turbo`.
-  - `KUNO_H3_ATTENTION`: `default` (SGLang's own choice, FlashAttention on Hopper) or `sage`
+  - `KUNO_H3_ATTENTION`: `auto`, the default (SageAttention for `h3-turbo` on H200s, SGLang's own choice everywhere
+    else), `default` (SGLang's own choice, FlashAttention on Hopper, on every server) or `sage` (every server)
     ([below](#sageattention-h3-only)).
   - `KUNO_SGLANG_ARGS`: extra `sglang serve` flags.
   - `KUNO_SGLANG_START_TIMEOUT_S`: default 3600.
@@ -401,15 +402,20 @@ docker run --rm --gpus '"device=0,1,2,3"' --ipc host \
 
 ### SageAttention (H3 only)
 
-The H3 image also carries [SageAttention](https://github.com/thu-ml/SageAttention)'s 8-bit attention, built in and
-**off by default**. `KUNO_H3_ATTENTION=sage` starts every SGLang server with `--attention-backend sage_attn`; anything
-else leaves SGLang's own choice, which is FlashAttention on an H200.
+The H3 image also carries [SageAttention](https://github.com/thu-ml/SageAttention)'s 8-bit attention, **on by default
+for `h3-turbo` on H200s** (since 2026-09-18). With `KUNO_H3_ATTENTION` unset or `auto`, the worker starts the Turbo
+server with `--attention-backend sage_attn` when the image has SageAttention and every GPU it can see is one the kernels
+are built for. Otherwise, and always for full `h3` and `h3-reference`, it leaves SGLang's own choice, which is
+FlashAttention on an H200. `default` turns SageAttention off everywhere; `sage` turns it on for every server, full H3
+included.
 
 - **What it saves.** Measured on one H200 (`h3-turbo`, 8 passes, 5 s, seed 1234, 2026-09-17): 47.95 s against
   FlashAttention's 51.26 s, so **6.5% less GPU time** — 9.28 GPU-seconds per output second against 9.92 — for about
   2 GB more GPU memory.
 - **What it changes.** A **different picture, not a worse one**: the two clips differ by 30.2 dB PSNR and 0.925 SSIM,
-  and each backend repeats its own clip bit-identically. Your videos will not match another miner's frame for frame,
+  and the framing visibly moves, but the owner compared them by eye and could not tell which was better. Each backend
+  repeats its own clip bit-identically. Full H3 runs 50 passes, where 8-bit attention moves the picture further, and
+  nobody has compared those clips, which is why `auto` leaves it on SGLang's default. Your videos will not match another miner's frame for frame,
   which costs you nothing: H3 jobs carry no step commitment, and validators judge H3 output on quality, never by
   comparing your frames with a replay.
 - **Verified mode does not use it.** `h3-turbo` in verified mode runs in the worker process on diffusers, whose
@@ -418,8 +424,8 @@ else leaves SGLang's own choice, which is FlashAttention on an H200.
   `starting the SGLang turbo server on 127.0.0.1:30012 (1 GPU(s), sage_attn attention)`. Nothing else carries it: H3
   has no precision recipe and no step commitment.
 - **Hopper only in this image.** The kernels are built for SM90 (H200), the card they were measured on. On a B200 or
-  B300, leave it at `default` until the image is rebuilt with those architectures; the worker refuses `sage` in an
-  image without the package, but it cannot tell whether the kernels match your card.
+  B300, `auto` falls back to SGLang's default and says why in the log. `sage` by name is refused in an image without
+  the package, or where NVML reports a card the kernels are not built for.
 
 ### What one GPU serves of `h3-turbo`
 

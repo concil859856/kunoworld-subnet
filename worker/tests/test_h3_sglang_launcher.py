@@ -18,6 +18,7 @@ import pytest
 
 from kuno_worker.backends import build_backends
 from kuno_worker.config import WorkerConfig
+from kuno_worker import h3_servers
 from kuno_worker.h3_servers import ATTENTION_KEY, plan_servers, run, server_env
 
 
@@ -26,6 +27,19 @@ LORA = "/models/h3-turbo/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors"
 H3_CLASS = "C2.h200-141gb.x1"
 # A verified class h3-turbo does not pin: h3 and h3-reference's four-GPU one.
 OTHER_CLASS = "C4.h200-141gb.x4.ulysses4"
+
+
+@pytest.fixture(autouse=True)
+def gpus_nvml_cannot_see(monkeypatch):
+    """As on a machine without a driver, whatever this one has: tests that need GPUs say which."""
+    monkeypatch.setattr(h3_servers, "visible_compute_capabilities", lambda: None)
+
+
+def on_gpus(monkeypatch, *capabilities: tuple[int, int]) -> None:
+    monkeypatch.setattr(h3_servers, "visible_compute_capabilities", lambda: list(capabilities))
+
+
+H200, B200 = (9, 0), (10, 0)
 
 
 def configure(tmp_path: Path, **values: str) -> tuple[WorkerConfig, dict[str, str]]:
@@ -87,14 +101,57 @@ def venv(tmp_path: Path, *packages: str) -> str:
     return str(binary)
 
 
-def test_the_attention_backend_defaults_to_flashattention_and_sage_is_asked_for(tmp_path):
-    """KUNO_H3_ATTENTION=sage adds SGLang's `--attention-backend sage_attn`; the default adds nothing, so every
-    server runs exactly the command every measurement used."""
+def test_turbo_runs_sageattention_by_default_on_h200s(tmp_path, monkeypatch):
+    """The owner compared Turbo's clips by eye on 2026-09-18 and could not tell SageAttention's from FlashAttention's,
+    and SageAttention is 6.5% faster, so `auto` (the default) gives it to the Turbo server wherever it can run."""
+    on_gpus(monkeypatch, H200)
     sage_venv = venv(tmp_path / "with", "sageattention")
-    for value in ("", "default"):
-        config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_SGLANG_BIN=sage_venv, **({ATTENTION_KEY: value} if value else {}))
+    for value in ("", "auto"):
+        config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, KUNO_SGLANG_BIN=sage_venv,
+                                **({ATTENTION_KEY: value} if value else {}))
         [server] = plan_servers(config, env)
-        assert "--attention-backend" not in server.argv and server.attention == "default"
+        assert server.argv[-6:] == ["--lora-path", LORA, "--lora-nickname", "turbo", "--attention-backend", "sage_attn"]
+        assert server.attention == "sage_attn"
+    # Full H3 runs 50 passes, where nobody has compared the pictures: it keeps SGLang's default, even beside Turbo.
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo,h3,h3-reference", KUNO_H3_TURBO_LORA=LORA,
+                            KUNO_H3_SHARED_SERVERS="1", KUNO_SGLANG_BIN=sage_venv)
+    assert [(s.name, s.attention) for s in plan_servers(config, env)] == [
+        ("fl2va", "default"), ("ref2va", "default"), ("turbo", "sage_attn"),
+    ]
+    config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_SGLANG_BIN=sage_venv)
+    [server] = plan_servers(config, env)
+    assert "--attention-backend" not in server.argv and server.attention == "default"
+
+
+@pytest.mark.parametrize("gpus, package, reason", [
+    ([B200], True, "built for sm_90, not sm_100"),
+    ([H200, B200], True, "built for sm_90, not sm_100"),
+    ([H200], False, "this image has no SageAttention"),
+    (None, True, "NVML did not report the GPUs' architecture"),
+])
+def test_auto_falls_back_to_sglangs_default_where_sageattention_cannot_run(tmp_path, monkeypatch, caplog, gpus, package, reason):
+    """The image's kernels are built for Hopper only (SAGE_ARCH 9.0), so a B200 or B300 Turbo worker serves with
+    SGLang's default instead of failing, and says why."""
+    if gpus is not None:
+        on_gpus(monkeypatch, *gpus)
+    binary = venv(tmp_path / "v", *(["sageattention"] if package else []))
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, KUNO_SGLANG_BIN=binary)
+    with caplog.at_level(logging.INFO, logger="kuno.worker.h3_servers"):
+        [server] = plan_servers(config, env)
+    assert "--attention-backend" not in server.argv and server.attention == "default"
+    assert "KUNO_H3_ATTENTION=auto: SGLang's default attention on every server, because " in caplog.text
+    assert reason in caplog.text
+
+
+def test_default_and_sage_are_asked_for_by_name(tmp_path, monkeypatch):
+    """`default` puts every server back on exactly the command the measurements before 2026-09-17 used; `sage` adds
+    SGLang's `--attention-backend sage_attn` to every server, full H3 included."""
+    on_gpus(monkeypatch, H200)
+    sage_venv = venv(tmp_path / "with", "sageattention")
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, KUNO_SGLANG_BIN=sage_venv,
+                            KUNO_H3_ATTENTION="default")
+    [server] = plan_servers(config, env)
+    assert "--attention-backend" not in server.argv and server.attention == "default"
     config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_SGLANG_BIN=sage_venv, KUNO_H3_ATTENTION="sage")
     [server] = plan_servers(config, env)
     assert server.argv[-2:] == ["--attention-backend", "sage_attn"] and server.attention == "sage_attn"
@@ -105,16 +162,21 @@ def test_the_attention_backend_defaults_to_flashattention_and_sage_is_asked_for(
     assert server.argv[-4:] == ["--attention-backend", "sage_attn", "--mem-fraction-static", "0.8"]
 
 
-def test_an_attention_backend_the_image_cannot_serve_is_refused(tmp_path):
-    """SGLang falls back to FlashAttention with only a log line, so the worker refuses instead of serving something
-    other than what the miner asked for."""
+def test_an_attention_backend_the_image_cannot_serve_is_refused(tmp_path, monkeypatch):
+    """SGLang falls back to FlashAttention with only a log line, so the worker refuses `sage` asked for by name
+    instead of serving something other than what the miner asked for."""
     config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_H3_ATTENTION="flash")
-    with pytest.raises(ValueError, match="KUNO_H3_ATTENTION='flash' is not one of default, sage"):
+    with pytest.raises(ValueError, match="KUNO_H3_ATTENTION='flash' is not one of auto, default, sage"):
         plan_servers(config, env)
     config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_H3_ATTENTION="sage", KUNO_SGLANG_BIN=venv(tmp_path / "without"))
     with pytest.raises(ValueError, match="needs sageattention in the SGLang environment"):
         plan_servers(config, env)
-    # A bare `sglang` on PATH (a development machine) has no venv to check, and is taken at its word.
+    on_gpus(monkeypatch, B200)
+    config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_H3_ATTENTION="sage", KUNO_SGLANG_BIN=venv(tmp_path / "with", "sageattention"))
+    with pytest.raises(ValueError, match="kernels are built for sm_90 only, and this worker's GPUs include sm_100"):
+        plan_servers(config, env)
+    # A bare `sglang` on PATH on a machine without a driver has nothing to check against, and is taken at its word.
+    monkeypatch.setattr(h3_servers, "visible_compute_capabilities", lambda: None)
     config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_H3_ATTENTION="sage")
     assert plan_servers(config, env)[0].attention == "sage_attn"
 

@@ -30,9 +30,12 @@ Environment, besides the worker's own:
   KUNO_H3_TURBO_LORA           --lora-path of the Turbo server, and the in-process pipeline's LoRA; h3-turbo needs it
   KUNO_H3_NUM_GPUS             --num-gpus and --ulysses-degree of every server (default: the gpus_per_worker of the
                                profiles that server holds — 4 for h3 and h3-reference, 1 for h3-turbo)
-  KUNO_H3_ATTENTION            default (SGLang's own choice, FlashAttention on Hopper) | sage (SageAttention's 8-bit
-                               attention, built into the H3 image; 6.5% faster and a different picture, §3 of
-                               research/h3-image-check_2026-09-17.md). Refused when the image cannot serve it
+  KUNO_H3_ATTENTION            auto (the default: SageAttention's 8-bit attention on the Turbo server where the image
+                               has it and the GPUs are ones its kernels are built for, H200s; SGLang's own choice,
+                               FlashAttention, everywhere else) | default (SGLang's own choice on every server) | sage
+                               (SageAttention on every server; refused where the image cannot serve it). SageAttention
+                               renders Turbo 6.5% faster, with a different picture the owner could not tell from
+                               FlashAttention's (research/h3-image-check_2026-09-17.md §3)
   KUNO_H3_SHARED_SERVERS       1 lets one container load H3 more than once on its GPUs (default: refused)
   KUNO_SGLANG_ARGS             extra arguments for every server, shell-quoted
   KUNO_SGLANG_START_TIMEOUT_S  how long to wait for /health (default 3600: loading ~124 GB in a CVM is slow)
@@ -72,11 +75,23 @@ log = logging.getLogger("kuno.worker.h3_servers")
 
 SERVERS = ("fl2va", "ref2va", "turbo")
 # KUNO_H3_ATTENTION: which attention implementation the SGLang servers run. `default` is whatever SGLang picks
-# (FlashAttention on Hopper), the one every measurement and every published clip so far used.
+# (FlashAttention on Hopper), which every measurement before 2026-09-17 used; `sage` is SageAttention's 8-bit attention.
+# `auto`, the default, runs SageAttention on the servers in AUTO_SAGE_SERVERS where the image can serve it on these GPUs,
+# and `default` everywhere else.
 ATTENTION_KEY = "KUNO_H3_ATTENTION"
+AUTO_ATTENTION = "auto"
 DEFAULT_ATTENTION = "default"
 ATTENTION_BACKENDS = {DEFAULT_ATTENTION: (), "sage": ("--attention-backend", "sage_attn")}
+ATTENTION_CHOICES = (AUTO_ATTENTION, *ATTENTION_BACKENDS)
 ATTENTION_PACKAGES = {"sage": "sageattention"}
+# The servers `auto` gives SageAttention: Turbo only. On one H200 it rendered Turbo's 8 passes 6.5% faster, and the
+# owner compared the two clips by eye on 2026-09-18 and could not tell which was better. Full H3 (fl2va, ref2va) runs
+# 50 passes, where 8-bit attention moves the picture much further (19.9 dB against BF16 in the VC-Attention paper), and
+# nobody has compared those clips, so it keeps SGLang's default.
+AUTO_SAGE_SERVERS = frozenset({"turbo"})
+# The GPU architectures the image's SageAttention kernels are compiled for: SAGE_ARCH in image/worker.Dockerfile, 9.0
+# (Hopper: H200). A B200 (10.0) or B300 (10.3) has no kernel to run, so `auto` gives them SGLang's default.
+SAGE_COMPUTE_CAPABILITIES = frozenset({(9, 0)})
 URL_KEYS = {"fl2va": "KUNO_H3_FL2VA_URL", "ref2va": "KUNO_H3_REF2VA_URL", "turbo": "KUNO_H3_TURBO_URL"}
 IN_PROCESS = "in-process"
 SHARED_KEY = "KUNO_H3_SHARED_SERVERS"
@@ -125,25 +140,76 @@ def _describe(load: str) -> str:
     return f"on the SGLang {load} server"
 
 
-def attention_args(env: Mapping[str, str], binary: str) -> list[str]:
-    """The `--attention-backend` the servers run with, from KUNO_H3_ATTENTION (default | sage).
+def attention_backends(env: Mapping[str, str], binary: str, names: Sequence[str]) -> dict[str, str]:
+    """Which attention backend each of the servers `names` runs, from KUNO_H3_ATTENTION (auto | default | sage):
+    `default` or `sage` for every server, or with `auto` (the default) `sage` for the servers in AUTO_SAGE_SERVERS
+    when the image has SageAttention and every GPU here is one its kernels are built for.
 
-    `sage` is SageAttention's 8-bit attention, built into the H3 image but off by default: on one H200 it rendered a
-    5 s Turbo clip in 47.95 s against FlashAttention's 51.26 s (6.5% faster) for about 2 GB more memory, and the two
-    clips differ (30.2 dB PSNR, 0.925 SSIM) — a different picture, not a worse one (research/h3-image-check_2026-09-17.md
-    §3). SGLang falls back to FlashAttention with only a log line when the package is missing, so a value this image
-    cannot serve is refused here instead. Raises ValueError for an unknown value, or for `sage` in an image without
-    sageattention in the SGLang venv."""
-    choice = (env.get(ATTENTION_KEY) or DEFAULT_ATTENTION).strip()
-    if choice not in ATTENTION_BACKENDS:
-        raise ValueError(f"{ATTENTION_KEY}={choice!r} is not one of {', '.join(ATTENTION_BACKENDS)}")
-    if choice != DEFAULT_ATTENTION and not _installed(binary, ATTENTION_PACKAGES[choice]):
-        raise ValueError(
-            f"{ATTENTION_KEY}={choice} needs {ATTENTION_PACKAGES[choice]} in the SGLang environment of {binary}, which "
-            f"this image does not have; SGLang would fall back to FlashAttention without failing. Use "
-            f"{ATTENTION_KEY}={DEFAULT_ATTENTION}, or an image built with it (image/worker.Dockerfile, target h3)"
-        )
-    return list(ATTENTION_BACKENDS[choice])
+    SageAttention is 8-bit attention: on one H200 it rendered a 5 s Turbo clip in 47.95 s against FlashAttention's
+    51.26 s (6.5% faster) for about 2 GB more memory. The two clips differ (30.2 dB PSNR, 0.925 SSIM, and a visibly
+    different framing), and the owner could not tell which was better (research/h3-image-check_2026-09-17.md §3).
+    SGLang falls back to FlashAttention with only a log line when the package is missing, so `sage` asked for by name
+    is refused where the image cannot serve it; `auto` falls back instead, and says so in the log. Raises ValueError for
+    an unknown value, or for `sage` in an image without sageattention in the SGLang venv or on GPUs NVML reports its
+    kernels are not built for."""
+    choice = (env.get(ATTENTION_KEY) or AUTO_ATTENTION).strip()
+    if choice not in ATTENTION_CHOICES:
+        raise ValueError(f"{ATTENTION_KEY}={choice!r} is not one of {', '.join(ATTENTION_CHOICES)}")
+    if choice == DEFAULT_ATTENTION or (choice == AUTO_ATTENTION and not AUTO_SAGE_SERVERS.intersection(names)):
+        return {name: DEFAULT_ATTENTION for name in names}
+    installed = _installed(binary, ATTENTION_PACKAGES["sage"])
+    capabilities = visible_compute_capabilities() if installed else None
+    unbuilt = sorted({cc for cc in capabilities or () if cc not in SAGE_COMPUTE_CAPABILITIES})
+    built_for = ", ".join(f"sm_{major}{minor}" for major, minor in sorted(SAGE_COMPUTE_CAPABILITIES))
+    if choice == "sage":
+        if not installed:
+            raise ValueError(
+                f"{ATTENTION_KEY}=sage needs sageattention in the SGLang environment of {binary}, which this image does "
+                f"not have; SGLang would fall back to FlashAttention without failing. Use {ATTENTION_KEY}={DEFAULT_ATTENTION}, "
+                "or an image built with it (image/worker.Dockerfile, target h3)"
+            )
+        if unbuilt:
+            raise ValueError(
+                f"{ATTENTION_KEY}=sage: this image's SageAttention kernels are built for {built_for} only, and this "
+                f"worker's GPUs include {', '.join(f'sm_{a}{b}' for a, b in unbuilt)}. Use {ATTENTION_KEY}={DEFAULT_ATTENTION} "
+                "(or auto), or rebuild the image with those architectures in SAGE_ARCH"
+            )
+        # Where NVML cannot say (a development machine without a driver), `sage` is taken at its word.
+        return {name: "sage" for name in names}
+    if not installed:
+        reason = "this image has no SageAttention"
+    elif capabilities is None:
+        reason = "NVML did not report the GPUs' architecture"
+    elif unbuilt:
+        reason = f"the image's SageAttention kernels are built for {built_for}, not {', '.join(f'sm_{a}{b}' for a, b in unbuilt)}"
+    else:
+        return {name: "sage" if name in AUTO_SAGE_SERVERS else DEFAULT_ATTENTION for name in names}
+    log.info("%s=auto: SGLang's default attention on every server, because %s", ATTENTION_KEY, reason)
+    return {name: DEFAULT_ATTENTION for name in names}
+
+
+def visible_compute_capabilities() -> list[tuple[int, int]] | None:
+    """The CUDA compute capability of every GPU this container can see, read through NVML (no CUDA context, so nothing
+    is taken from the SGLang servers), or None where NVML is missing or answers nothing."""
+    try:
+        import pynvml
+    except ImportError:
+        return None
+    try:
+        pynvml.nvmlInit()
+    except Exception:  # noqa: BLE001 - no driver (a development machine, or the mock network)
+        return None
+    try:
+        found = [
+            tuple(pynvml.nvmlDeviceGetCudaComputeCapability(pynvml.nvmlDeviceGetHandleByIndex(index)))
+            for index in range(pynvml.nvmlDeviceGetCount())
+        ]
+    except Exception:  # noqa: BLE001 - NVML is there but will not answer
+        return None
+    finally:
+        with contextlib.suppress(Exception):
+            pynvml.nvmlShutdown()
+    return [(int(major), int(minor)) for major, minor in found] or None
 
 
 def _installed(binary: str, package: str) -> bool:
@@ -188,7 +254,7 @@ def plan_servers(config: WorkerConfig, env: Mapping[str, str], catalog: Mapping[
         return []
     binary = env.get("KUNO_SGLANG_BIN") or "sglang"
     extra = shlex.split(env.get("KUNO_SGLANG_ARGS", ""))
-    attention = attention_args(env, binary)
+    attention = attention_backends(env, binary, [name for name in SERVERS if name in loads])
     override = env.get("KUNO_H3_NUM_GPUS")
     by_id = {profile.id: profile for profile in served}
     urls = {"fl2va": config.h3_fl2va_url, "ref2va": config.h3_ref2va_url, "turbo": config.h3_turbo_url}
@@ -207,7 +273,7 @@ def plan_servers(config: WorkerConfig, env: Mapping[str, str], catalog: Mapping[
             "--num-gpus", str(gpus), "--ulysses-degree", str(gpus), "--performance-mode", "speed",
             "--host", "127.0.0.1", "--port", str(port),
             "--master-port", str(port + MASTER_PORT_OFFSET), "--scheduler-port", str(port + SCHEDULER_PORT_OFFSET),
-            *lora, *attention, *extra,
+            *lora, *ATTENTION_BACKENDS[attention[name]], *extra,
         ]
         servers.append(Server(name, port, argv))
     if len({server.port for server in servers}) != len(servers):

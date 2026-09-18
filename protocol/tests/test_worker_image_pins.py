@@ -141,10 +141,10 @@ def test_default_profiles_and_entry_points_match_what_each_image_can_serve():
     assert 'kuno-h3-worker = "kuno_worker.h3_servers:main"' in scripts and 'kuno-safety-check = "kuno_worker.safety_check:main"' in scripts
 
 
-def test_sageattention_is_built_from_a_pinned_commit_and_is_not_the_default():
+def test_sageattention_is_built_from_a_pinned_commit_for_the_gpus_the_worker_gives_it_to():
     """The H3 image carries SageAttention (6.5% faster, a different picture: research/h3-image-check_2026-09-17.md §3),
-    built from one commit whose contents are checked, and only for the architecture it was measured on. Nothing in the
-    image turns it on: a miner does that with KUNO_H3_ATTENTION=sage."""
+    built from one commit whose contents are checked, and only for the architecture it was measured on. The worker's
+    `auto` default gives it to the Turbo server only on GPUs of that architecture, so the two must name the same one."""
     body = stage("h3")
     assert re.search(r"^ARG SAGE_REF=[0-9a-f]{40}$", body, re.M)  # a commit, not a branch or tag
     assert re.search(r"^ARG SAGE_TREE_SHA256=[0-9a-f]{64}$", body, re.M)
@@ -154,8 +154,10 @@ def test_sageattention_is_built_from_a_pinned_commit_and_is_not_the_default():
     build = body.index("pip --python /opt/sglang/bin/python install")
     assert 0 < body.index('[ "$found" = "${SAGE_TREE_SHA256}" ]') < build
     assert "sageattention/_qattn_sm90" in body  # and the SM90 kernels really landed in the SGLang venv
-    # Built, not on: the images set no KUNO_H3_ATTENTION, so the servers run SGLang's own default (FlashAttention).
+    # The images set no KUNO_H3_ATTENTION, so the worker's `auto` decides, and it knows SM90 and nothing else.
     assert "KUNO_H3_ATTENTION" not in stage_env("h3") and "KUNO_H3_ATTENTION" not in stage_env("ltx")
+    launcher = (SUBNET / "worker" / "src" / "kuno_worker" / "h3_servers.py").read_text()
+    assert "SAGE_COMPUTE_CAPABILITIES = frozenset({(9, 0)})" in launcher
     assert "sageattention" not in stage("ltx")
 
 

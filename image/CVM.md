@@ -260,8 +260,9 @@ The `h3` target adds SGLang's side:
   - **One sdist.** `antlr4-python3-runtime 4.9.3` has no wheel. It comes in through `omegaconf` and
     `nvidia-modelopt` from `sglang[diffusion]`. The build installs it without build isolation, using the
     setuptools 84.0.0 wheel from the lock, so building it fetches nothing unpinned.
-- **SageAttention**, built from the pinned commit `d9704247` for SM90 and installed into `/opt/sglang`, but **off
-  unless `KUNO_H3_ATTENTION=sage`**. On one H200 it rendered a 5 s Turbo clip 6.5% faster than FlashAttention (47.95 s
+- **SageAttention**, built from the pinned commit `d9704247` for SM90 and installed into `/opt/sglang`, and **on by
+  default for the Turbo server on H200s** (`KUNO_H3_ATTENTION=auto`; `default` turns it off, `sage` puts it on every
+  server). On one H200 it rendered a 5 s Turbo clip 6.5% faster than FlashAttention (47.95 s
   against 51.26 s) for about 2 GB more memory, with a different picture: 30.2 dB PSNR and 0.925 SSIM between the two
   clips, each repeating bit-identically (2026-09-17). The build downloads GitHub's tarball of that commit and checks
   the digest of the extracted tree, then compiles the kernels with the venv's CUDA 13 toolkit
@@ -290,9 +291,12 @@ The `h3` target adds SGLang's side:
     ```
     The Turbo server is the fl2va checkpoint on port 30012 with `--num-gpus 1 --ulysses-degree 1` plus
     `--lora-path <KUNO_H3_TURBO_LORA> --lora-nickname turbo`.
-  - **The attention backend.** `KUNO_H3_ATTENTION=sage` adds `--attention-backend sage_attn` to every server; the
-    default is SGLang's own choice (FlashAttention on Hopper). `sage` in an image without the package is refused at
-    start-up, because SGLang would otherwise fall back to FlashAttention with only a log line. Each server's GPU count
+  - **The attention backend.** With `KUNO_H3_ATTENTION` unset or `auto`, the Turbo server gets `--attention-backend
+    sage_attn` when the package is installed and NVML reports only SM90 GPUs; every other server, and Turbo anywhere
+    else, keeps SGLang's own choice (FlashAttention on Hopper), with a log line saying why. `default` is SGLang's
+    choice on every server and `sage` is SageAttention on every server. `sage` is refused at start-up in an image
+    without the package or on GPUs the kernels are not built for, because SGLang would otherwise fall back to
+    FlashAttention with only a log line. Each server's GPU count
     and attention backend are named in the worker's start-up log.
   - **One H3 load per container.** A loaded 4-GPU server holds 87–97 GB per GPU and peaks at about 103 GB (H200,
     2026-09-16), so two can't share 141 GB H200s, and very likely not 180 GB B200s. `kuno-h3-worker` refuses a

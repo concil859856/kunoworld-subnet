@@ -107,8 +107,8 @@ four GPUs cost 15.6 GPU-seconds per output second, a floor (cost × 1.25 / 0.60)
 One GPU costs 9.92 straight against SGLang, a floor of **$0.046** at 5 s, under both. At $0.04 the Standard price is
 about 13% under that floor, so Standard Turbo pays miners about **69% of revenue** rather than the 60% target above
 (nearer 76% at the VCU weight in `profiles.json`, which includes the worker's 2–5 s of overhead); Private at $0.065
-pays about 42%. Turning SageAttention on (9.28 GPU-s/s, `image/worker.Dockerfile`) would bring the Standard share to
-about 64%. Long Turbo clips are the same story as full H3: the floor is $0.081 at 14 s, which only the Private
+pays about 42%. SageAttention, the default for Turbo on H200s since 2026-09-18 (9.28 GPU-s/s, MINING.md), brings the Standard
+share to about 64%. Long Turbo clips are the same story as full H3: the floor is $0.081 at 14 s, which only the Private
 `long_clip` price covers, and a 141 GB card does not serve 14 s at all (MINING.md §3c).
 
 **Decided 2026-09-17 (owner): full `h3` and `h3-reference` leave Standard mode.** A Standard second of `h3` sold for
