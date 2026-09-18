@@ -18,6 +18,7 @@ from kuno_protocol.envelope import CAPACITY_REFUSED, fits, full_table, restricts
 from kuno_protocol.profiles import Mode, ParamError, load_profiles, validate_params
 from kuno_protocol.schemas import GenerationParams, MinerJob, MinerRegistration
 from kuno_worker.backends.base import Backend, GenerationTask
+from kuno_worker.backends.h3 import H3SglangBackend, one_gpu_envelope, one_gpu_max_duration_s
 from kuno_worker.backends.ltx_resident import LtxResidentBackend, build_call
 from kuno_worker.backends.quantized import CapacityRefused, MemoryPlan, admit, envelope_for_plan, plan_for_class
 from kuno_worker.config import WorkerConfig
@@ -27,6 +28,8 @@ from kuno_worker.worker import Worker
 PROFILES = load_profiles()
 FAST = PROFILES["ltx-2.5-fast"]
 DFR = PROFILES["ltx-2.5-4k"]
+TURBO = PROFILES["h3-turbo"]
+H3 = PROFILES["h3"]
 RTX5090 = "O1.rtx-5090-32gb.x1.fp8-cast"
 RTX4090 = "O1.rtx-4090-24gb.x1.int8"
 
@@ -216,3 +219,81 @@ def test_a_backend_capacity_refusal_is_reported_as_capacity_refused_not_internal
     worker.handle_job(job(5))
     assert [code for _, code, _ in client.failed] == [CAPACITY_REFUSED, "internal_error"]
     assert "99 latent tokens" in client.failed[0][2]
+
+
+# ------------------------------------------------------------------ MiniMax H3 Turbo on one GPU
+
+
+@pytest.mark.parametrize(
+    ("memory_gb", "longest"),
+    [
+        (96.0, None),     # an RTX PRO 6000: a 5 s clip alone peaks at 126.6 GB, so it serves nothing
+        (139.8, 10.0),    # an H200 141 GB, as the driver reports it: 14 s would leave 2-3 GB free, 10 s about 7
+        (141.0, 10.0),
+        (179.1, 14.0),    # a B200 180 GB: the whole profile
+        (287.0, 14.0),    # a B300 288 GB
+    ],
+)
+def test_one_gpu_serves_h3_turbo_up_to_the_length_its_memory_holds(memory_gb, longest):
+    assert one_gpu_max_duration_s(TURBO, memory_gb) == longest
+    table = one_gpu_envelope(TURBO, memory_gb)
+    if longest is None:
+        assert table == {} and not fits(table, turbo_params(5))
+        return
+    # Every size and frame rate the profile sells, each capped at the same length.
+    assert set(table) == set(full_table(TURBO)) and {d for r in table.values() for f in r.values() for d in f.values()} == {longest}
+    assert fits(table, turbo_params(longest)) and not fits(table, turbo_params(longest + 1))
+    assert restricts(table, TURBO) == (longest < TURBO.limits.max_duration_s)
+
+
+def turbo_params(duration_s: float) -> GenerationParams:
+    return GenerationParams(profile_id=TURBO.id, mode=Mode.TEXT_TO_VIDEO, duration_s=duration_s, resolution="768p",
+                            aspect_ratio="16:9", fps=24)
+
+
+def test_the_h3_backend_caps_only_the_one_gpu_profile_and_only_when_it_knows_the_card(tmp_path, monkeypatch):
+    backend = H3SglangBackend("http://127.0.0.1:1", "http://127.0.0.1:2", tmp_path, memory_gb=139.8)
+    assert backend.serving_envelope(TURBO) == one_gpu_envelope(TURBO, 139.8)
+    # h3 and h3-reference run on four GPUs, which hold every clip they allow.
+    for profile_id in ("h3", "h3-reference"):
+        assert backend.serving_envelope(PROFILES[profile_id]) == full_table(PROFILES[profile_id])
+    # Without a memory reading (no NVML, or no driver: the mock network and these tests) nothing is capped, exactly
+    # as it was before envelopes. The reading is taken once.
+    readings = []
+
+    def probe(value):
+        def read():
+            readings.append(value)
+            return value
+
+        return read
+
+    monkeypatch.setattr("kuno_worker.backends.h3.visible_gpu_memory_gb", probe(None))
+    blind = H3SglangBackend("http://127.0.0.1:1", "http://127.0.0.1:2", tmp_path)
+    assert blind.serving_envelope(TURBO) == full_table(TURBO)
+    monkeypatch.setattr("kuno_worker.backends.h3.visible_gpu_memory_gb", probe(179.1))
+    seen = H3SglangBackend("http://127.0.0.1:1", "http://127.0.0.1:2", tmp_path)
+    assert seen.serving_envelope(TURBO) == full_table(TURBO)  # a B200 holds the whole profile
+    assert seen.serving_envelope(TURBO) == full_table(TURBO)
+    assert readings == [None, 179.1]  # and NVML was read once per backend, not once per profile
+
+
+def test_a_turbo_worker_on_an_h200_registers_its_ten_second_envelope(tmp_path):
+    client = RecordingClient()
+    config = WorkerConfig(gateway_url="http://127.0.0.1:9", profiles=[TURBO.id, H3.id], image_digest=DEV_IMAGE_DIGEST)
+    backend = H3SglangBackend("http://127.0.0.1:1", "http://127.0.0.1:2", tmp_path, memory_gb=139.8)
+    worker = Worker(config, MockTEE(generate_signing_key(), DEV_IMAGE_DIGEST), {"minimax-h3": backend})
+    worker.client = client
+    worker.register()
+    (sent,) = client.registered
+    # Only the profile the card restricts is advertised; h3 keeps its full limits and stays out of the envelope.
+    assert list(sent["envelope"]) == [TURBO.id]
+    assert sent["envelope"][TURBO.id]["768p"]["16:9"] == {"24": 10.0}
+    assert worker.handle_job(turbo_job(14)) is None
+    ((_, code, message),) = client.failed
+    assert code == CAPACITY_REFUSED and "serves 768p 16:9 at 24 fps up to 10 s" in message
+    assert worker.serving_envelope()[H3.id] == full_table(H3)
+
+
+def turbo_job(duration_s: float) -> MinerJob:
+    return MinerJob(job_id=str(uuid.uuid4()), params=turbo_params(duration_s), enc="AA", ciphertext="AA", input_blob_ids=[])

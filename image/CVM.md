@@ -212,7 +212,7 @@ With `KUNO_BACKEND=real`, each H3 profile goes to one runtime (`worker/backends/
 |---|---|---|
 | `h3` | SGLang's fl2va server, over loopback | the same, with no step commitment |
 | `h3-reference` | SGLang's ref2va server | the same, with no step commitment |
-| `h3-turbo` | SGLang's Turbo server: fl2va with LightX2V's LoRA | diffusers' MiniMax H3 modular pipeline with the LoRA, in the worker process (`backends/h3_resident.py`), committing to every step; no Turbo server |
+| `h3-turbo` | SGLang's Turbo server: fl2va with LightX2V's LoRA, on **one** GPU | diffusers' MiniMax H3 modular pipeline with the LoRA, in the worker process (`backends/h3_resident.py`), committing to every step; no Turbo server |
 
 All three profiles' `verified` blocks pin the diffusers pipeline, but SGLang has no per-step hook, so only
 `h3-turbo` has a verified path. diffusers loads the LoRA through `peft`, which `image/pyproject.toml` adds to the
@@ -235,17 +235,31 @@ The `h3` target adds SGLang's side:
   - **One sdist.** `antlr4-python3-runtime 4.9.3` has no wheel. It comes in through `omegaconf` and
     `nvidia-modelopt` from `sglang[diffusion]`. The build installs it without build isolation, using the
     setuptools 84.0.0 wheel from the lock, so building it fetches nothing unpinned.
+- **SageAttention**, built from the pinned commit `d9704247` for SM90 and installed into `/opt/sglang`, but **off
+  unless `KUNO_H3_ATTENTION=sage`**. On one H200 it rendered a 5 s Turbo clip 6.5% faster than FlashAttention (47.95 s
+  against 51.26 s) for about 2 GB more memory, with a different picture: 30.2 dB PSNR and 0.925 SSIM between the two
+  clips, each repeating bit-identically (2026-09-17). The build downloads GitHub's tarball of that commit and checks
+  the digest of the extracted tree, then compiles the kernels with the venv's CUDA 13 toolkit
+  (`-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK`, and a libcuda stub for the link); it took 234 s on 12 cores on a
+  development box. Only SM90 is built, so on B200 and B300 the setting must stay at its default until the image is
+  rebuilt with `SAGE_ARCH="9.0 10.0"`. Verified mode does not use it: the diffusers recipe pins `sdpa`.
 - **g++**, from the Debian snapshot. Triton builds its CUDA launcher with gcc the first time a kernel runs, and
   SGLang's diffusion kernels include Triton and JIT-compiled ones. The H3 DiT calls `fused_inplace_qknorm`.
 - **`kuno-h3-worker`**, the entry point (`worker/src/kuno_worker/h3_servers.py`). kuno-app starts one container per
   GPU group (§6), so each container brings its own servers.
   - **What it starts.** The `sglang serve` the profiles route to: fl2va for `h3`, ref2va for `h3-reference`, and
-    the Turbo server for `h3-turbo`. Each runs with the official recipe:
+    the Turbo server for `h3-turbo`. Each runs with the official recipe, on as many GPUs as its own profiles need
+    (`gpus_per_worker`: four for `h3` and `h3-reference`, one for `h3-turbo`; `KUNO_H3_NUM_GPUS` overrides them all):
     ```
     /opt/sglang/bin/sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va --num-gpus 4 \
         --ulysses-degree 4 --performance-mode speed --host 127.0.0.1 --port 30010 --master-port 31010 --scheduler-port 32010
     ```
-    The Turbo server is the fl2va checkpoint on port 30012 plus `--lora-path <KUNO_H3_TURBO_LORA> --lora-nickname turbo`.
+    The Turbo server is the fl2va checkpoint on port 30012 with `--num-gpus 1 --ulysses-degree 1` plus
+    `--lora-path <KUNO_H3_TURBO_LORA> --lora-nickname turbo`.
+  - **The attention backend.** `KUNO_H3_ATTENTION=sage` adds `--attention-backend sage_attn` to every server; the
+    default is SGLang's own choice (FlashAttention on Hopper). `sage` in an image without the package is refused at
+    start-up, because SGLang would otherwise fall back to FlashAttention with only a log line. Each server's GPU count
+    and attention backend are named in the worker's start-up log.
   - **One H3 load per container.** A loaded 4-GPU server holds 87–97 GB per GPU and peaks at about 103 GB (H200,
     2026-09-16), so two can't share 141 GB H200s, and very likely not 180 GB B200s. `kuno-h3-worker` refuses a
     profile set that needs two loads, for example `h3,h3-reference`, or `h3-turbo` beside `h3`. It names the
@@ -277,9 +291,16 @@ The `h3` target adds SGLang's side:
   sees only `/models`, so the file has to be on a weights image, for example the `h3` one next to the hub cache.
 - **Requests.** Each carries `flow_shift` 6 and `audio_flow_shift` 3, the LoRA's training shifts, and
   `num_inference_steps` 9: SGLang runs one pass fewer than the points it is given, and the LoRA is trained for 8.
+- **One GPU.** `h3-turbo` is a single-GPU profile since 2026-09-17: one H200 renders it at 9.92 GPU-seconds per
+  output second against 15.6 through a four-GPU worker, and a single-GPU confidential VM is far easier to rent. It is
+  served from the `c2.*.x1` shapes, not the whole-server `c8.*` ones.
+- **Its envelope.** One H200 peaks at 126.6-128.9 GB for a 5 s clip and 137.6-138.9 GB at 14 s, so the worker
+  advertises `h3-turbo` up to 10 s on a 141 GB card and the profile's full 14 s on 180 GB or more
+  (`worker/backends/h3.py`, MINING.md §3c).
 - **Measured.** SGLang 0.5.19 from this image served the LoRA through `--lora-path` on 4 H200s (2026-09-16),
-  at 11.5 GPU-s per output second at 5 s (`research/pricing/measured_2026-09-16_h3-turbo.md` in the dev repo). That
-  run sent 8 points, not 9, and went straight to SGLang: the worker has not sent a Turbo job yet.
+  at 11.5 GPU-s per output second at 5 s, and on 2026-09-17 through the worker and a real gateway, at 15.6 on four
+  GPUs (`research/pricing/measured_2026-09-16_h3-turbo.md` and `research/h3-image-check_2026-09-17.md` in the dev
+  repo). One-GPU serving has run only straight against SGLang, not through the worker.
 - **No lightx2v.** LightX2V's own `inference_minimax_h3.py` isn't in the image, and no backend runs it.
 
 **Run on GPUs without confidential computing** (4 of 8 H200s, 2026-09-15 and -16): SGLang loads H3 from a read-only,
@@ -288,13 +309,18 @@ names exist (both fixed in `worker.Dockerfile`). **Not verified**, in particular
 - **Two H3 loads on one GPU group** (`KUNO_H3_SHARED_SERVERS=1`), on any GPU. The image's earlier default,
   `h3,h3-reference`, started both servers on four GPUs; it never ran, and would almost certainly run out of memory
   on H200s.
-- **`h3-turbo` through the worker:** the Turbo server started by `kuno-h3-worker`, and its requests at 9 points.
+- **`h3-turbo` through the worker:** the Turbo server started by `kuno-h3-worker` **on one GPU**. The four-GPU Turbo
+  server and its requests at 9 points ran through the worker and a real gateway on 2026-09-17; one-GPU serving has run
+  only straight against SGLang, and never with the memory of a 10 s clip checked against the envelope.
+- **SageAttention in this image:** it was built and measured in a container committed from the published image, not
+  by `worker.Dockerfile`, and only for SM90. A rebuild has to show that `image/build.sh --check` still gives two
+  identical digests and that the SM90 kernels are installed.
 - SGLang's JIT kernels compiling with the CUDA 13 toolkit that pip wheels put in `/opt/sglang`. `kuno-h3-worker` sets
   the servers' `CUDA_HOME` to it (`site-packages/nvidia/cu13`, holding `nvcc` and the runtime headers), and g++ is
   the host compiler. Whether those wheels hold everything the kernels include and link is unchecked.
 - Verified `h3-turbo` in the worker process: its memory, loading the LoRA through `peft`, and its determinism. Only
-  the imports were checked, with peft 0.21.0 beside this image's diffusers 0.40, transformers and torch. Its loader
-  has no sequence parallelism, while the classes `h3-turbo` pins name Ulysses x4.
+  the imports were checked, with peft 0.21.0 beside this image's diffusers 0.40, transformers and torch. Since
+  2026-09-17 the classes it pins are single-GPU ones, which its loader (no sequence parallelism) matches.
 - Shared memory for NCCL between four GPUs in one container. kuno-app sets no `--shm-size`, and podman's default
   `/dev/shm` is 64 MB.
 
@@ -484,7 +510,14 @@ uv run python subnet/image/cvm/publish.py verify --manifest manifest.signed.json
 ```
 
 `entry` adds an `AllowedMeasurement`: `platform: "tdx"`, the worker image digest RTMR3 records, the
-shape's profiles, and the five registers. It also adds `model_digests` entries (`PROTOCOL.md`, "Golden
+shape's profiles, and the five registers.
+
+**One shape, two worker images.** A `c2.*.x1` shape serves `ltx-2.5-fast`, `ltx-2.5-pro`, `ltx-2.5-4k` and, since
+2026-09-17, `h3-turbo` — but never from the same worker image: the LTX image cannot serve H3 and the H3 image cannot
+serve LTX-2.5. The two measurements differ (RTMR3 records the image digest), so they are separate entries, and
+`--shapes` would give each the shape's whole list. Publish the H3-image entry with `--profiles h3-turbo` and the
+LTX-image entry with `--profiles ltx-2.5-fast,ltx-2.5-pro,ltx-2.5-4k`, so each entry allows only what its image can
+actually serve. It also adds `model_digests` entries (`PROTOCOL.md`, "Golden
 manifest"). The manifest has no field for the image disk: RTMR3 pins its root hash, and `entry` prints it
 beside each entry. It refuses:
 - incomplete registers;
@@ -639,8 +672,10 @@ The server specs come from vendor pages and were not checked on hardware. Eight 
 
 ### Whole-server TDs for MiniMax H3
 
-H3 runs on four GPUs with Ulysses sequence parallelism. NVIDIA supports no four-GPU confidential VM on an HGX
-baseboard, so each H3 shape takes the whole 8-GPU server into one TD and runs two workers of four GPUs:
+`h3` and `h3-reference` run on four GPUs with Ulysses sequence parallelism. NVIDIA supports no four-GPU confidential
+VM on an HGX baseboard, so each whole-server H3 shape takes all 8 GPUs into one TD and runs two workers of four GPUs.
+(`h3-turbo` is a single-GPU profile and is served from the `c2.*.x1` shapes, with the H3 worker image and the H3
+weights image mounted; it needs none of this.)
 
 | Shape | NVIDIA mode | In the TD | GPU-to-GPU traffic | Ready state |
 |---|---|---|---|---|
@@ -670,17 +705,21 @@ continuing, the way dstack-vmm does (`configure_gpus`: GPUs, then bridges). The 
 
 ```
 KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7
-KUNO_PROFILES=h3-turbo h3-reference
-KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors
+KUNO_PROFILES=h3 h3-reference
 ```
 
 - **Profiles per group.** `KUNO_PROFILES` is one comma-separated list, which every group serves, or one list per
-  group, space-separated in the order of `KUNO_GPU_GROUPS`. Above, GPUs 0–3 serve `h3-turbo` and GPUs 4–7
+  group, space-separated in the order of `KUNO_GPU_GROUPS`. Above, GPUs 0–3 serve `h3` and GPUs 4–7
   `h3-reference`. Spaces next to a comma stay inside a list, so `h3, h3-reference` is one list. Without
   `KUNO_GPU_GROUPS`, `kuno-app` refuses per-group lists.
+- **One group size per VM.** Every group of a TD holds the same number of GPUs, because a manifest entry carries one
+  `gpus_per_enclave`, and `kuno-app` refuses a layout whose profiles disagree. A `c8.*` shape is published for `h3`
+  and `h3-reference`, so its groups are four GPUs. **A Turbo group is one GPU** now
+  (`gpus_per_worker: 1`), which the same code supports — eight groups of one on an 8-GPU VM — but no `c8.*`
+  measurement is published for it, so Turbo is served from the single-GPU `c2.*` shapes instead, where the
+  whole VM is its group and no layout is needed.
 - **One H3 load per group.** On H200s and B200s each H3 group serves one of `h3`, `h3-reference` and `h3-turbo`
   (§1, "The MiniMax H3 image"). A group given more exits at start, and `kuno-app` then stops the other worker too.
-  `h3-turbo` has not yet run through the worker.
 - **Devices.** Each container gets its group's CDI devices, `nvidia.com/gpu=<index>`, and in Protected PCIe mode
   the NVSwitch device nodes and the root filesystem's NSCQ library.
 - **Layout checks.** `kuno-app` refuses overlapping groups, missing indices, a group whose size isn't every

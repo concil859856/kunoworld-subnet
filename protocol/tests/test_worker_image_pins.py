@@ -141,6 +141,24 @@ def test_default_profiles_and_entry_points_match_what_each_image_can_serve():
     assert 'kuno-h3-worker = "kuno_worker.h3_servers:main"' in scripts and 'kuno-safety-check = "kuno_worker.safety_check:main"' in scripts
 
 
+def test_sageattention_is_built_from_a_pinned_commit_and_is_not_the_default():
+    """The H3 image carries SageAttention (6.5% faster, a different picture: research/h3-image-check_2026-09-17.md §3),
+    built from one commit whose contents are checked, and only for the architecture it was measured on. Nothing in the
+    image turns it on: a miner does that with KUNO_H3_ATTENTION=sage."""
+    body = stage("h3")
+    assert re.search(r"^ARG SAGE_REF=[0-9a-f]{40}$", body, re.M)  # a commit, not a branch or tag
+    assert re.search(r"^ARG SAGE_TREE_SHA256=[0-9a-f]{64}$", body, re.M)
+    assert re.search(r"^ARG SAGE_ARCH=9\.0$", body, re.M)  # SM90 (H200), the only one built and measured
+    assert "SageAttention/tar.gz/${SAGE_REF}" in body and "TORCH_CUDA_ARCH_LIST=\"${SAGE_ARCH}\"" in body
+    # The extracted tree is hashed and compared before anything is built or installed.
+    build = body.index("pip --python /opt/sglang/bin/python install")
+    assert 0 < body.index('[ "$found" = "${SAGE_TREE_SHA256}" ]') < build
+    assert "sageattention/_qattn_sm90" in body  # and the SM90 kernels really landed in the SGLang venv
+    # Built, not on: the images set no KUNO_H3_ATTENTION, so the servers run SGLang's own default (FlashAttention).
+    assert "KUNO_H3_ATTENTION" not in stage_env("h3") and "KUNO_H3_ATTENTION" not in stage_env("ltx")
+    assert "sageattention" not in stage("ltx")
+
+
 @pytest.mark.skipif(tomllib is None, reason="tomllib needs Python 3.11")
 def test_base_images_python_environments_and_debian_packages_are_pinned():
     for arg in ("PYTHON_IMAGE", "UV_IMAGE"):

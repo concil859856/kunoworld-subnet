@@ -372,12 +372,14 @@ def test_every_shape_is_the_vm_of_one_confidential_class_in_each_profile_it_serv
     for gpu, vram, switches, mode in (("h200", 141, 4, "ppcie"), ("b200", 180, 0, "mpt"), ("b300", 288, 0, "mpt")):
         shape = shapes[f"c8.{gpu}-{vram}gb.x8"]
         assert (shape["num_gpus"], shape["num_nvswitches"], shape["gpu_mode"]) == (8, switches, mode)
-        assert shape["profiles"] == ["h3-turbo", "h3", "h3-reference"]
+        # h3-turbo left the whole-server shapes on 2026-09-17: one GPU serves it (profiles.json), and every worker
+        # group of a TD is one size, so it runs on the single-GPU c2 shapes below.
+        assert shape["profiles"] == ["h3", "h3-reference"]
     # NVIDIA supports no 4-GPU confidential VM on an HGX baseboard: Protected PCIe takes all 8 GPUs and 4 NVSwitches.
     assert not [s for s in shapes if s.startswith("c4.")]
     for gpu, vram in (("b200", 180), ("b300", 288)):
         shape = shapes[f"c2.{gpu}-{vram}gb.x1"]
-        assert shape["num_gpus"] == 1 and shape["profiles"] == ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k"]
+        assert shape["num_gpus"] == 1 and shape["profiles"] == ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k", "h3-turbo"]
         for profile in shape["profiles"]:
             hardware = catalog[profile].verified.hardware_class(f"C2.{gpu}-{vram}gb.x1")
             assert hardware.tier == "C2" and gpu.upper() in hardware.gpu_sku and catalog[profile].min_vram_gb <= vram
@@ -411,7 +413,7 @@ def test_a_manifest_entry_is_built_signed_offline_and_accepted_by_the_production
     parsed = GoldenManifest.model_validate_json(manifest.read_text())
     entry = parsed.allowed[0]
     assert (entry.platform, entry.image_digest, entry.rtmr3) == ("tdx", IMAGE_DIGEST, measurement_document()["registers"]["rtmr3"])
-    assert entry.profiles == ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k"] and not parsed.trusts_mock()
+    assert entry.profiles == ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k", "h3-turbo"] and not parsed.trusts_mock()
     assert parsed.model_digest_for("ltx-2.5-fast", "C2.h200-141gb.x1") == "c" * 64
 
     signed = tmp_path / "manifest.signed.json"

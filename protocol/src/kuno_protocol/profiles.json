@@ -61,8 +61,8 @@
         "negative_prompt": false,
         "prompt_enhancer": false
       },
-      "hardware_class": "C4",
-      "gpus_per_worker": 4,
+      "hardware_class": "C2",
+      "gpus_per_worker": 1,
       "steps": 8,
       "license": {
         "name": "MiniMax H3 Community License",
@@ -85,12 +85,12 @@
       },
       "vcu_weights": {
         "per_output_second": {
-          "768p": 19
+          "768p": 18
         },
-        "duration_slope": 0.072,
-        "note": "GPU-cost weights, measured 2026-09-16 (research/pricing/measured_2026-09-16_h3-turbo.md): 5, 10 and 14 s at 768p on 4x H200 through SGLang with the 8-step LoRA, corrected to 8 passes"
+        "duration_slope": 0.08,
+        "note": "GPU-cost weights for one-GPU serving, measured 2026-09-17 (research/h3-image-check_2026-09-17.md) and 2026-09-16 (research/pricing/measured_2026-09-16_h3-turbo.md), both at 768p on an H200 with the 8-step LoRA at its 8 passes. One GPU through SGLang: 9.92 GPU-seconds per output second at 5 s (9.7 on 2026-09-16) and 17.6 at 14 s; the worker adds about 2-5 s a job over SGLang direct, which is +1.0 GPU-s/s at 5 s and +0.4 at 14 s, so 10.9 and 18.4 through the worker. A confidential H200 GPU-second costs $4.80/3600/0.60 = $0.00222 and a VCU is $0.001367 (ltx-2.5-fast 720p is 3 VCU at $0.0041 per output second), so a GPU-second is 1.626 VCU: 10.9 x 1.626 = 17.8, rounded up to 18. The slope fits 18.4/10.9 = 1.68 over 9 s, i.e. 0.076, rounded up to 0.08 (18 x 1.72 = 31 VCU per second at 14 s against the 30 measured, and 25.2 at 10 s against 24.5 interpolated). Four-GPU serving measured 19 with slope 0.072 on 2026-09-16"
       },
-      "min_vram_gb": 80,
+      "min_vram_gb": 141,
       "verified": {
         "variant": "deterministic",
         "runtime": "diffusers-modular-h3/1",
@@ -103,36 +103,30 @@
         ],
         "hardware_classes": [
           {
-            "id": "C4.h200-141gb.x4.ulysses4",
-            "tier": "C4",
-            "gpu_sku": "NVIDIA H200 141GB (HGX H200 8-GPU; one of the two workers in a c8.h200-141gb.x8 TD)",
-            "gpu_count": 4,
-            "parallel": {
-              "ulysses": 4
-            },
-            "interconnect": "nvlink, protected PCIe (GPU-to-GPU traffic not encrypted)",
+            "id": "C2.h200-141gb.x1",
+            "tier": "C2",
+            "gpu_sku": "NVIDIA H200 141GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
             "dev": false
           },
           {
-            "id": "C4.b200-180gb.x4.ulysses4",
-            "tier": "C4",
-            "gpu_sku": "NVIDIA B200 180GB (HGX B200; one of the two workers in a c8.b200-180gb.x8 TD)",
-            "gpu_count": 4,
-            "parallel": {
-              "ulysses": 4
-            },
-            "interconnect": "nvlink, multi-GPU passthrough CC (encrypted)",
+            "id": "C2.b200-180gb.x1",
+            "tier": "C2",
+            "gpu_sku": "NVIDIA B200 180GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
             "dev": false
           },
           {
-            "id": "C4.b300-288gb.x4.ulysses4",
-            "tier": "C4",
-            "gpu_sku": "NVIDIA B300 288GB (HGX B300; one of the two workers in a c8.b300-288gb.x8 TD)",
-            "gpu_count": 4,
-            "parallel": {
-              "ulysses": 4
-            },
-            "interconnect": "nvlink, multi-GPU passthrough CC (encrypted)",
+            "id": "C2.b300-288gb.x1",
+            "tier": "C2",
+            "gpu_sku": "NVIDIA B300 288GB",
+            "gpu_count": 1,
+            "parallel": {},
+            "interconnect": null,
             "dev": false
           },
           {
@@ -242,9 +236,6 @@
       "pricing": {
         "usd_per_second": {
           "768p": 0.3
-        },
-        "standard_usd_per_second": {
-          "768p": 0.06
         },
         "min_job_usd": 0.1,
         "long_clip": {
@@ -440,9 +431,6 @@
       "pricing": {
         "usd_per_second": {
           "768p": 0.5
-        },
-        "standard_usd_per_second": {
-          "768p": 0.06
         },
         "min_job_usd": 0.1,
         "long_clip": {

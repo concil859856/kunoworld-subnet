@@ -18,11 +18,14 @@ import pytest
 
 from kuno_worker.backends import build_backends
 from kuno_worker.config import WorkerConfig
-from kuno_worker.h3_servers import plan_servers, run, server_env
+from kuno_worker.h3_servers import ATTENTION_KEY, plan_servers, run, server_env
 
 
 LORA = "/models/h3-turbo/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors"
-H3_CLASS = "C4.h200-141gb.x4.ulysses4"
+# h3-turbo is a one-GPU profile, and the classes it pins are the single-GPU ones (profiles.json, 2026-09-17).
+H3_CLASS = "C2.h200-141gb.x1"
+# A verified class h3-turbo does not pin: h3 and h3-reference's four-GPU one.
+OTHER_CLASS = "C4.h200-141gb.x4.ulysses4"
 
 
 def configure(tmp_path: Path, **values: str) -> tuple[WorkerConfig, dict[str, str]]:
@@ -45,16 +48,75 @@ def test_h3_needs_only_the_fl2va_server_run_with_the_official_recipe(tmp_path):
 
 
 @pytest.mark.parametrize("backend", ["real", "cold"])
-def test_h3_turbo_gets_its_own_fl2va_server_with_the_lora_loaded_as_measured(tmp_path, backend):
+def test_h3_turbo_gets_its_own_one_gpu_fl2va_server_with_the_lora_loaded_as_measured(tmp_path, backend):
+    """One GPU, not four: a 1-GPU H200 runs Turbo at 9.92 GPU-seconds per output second against 15.6 through a
+    4-GPU worker, the only serving that fits our prices (research/h3-image-check_2026-09-17.md §4)."""
     config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_BACKEND=backend, KUNO_H3_TURBO_LORA=LORA)
     [server] = plan_servers(config, env)
-    assert (server.name, server.port) == ("turbo", 30012)
+    assert (server.name, server.port, server.gpus, server.attention) == ("turbo", 30012, 1, "default")
     assert server.argv == [
         "sglang", "serve", "--model-path", "MiniMaxAI/MiniMax-H3", "--model-variant", "fl2va",
-        "--num-gpus", "4", "--ulysses-degree", "4", "--performance-mode", "speed",
+        "--num-gpus", "1", "--ulysses-degree", "1", "--performance-mode", "speed",
         "--host", "127.0.0.1", "--port", "30012", "--master-port", "31012", "--scheduler-port", "32012",
         "--lora-path", LORA, "--lora-nickname", "turbo",
     ]
+
+
+def test_each_server_runs_on_the_gpus_its_own_profiles_need(tmp_path):
+    """A B300 container sharing both loads: h3 keeps its four GPUs and h3-turbo its one."""
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo,h3,h3-reference", KUNO_H3_TURBO_LORA=LORA, KUNO_H3_SHARED_SERVERS="1")
+    assert [(s.name, s.gpus) for s in plan_servers(config, env)] == [("fl2va", 4), ("ref2va", 4), ("turbo", 1)]
+    # KUNO_H3_NUM_GPUS still overrides every server.
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo,h3,h3-reference", KUNO_H3_TURBO_LORA=LORA,
+                            KUNO_H3_SHARED_SERVERS="1", KUNO_H3_NUM_GPUS="2")
+    assert [(s.name, s.gpus) for s in plan_servers(config, env)] == [("fl2va", 2), ("ref2va", 2), ("turbo", 2)]
+
+
+# ---------------------------------------------------------------- the attention backend
+
+
+def venv(tmp_path: Path, *packages: str) -> str:
+    """An SGLang venv's `sglang` binary, with these packages in its site-packages."""
+    site = tmp_path / "sglang" / "lib" / "python3.12" / "site-packages"
+    site.mkdir(parents=True, exist_ok=True)
+    for package in packages:
+        (site / package).mkdir(exist_ok=True)
+    binary = tmp_path / "sglang" / "bin" / "sglang"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.touch()
+    return str(binary)
+
+
+def test_the_attention_backend_defaults_to_flashattention_and_sage_is_asked_for(tmp_path):
+    """KUNO_H3_ATTENTION=sage adds SGLang's `--attention-backend sage_attn`; the default adds nothing, so every
+    server runs exactly the command every measurement used."""
+    sage_venv = venv(tmp_path / "with", "sageattention")
+    for value in ("", "default"):
+        config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_SGLANG_BIN=sage_venv, **({ATTENTION_KEY: value} if value else {}))
+        [server] = plan_servers(config, env)
+        assert "--attention-backend" not in server.argv and server.attention == "default"
+    config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_SGLANG_BIN=sage_venv, KUNO_H3_ATTENTION="sage")
+    [server] = plan_servers(config, env)
+    assert server.argv[-2:] == ["--attention-backend", "sage_attn"] and server.attention == "sage_attn"
+    # The extra arguments still come last, so KUNO_SGLANG_ARGS can override the choice by hand.
+    config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_SGLANG_BIN=sage_venv, KUNO_H3_ATTENTION="sage",
+                            KUNO_SGLANG_ARGS="--mem-fraction-static 0.8")
+    [server] = plan_servers(config, env)
+    assert server.argv[-4:] == ["--attention-backend", "sage_attn", "--mem-fraction-static", "0.8"]
+
+
+def test_an_attention_backend_the_image_cannot_serve_is_refused(tmp_path):
+    """SGLang falls back to FlashAttention with only a log line, so the worker refuses instead of serving something
+    other than what the miner asked for."""
+    config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_H3_ATTENTION="flash")
+    with pytest.raises(ValueError, match="KUNO_H3_ATTENTION='flash' is not one of default, sage"):
+        plan_servers(config, env)
+    config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_H3_ATTENTION="sage", KUNO_SGLANG_BIN=venv(tmp_path / "without"))
+    with pytest.raises(ValueError, match="needs sageattention in the SGLang environment"):
+        plan_servers(config, env)
+    # A bare `sglang` on PATH (a development machine) has no venv to check, and is taken at its word.
+    config, env = configure(tmp_path, KUNO_PROFILES="h3", KUNO_H3_ATTENTION="sage")
+    assert plan_servers(config, env)[0].attention == "sage_attn"
 
 
 @pytest.mark.parametrize("backend", ["real", "cold"])
@@ -97,7 +159,7 @@ def test_verified_h3_turbo_runs_in_the_worker_process_and_gets_no_server(tmp_pat
     config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, KUNO_VERIFIED_HARDWARE_CLASS=H3_CLASS)
     assert plan_servers(config, env) == []
     # A class h3-turbo does not pin leaves it in performance mode, on its server; cold has no in-process pipeline.
-    for extra in ({"KUNO_VERIFIED_HARDWARE_CLASS": "C2.h200-141gb.x1"}, {"KUNO_VERIFIED_HARDWARE_CLASS": H3_CLASS, "KUNO_BACKEND": "cold"}):
+    for extra in ({"KUNO_VERIFIED_HARDWARE_CLASS": OTHER_CLASS}, {"KUNO_VERIFIED_HARDWARE_CLASS": H3_CLASS, "KUNO_BACKEND": "cold"}):
         config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, **extra)
         assert [s.name for s in plan_servers(config, env)] == ["turbo"]
 
@@ -198,7 +260,7 @@ def test_verified_h3_turbo_gets_the_in_process_pipeline_with_the_servers_weights
     assert not h3.verified_enabled(profiles["h3"]) and not h3.verified_enabled(profiles["h3-reference"])
 
 
-@pytest.mark.parametrize(("backend", "hardware_class"), [("real", None), ("real", "C2.h200-141gb.x1"), ("cold", H3_CLASS)])
+@pytest.mark.parametrize(("backend", "hardware_class"), [("real", None), ("real", OTHER_CLASS), ("cold", H3_CLASS)])
 def test_performance_mode_sends_every_h3_profile_to_the_servers(tmp_path, loaded, backend, hardware_class):
     values = {"KUNO_LTX_MODELS_DIR": str(tmp_path), "KUNO_H3_TURBO_URL": "http://127.0.0.1:30022/"}
     if hardware_class:

@@ -289,7 +289,7 @@ def test_h3_turbo_jobs_go_to_the_turbo_server(fake_sglang, tmp_path):
 
 def test_verified_h3_turbo_runs_in_process_and_everything_else_on_the_servers(fake_sglang, tmp_path):
     url, received = fake_sglang
-    turbo = InProcessTurbo("C4.h200-141gb.x4.ulysses4")
+    turbo = InProcessTurbo("C2.h200-141gb.x1")
     backend = H3SglangBackend(url, url, tmp_path / "work", turbo_url=DEAD_URL, turbo=turbo)
     for profile_id in ("h3-turbo", "h3", "h3-reference"):
         backend.warm(PROFILES[profile_id])
@@ -301,7 +301,7 @@ def test_verified_h3_turbo_runs_in_process_and_everything_else_on_the_servers(fa
 
 def test_an_in_process_pipeline_on_a_class_turbo_does_not_pin_leaves_turbo_on_its_server(fake_sglang, tmp_path):
     url, received = fake_sglang
-    turbo = InProcessTurbo("C2.h200-141gb.x1")
+    turbo = InProcessTurbo("C4.h200-141gb.x4.ulysses4")  # h3 and h3-reference's class; h3-turbo pins the x1 ones
     backend = H3SglangBackend(DEAD_URL, DEAD_URL, tmp_path / "work", turbo_url=url, turbo=turbo)
     backend.warm(PROFILES["h3-turbo"])
     backend.generate(task_for("h3-turbo", Mode.TEXT_TO_VIDEO, tmp_path / "inputs"), NOOP)

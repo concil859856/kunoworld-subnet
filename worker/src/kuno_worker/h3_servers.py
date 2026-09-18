@@ -28,15 +28,20 @@ Environment, besides the worker's own:
   KUNO_SGLANG_BIN              the sglang executable (default: `sglang` on PATH; the H3 image sets its venv's)
   KUNO_H3_MODEL_ID             --model-path (default MiniMaxAI/MiniMax-H3: with HF_HUB_OFFLINE=1 it resolves in HF_HUB_CACHE)
   KUNO_H3_TURBO_LORA           --lora-path of the Turbo server, and the in-process pipeline's LoRA; h3-turbo needs it
-  KUNO_H3_NUM_GPUS             --num-gpus and --ulysses-degree (default: the profiles' gpus_per_worker)
+  KUNO_H3_NUM_GPUS             --num-gpus and --ulysses-degree of every server (default: the gpus_per_worker of the
+                               profiles that server holds — 4 for h3 and h3-reference, 1 for h3-turbo)
+  KUNO_H3_ATTENTION            default (SGLang's own choice, FlashAttention on Hopper) | sage (SageAttention's 8-bit
+                               attention, built into the H3 image; 6.5% faster and a different picture, §3 of
+                               research/h3-image-check_2026-09-17.md). Refused when the image cannot serve it
   KUNO_H3_SHARED_SERVERS       1 lets one container load H3 more than once on its GPUs (default: refused)
   KUNO_SGLANG_ARGS             extra arguments for every server, shell-quoted
   KUNO_SGLANG_START_TIMEOUT_S  how long to wait for /health (default 3600: loading ~124 GB in a CVM is slow)
   KUNO_SGLANG_LOG              discard (default) | inherit
 
 On GPUs: this launcher started the fl2va and ref2va servers on 4x H200 in the 2026-09-15 smoke test, one profile
-per container. The Turbo server's flags ran by hand on 2026-09-16, not through here; the Turbo server as planned
-here and the one-load refusal have run only against fake servers in the tests.
+per container, and on 2026-09-17 it started the four-GPU Turbo server and served a job through a real gateway, with
+the one-load refusal firing as designed and two GPU groups running at once. The one-GPU Turbo server this now plans,
+and the `sage` attention backend, have run only straight against SGLang, never from here.
 """
 
 from __future__ import annotations
@@ -66,6 +71,12 @@ from .config import WorkerConfig
 log = logging.getLogger("kuno.worker.h3_servers")
 
 SERVERS = ("fl2va", "ref2va", "turbo")
+# KUNO_H3_ATTENTION: which attention implementation the SGLang servers run. `default` is whatever SGLang picks
+# (FlashAttention on Hopper), the one every measurement and every published clip so far used.
+ATTENTION_KEY = "KUNO_H3_ATTENTION"
+DEFAULT_ATTENTION = "default"
+ATTENTION_BACKENDS = {DEFAULT_ATTENTION: (), "sage": ("--attention-backend", "sage_attn")}
+ATTENTION_PACKAGES = {"sage": "sageattention"}
 URL_KEYS = {"fl2va": "KUNO_H3_FL2VA_URL", "ref2va": "KUNO_H3_REF2VA_URL", "turbo": "KUNO_H3_TURBO_URL"}
 IN_PROCESS = "in-process"
 SHARED_KEY = "KUNO_H3_SHARED_SERVERS"
@@ -89,6 +100,17 @@ class Server:
     port: int
     argv: list[str]
 
+    @property
+    def gpus(self) -> int:
+        return int(self.argv[self.argv.index("--num-gpus") + 1])
+
+    @property
+    def attention(self) -> str:
+        """The attention backend this server runs, as SGLang names it: its `--attention-backend`, or SGLang's own default."""
+        if "--attention-backend" in self.argv:
+            return self.argv[self.argv.index("--attention-backend") + 1]
+        return DEFAULT_ATTENTION
+
 
 def _loopback_port(url: str, key: str) -> int:
     parts = urlsplit(url)
@@ -101,6 +123,36 @@ def _describe(load: str) -> str:
     if load == IN_PROCESS:
         return "in the worker process (verified mode)"
     return f"on the SGLang {load} server"
+
+
+def attention_args(env: Mapping[str, str], binary: str) -> list[str]:
+    """The `--attention-backend` the servers run with, from KUNO_H3_ATTENTION (default | sage).
+
+    `sage` is SageAttention's 8-bit attention, built into the H3 image but off by default: on one H200 it rendered a
+    5 s Turbo clip in 47.95 s against FlashAttention's 51.26 s (6.5% faster) for about 2 GB more memory, and the two
+    clips differ (30.2 dB PSNR, 0.925 SSIM) — a different picture, not a worse one (research/h3-image-check_2026-09-17.md
+    §3). SGLang falls back to FlashAttention with only a log line when the package is missing, so a value this image
+    cannot serve is refused here instead. Raises ValueError for an unknown value, or for `sage` in an image without
+    sageattention in the SGLang venv."""
+    choice = (env.get(ATTENTION_KEY) or DEFAULT_ATTENTION).strip()
+    if choice not in ATTENTION_BACKENDS:
+        raise ValueError(f"{ATTENTION_KEY}={choice!r} is not one of {', '.join(ATTENTION_BACKENDS)}")
+    if choice != DEFAULT_ATTENTION and not _installed(binary, ATTENTION_PACKAGES[choice]):
+        raise ValueError(
+            f"{ATTENTION_KEY}={choice} needs {ATTENTION_PACKAGES[choice]} in the SGLang environment of {binary}, which "
+            f"this image does not have; SGLang would fall back to FlashAttention without failing. Use "
+            f"{ATTENTION_KEY}={DEFAULT_ATTENTION}, or an image built with it (image/worker.Dockerfile, target h3)"
+        )
+    return list(ATTENTION_BACKENDS[choice])
+
+
+def _installed(binary: str, package: str) -> bool:
+    """Whether `package` is in the site-packages of the venv `binary` lives in. True when the venv cannot be located
+    (a bare `sglang` on PATH, as in tests and on a development machine): there is nothing to check it against."""
+    if os.sep not in binary:
+        return True
+    site = sorted(Path(binary).parent.parent.glob(f"lib/python*/site-packages/{package}"))
+    return bool(site) or not sorted(Path(binary).parent.parent.glob("lib/python*/site-packages"))
 
 
 def plan_servers(config: WorkerConfig, env: Mapping[str, str], catalog: Mapping[str, ModelProfile] | None = None) -> list[Server]:
@@ -134,15 +186,20 @@ def plan_servers(config: WorkerConfig, env: Mapping[str, str], catalog: Mapping[
         )
     if not served:
         return []
-    gpus = int(env.get("KUNO_H3_NUM_GPUS") or max(profile.gpus_per_worker for profile in served))
     binary = env.get("KUNO_SGLANG_BIN") or "sglang"
     extra = shlex.split(env.get("KUNO_SGLANG_ARGS", ""))
+    attention = attention_args(env, binary)
+    override = env.get("KUNO_H3_NUM_GPUS")
+    by_id = {profile.id: profile for profile in served}
     urls = {"fl2va": config.h3_fl2va_url, "ref2va": config.h3_ref2va_url, "turbo": config.h3_turbo_url}
     servers = []
     for name in SERVERS:
         if name not in loads:
             continue
         port = _loopback_port(urls[name], URL_KEYS[name])
+        # Each server runs on the GPUs its own profiles need: four for h3 and h3-reference, one for h3-turbo,
+        # which a single H200 serves more cheaply (profiles.json, measured 2026-09-17).
+        gpus = int(override or max(by_id[p].gpus_per_worker for p in loads[name] if p in by_id))
         # The Turbo server is the fl2va checkpoint with the LoRA loaded at start, as measured on 2026-09-16.
         lora = ["--lora-path", str(config.h3_turbo_lora), "--lora-nickname", TURBO_NICKNAME] if name == "turbo" else []
         argv = [
@@ -150,7 +207,7 @@ def plan_servers(config: WorkerConfig, env: Mapping[str, str], catalog: Mapping[
             "--num-gpus", str(gpus), "--ulysses-degree", str(gpus), "--performance-mode", "speed",
             "--host", "127.0.0.1", "--port", str(port),
             "--master-port", str(port + MASTER_PORT_OFFSET), "--scheduler-port", str(port + SCHEDULER_PORT_OFFSET),
-            *lora, *extra,
+            *lora, *attention, *extra,
         ]
         servers.append(Server(name, port, argv))
     if len({server.port for server in servers}) != len(servers):
@@ -248,7 +305,9 @@ def run(argv: Sequence[str], env: Mapping[str, str] | None = None, *, worker_com
     worker_process: subprocess.Popen | None = None
     try:
         for server in servers:
-            log.info("starting the SGLang %s server on 127.0.0.1:%d", server.name, server.port)
+            # The attention backend changes the pictures a miner produces, so say in the log which one this worker ran.
+            log.info("starting the SGLang %s server on 127.0.0.1:%d (%d GPU(s), %s attention)", server.name, server.port,
+                     server.gpus, server.attention)
             processes.append(subprocess.Popen(server.argv, env=server_env(env, server.argv[0]), stdin=subprocess.DEVNULL,
                                               stdout=output, stderr=output, start_new_session=True))
         timeout_s = float(env.get("KUNO_SGLANG_START_TIMEOUT_S", "3600"))

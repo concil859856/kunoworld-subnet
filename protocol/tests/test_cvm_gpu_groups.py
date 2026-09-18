@@ -54,16 +54,26 @@ def groups(table: Path, spec: str, profiles: str, gpus: int = 8):
 
 
 def test_two_h3_workers_split_an_eight_gpu_vm_into_groups_of_four(table):
-    out = groups(table, "0,1,2,3 4,5,6,7", "h3-turbo, h3,h3-reference")  # one list, with a space after a comma
+    out = groups(table, "0,1,2,3 4,5,6,7", "h3, h3-reference")  # one list, with a space after a comma
     assert out.returncode == 0, out.stderr
-    assert out.stdout.splitlines() == ["0,1,2,3 h3-turbo,h3,h3-reference", "4,5,6,7 h3-turbo,h3,h3-reference"]
+    assert out.stdout.splitlines() == ["0,1,2,3 h3,h3-reference", "4,5,6,7 h3,h3-reference"]
+
+
+def test_h3_turbo_groups_are_one_gpu_each(table):
+    """h3-turbo is a single-GPU profile (2026-09-17 measurements), so its groups hold one GPU, as LTX-2.5's do."""
+    out = groups(table, "0 1 2 3 4 5 6 7", "h3-turbo")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == [f"{i} h3-turbo" for i in range(8)]
+    # Turbo beside a four-GPU profile in one TD is refused: every group of a VM is one size.
+    assert "need different GPU counts per worker" in groups(table, "0 1,2,3,4", "h3-turbo h3").stderr
 
 
 @pytest.mark.parametrize(
     ("spec", "profiles", "workers"),
     [
-        ("0,1,2,3 4,5,6,7", "h3-turbo h3-reference", ["0,1,2,3 h3-turbo", "4,5,6,7 h3-reference"]),
-        ("4,5,6,7 0,1,2,3", " h3 ,h3-turbo\th3-reference ", ["4,5,6,7 h3,h3-turbo", "0,1,2,3 h3-reference"]),
+        ("0,1,2,3 4,5,6,7", "h3 h3-reference", ["0,1,2,3 h3", "4,5,6,7 h3-reference"]),
+        ("4,5,6,7 0,1,2,3", " h3 ,h3-reference\th3 ", ["4,5,6,7 h3,h3-reference", "0,1,2,3 h3"]),
+        ("0 1", "h3-turbo ltx-2.5-fast", ["0 h3-turbo", "1 ltx-2.5-fast"]),  # both are one GPU per worker
         ("0 1 2", "ltx-2.5-fast", ["0 ltx-2.5-fast", "1 ltx-2.5-fast", "2 ltx-2.5-fast"]),
         ("0 1", "ltx-2.5-fast,ltx-2.5-pro ltx-2.5-4k", ["0 ltx-2.5-fast,ltx-2.5-pro", "1 ltx-2.5-4k"]),
     ],
@@ -87,9 +97,10 @@ def test_each_gpu_group_can_serve_its_own_profiles_in_the_order_of_the_groups(ta
         ("01,1,2,3", "h3", 8, "must be comma-separated GPU indices"),
         (" ", "h3", 8, "names no GPU group"),
         ("0,1,2,3", "h3", 2, "GPU 2 in group 0,1,2,3 is not in this VM"),
-        ("0,1,2,3 4,5,6,7", "h3-turbo h3-reference h3", 8, "gives 3 profile lists for 2 GPU groups"),
-        ("0,1,2,3", "h3-turbo h3-reference", 8, "gives 2 profile lists for 1 GPU groups"),
-        ("0,1,2,3 4,5,6,7", "h3-turbo ltx-2.5-fast", 8, "need different GPU counts per worker"),
+        ("0,1,2,3 4,5,6,7", "h3 h3-reference h3", 8, "gives 3 profile lists for 2 GPU groups"),
+        ("0,1,2,3", "h3 h3-reference", 8, "gives 2 profile lists for 1 GPU groups"),
+        ("0,1,2,3 4,5,6,7", "h3 ltx-2.5-fast", 8, "need different GPU counts per worker"),
+        ("0,1 2,3", "h3-turbo", 8, "has 2 GPU(s); profiles h3-turbo need 1 per worker"),
         ("0 1", "ltx-2.5-fast h9", 8, "profile h9 is not in the catalog"),
         ("0,1,2,3", ",", 8, "KUNO_PROFILES list , names no profile"),
     ],
@@ -152,12 +163,12 @@ def measurements(shape: str) -> dict:
 
 SHAPES = {
     "shapes": [
-        {"id": "t8.h200.x8", "profiles": ["h3-turbo", "h3", "h3-reference"], "gpu_mode": "ppcie", "cpus": 8, "memory": "8G", "num_gpus": 8, "num_nvswitches": 4},
+        {"id": "t8.h200.x8", "profiles": ["h3", "h3-reference"], "gpu_mode": "ppcie", "cpus": 8, "memory": "8G", "num_gpus": 8, "num_nvswitches": 4},
         {"id": "t8.b200.x8", "profiles": ["h3"], "gpu_mode": "mpt", "cpus": 8, "memory": "8G", "num_gpus": 8, "num_nvswitches": 0},
         {"id": "t2.x1", "profiles": ["ltx-2.5-fast"], "gpu_mode": "spt", "cpus": 8, "memory": "8G", "num_gpus": 1, "num_nvswitches": 0},
         {"id": "t2.nomode", "profiles": ["ltx-2.5-fast"], "cpus": 8, "memory": "8G", "num_gpus": 1},
         {"id": "t4.bad", "profiles": ["h3"], "gpu_mode": "ppcie", "cpus": 8, "memory": "8G", "num_gpus": 4, "num_nvswitches": 0},
-        {"id": "t8.mixed", "profiles": ["h3", "ltx-2.5-fast"], "gpu_mode": "mpt", "cpus": 8, "memory": "8G", "num_gpus": 8},
+        {"id": "t8.mixed", "profiles": ["h3", "h3-turbo"], "gpu_mode": "mpt", "cpus": 8, "memory": "8G", "num_gpus": 8},
     ]
 }
 

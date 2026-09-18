@@ -165,6 +165,12 @@ thresholds in `worker/src/kuno_worker/safety.py`.
 | Which miners may run it | **confidential tier only** | any miner: confidential or open tier |
 | Content policy | sexual content banned; in-enclave prompt and frame checks, strikes, reports, provenance | the same, plus the gateway's content-policy check on the prompt |
 
+**Some profiles are sold in one mode only.** A profile with no `standard_usd_per_second` in `profiles.json` is
+Private-only: `/v1/models` lists `privacy_modes: ["private"]`, `/v1/route` and every Standard job for it are refused
+with `privacy_mode_unavailable` before anything is charged, and no Standard capacity counts for it. Since 2026-09-17
+that is `h3` and `h3-reference`, whose Standard price was a fifth of what the render costs (PRICING.md §4);
+`h3-turbo` and the LTX-2.5 profiles are sold in both.
+
 A job's mode is not part of `GenerationParams`. The params are the encryption's associated data and
 the shared protocol vectors pin their bytes, so existing clients keep producing identical envelopes.
 The mode is recorded by the gateway and reported as `JobStatus.privacy` (default `"private"`).

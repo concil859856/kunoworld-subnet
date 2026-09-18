@@ -638,8 +638,8 @@ Open-tier enclaves are not issued C2PA certificates (`403 tier_not_eligible`).
 
 ### Serving envelope
 
-A worker whose card can't fit every request of a profile (the RTX 4090 and 5090 classes, MINING.md §6)
-registers what it can fit. `envelope` maps profile id → resolution → aspect ratio → fps (a decimal
+A worker whose card can't fit every request of a profile (the RTX 4090 and 5090 classes, MINING.md §6, and
+`h3-turbo` on a 141 GB card, MINING.md §3c) registers what it can fit. `envelope` maps profile id → resolution → aspect ratio → fps (a decimal
 string) → the longest `duration_s` served:
 
 ```
@@ -652,8 +652,9 @@ hardware restricts, so an unrestricted worker's registration is unchanged. A job
 `duration_s ≤ envelope[profile_id][resolution][aspect_ratio][fps]`. That is a lookup on the public
 `GenerationParams`, with no model maths, and it matches the worker's memory admission exactly: at a
 fixed size and frame rate, LTX's latent tokens only grow with duration. The reference is
-`kuno_protocol.envelope`, and the worker derives its envelope from its memory plan
-(`kuno_worker.backends.quantized.envelope_for_plan`).
+`kuno_protocol.envelope`; the worker derives an LTX-2.5 envelope from its memory plan
+(`kuno_worker.backends.quantized.envelope_for_plan`) and `h3-turbo`'s from its GPU's memory against the measured peaks
+of one-GPU serving (`kuno_worker.backends.h3.one_gpu_envelope`).
 
 The gateway:
 

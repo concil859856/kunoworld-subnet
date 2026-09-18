@@ -95,14 +95,13 @@ def test_the_margin_check_flags_every_cell_priced_below_the_miner_multiple():
     pro = {"ltx-2.5-pro": ({"720p": 9.0, "1080p": 60.0}, 0.03, {48: 2.0, 50: 2.0})}
     proposal = derive([("h200.json", bench_doc(pro))], settings())
     flagged = {(row["profile"], row["resolution"], row["privacy"]) for row in proposal["margin_check"]}
-    # Standard prices are fal's list prices (2026-09-16). The H3 ones are below what a miner must earn at the measured
-    # weights, so every H3 Standard row is flagged; their Private prices cover it at every length. At these synthetic
-    # LTX-2.5 Pro weights, 720p is covered in both modes and 1080p Private ($0.22/s) covers every cell, but 1080p
-    # Standard ($0.17/s) falls short at 48 and 50 fps, where the price rises 1.5x and the render cost 2x.
-    assert flagged == {
-        ("ltx-2.5-pro", "1080p", "standard"),
-        ("h3", "768p", "standard"), ("h3-reference", "768p", "standard"), ("h3-turbo", "768p", "standard"),
-    }
+    # Standard prices are fal's list prices (2026-09-16). h3-turbo's is below what a miner must earn at the measured
+    # weights, so its Standard row is flagged; its Private price covers it at every length. Full h3 and h3-reference are
+    # Private-only since 2026-09-17, so they have no Standard row to flag at all. At these synthetic LTX-2.5 Pro weights,
+    # 720p is covered in both modes and 1080p Private ($0.22/s) covers every cell, but 1080p Standard ($0.17/s) falls
+    # short at 48 and 50 fps, where the price rises 1.5x and the render cost 2x.
+    assert flagged == {("ltx-2.5-pro", "1080p", "standard"), ("h3-turbo", "768p", "standard")}
+    assert not [row for row in proposal["margin_check"] if row["profile"] in ("h3", "h3-reference") and row["privacy"] == "standard"]
     rate = proposal["rate_card"]["usd_per_vcu_second"]["confidential"]
     standard = next(row for row in proposal["margin_check"] if row["privacy"] == "standard" and row["profile"] == "ltx-2.5-pro")
     worst = standard["worst"]

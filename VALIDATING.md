@@ -54,6 +54,9 @@ kuno-validator run --role main --interval 4320 --netuid <netuid> \
 `--canary` sends private (end-to-end encrypted) canaries, which only confidential-tier miners
 can receive. `--standard-canary` sends standard-mode canaries through `POST /v1/standard/videos`;
 those can land on open-tier miners too, and they are the admission probes (see [Open tier](#open-tier)).
+Give `--standard-canary` only a profile sold in Standard mode: a Private-only profile (`h3` and `h3-reference` since
+2026-09-17, `privacy_modes: ["private"]` in `/v1/models`) answers `privacy_mode_unavailable`, and the round logs a
+failed canary that says nothing about any miner.
 `--plan-canary <profile>` and `--standard-plan-canary <profile>` send plan jobs (Director) in each privacy mode; see
 [Plan canaries](#plan-canaries). Their briefs come from `KUNO_PLAN_CANARY_BRIEFS`, a JSON file of
 `[{"brief": "...", "must_mention": ["..."], "target_s": 30}]`; without it the public fallback set in `plan_canaries.py`
@@ -234,7 +237,7 @@ VCU = weight(resolution) × fps multiplier × (1 + duration slope × max(0, seco
 | `ltx-2.5-fast` | 720p 3, 1080p 5; a plan 27 flat | 0.03 (provisional) | 720p measured 2026-09-15; 1080p estimated; the plan weight is a placeholder |
 | `ltx-2.5-pro` | 720p 33, 1080p 73 | 0.03 (provisional) | 720p measured; 1080p scaled by the same factor |
 | `ltx-2.5-4k` | 1440p 22, 2160p 60 | 0.03 (provisional) | estimated |
-| `h3-turbo` | 768p 19 | 0.072 | measured 2026-09-16, 5, 10 and 14 s on 4x H200 (8-step LoRA) |
+| `h3-turbo` | 768p 18 | 0.08 | measured 2026-09-17 for one-GPU serving: 5 and 14 s on one H200 (8-step LoRA), plus the worker's own overhead |
 | `h3` | 768p 100 | 0.093 | measured 2026-09-15, 5 s on 4x H200; slope from 5, 10 and 14 s on 2026-09-16 |
 | `h3-reference` | 768p 163 | 0.065 | measured 2026-09-15, 5 s on 4x H200 |
 

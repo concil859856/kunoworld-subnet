@@ -22,7 +22,7 @@
     {
       "id": "c2.h200-141gb.x1",
       "description": "one H200 141GB in single-GPU passthrough CC mode; eight fit a 224-thread, 2 TB HGX H200 host",
-      "profiles": ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k"],
+      "profiles": ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k", "h3-turbo"],
       "gpu_mode": "spt",
       "gpu_device_ids": ["10de:2335", "10de:233b"],
       "cpus": 24,
@@ -39,7 +39,7 @@
     {
       "id": "c2.b200-180gb.x1",
       "description": "one B200 180GB of an HGX B200 in single-GPU passthrough CC mode; eight fit a 224-thread, 2 TB host",
-      "profiles": ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k"],
+      "profiles": ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k", "h3-turbo"],
       "gpu_mode": "spt",
       "gpu_device_ids": ["10de:2901", "10de:2909"],
       "cpus": 24,
@@ -56,7 +56,7 @@
     {
       "id": "c2.b300-288gb.x1",
       "description": "one B300 288GB of an HGX B300 in single-GPU passthrough CC mode; eight fit a 256-thread, 2 TB host",
-      "profiles": ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k"],
+      "profiles": ["ltx-2.5-fast", "ltx-2.5-pro", "ltx-2.5-4k", "h3-turbo"],
       "gpu_mode": "spt",
       "gpu_device_ids": ["10de:3182"],
       "cpus": 28,
@@ -73,7 +73,7 @@
     {
       "id": "c8.h200-141gb.x8",
       "description": "a whole HGX H200 8-GPU server in Protected PCIe mode: 8 GPUs and 4 NVSwitches in one TD, two H3 workers of four GPUs each (KUNO_GPU_GROUPS). GPU-to-GPU NVLink traffic is not encrypted",
-      "profiles": ["h3-turbo", "h3", "h3-reference"],
+      "profiles": ["h3", "h3-reference"],
       "gpu_mode": "ppcie",
       "gpu_device_ids": ["10de:2335"],
       "cpus": 192,
@@ -90,7 +90,7 @@
     {
       "id": "c8.b200-180gb.x8",
       "description": "a whole HGX B200 server in multi-GPU passthrough CC mode: 8 GPUs in one TD, NVSwitches and Fabric Manager on the host, two H3 workers of four GPUs each. NVLink traffic is encrypted",
-      "profiles": ["h3-turbo", "h3", "h3-reference"],
+      "profiles": ["h3", "h3-reference"],
       "gpu_mode": "mpt",
       "gpu_device_ids": ["10de:2901", "10de:2909"],
       "cpus": 192,
@@ -107,7 +107,7 @@
     {
       "id": "c8.b300-288gb.x8",
       "description": "a whole HGX B300 server in multi-GPU passthrough CC mode: 8 GPUs in one TD, NVSwitches and Fabric Manager on the host, two H3 workers of four GPUs each. NVLink traffic is encrypted",
-      "profiles": ["h3-turbo", "h3", "h3-reference"],
+      "profiles": ["h3", "h3-reference"],
       "gpu_mode": "mpt",
       "gpu_device_ids": ["10de:3182"],
       "cpus": 192,

@@ -24,8 +24,8 @@ a first run on a dev network, and the mainnet requirements.
 | Class | GPUs | Serves |
 |---|---|---|
 | C1 | 1× RTX PRO 6000 Blackwell Server Edition (96 GB) | LTX-2.5 Fast |
-| C2 | 1× H200 (141 GB), B200 (180 GB) or B300 (288 GB) | LTX-2.5 Fast, Pro, 4K |
-| C4 | 4× H200, B200 or B300 per worker: two workers in one whole-server 8-GPU VM | MiniMax H3, H3 Turbo, H3 Director |
+| C2 | 1× H200 (141 GB), B200 (180 GB) or B300 (288 GB) | LTX-2.5 Fast, Pro, 4K, MiniMax H3 Turbo |
+| C4 | 4× H200, B200 or B300 per worker: two workers in one whole-server 8-GPU VM | MiniMax H3, H3 Director |
 
 An 8-GPU server (HGX H200, B200, B300, or 8× RTX PRO 6000 Server Edition) runs eight single-GPU
 C1/C2 VMs, each matching the same published measurement, or one 8-GPU VM for H3

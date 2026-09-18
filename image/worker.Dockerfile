@@ -6,14 +6,16 @@
 #                CUDA 12.8 torch, torchaudio and torchao, diffusers, transformers, accelerate, PyAV), NVML GPU
 #                evidence, C2PA provenance, and the content safety classifiers with their weights.
 #                Entry point: kuno-worker.
-#   target h3    MiniMax H3. Everything in ltx, plus SGLang in a venv of its own (/opt/sglang: CUDA 13 torch)
-#                and a C/C++ toolchain for the kernels SGLang and Triton compile. Entry point: kuno-h3-worker,
-#                which runs the SGLang servers beside the worker.
+#   target h3    MiniMax H3. Everything in ltx, plus SGLang in a venv of its own (/opt/sglang: CUDA 13 torch),
+#                a C/C++ toolchain for the kernels SGLang and Triton compile, and SageAttention built from a pinned
+#                commit and off unless KUNO_H3_ATTENTION=sage. Entry point: kuno-h3-worker, which runs the SGLang
+#                servers beside the worker.
 #
 # Reproducible by construction: base images pinned by digest, Python dependencies frozen by image/uv.lock
 # and image/sglang/uv.lock (hashes included), classifier weights fetched at pinned revisions and checked
-# against image/safety-models/SHA256SUMS, Debian packages from a fixed snapshot, no bytecode compiled at
-# build time, timestamps clamped to SOURCE_DATE_EPOCH. Nothing is downloaded when a container runs: model
+# against image/safety-models/SHA256SUMS, SageAttention's source pinned by commit and checked by the digest of
+# its contents, Debian packages from a fixed snapshot, no bytecode compiled at build time, timestamps clamped
+# to SOURCE_DATE_EPOCH. Nothing is downloaded when a container runs: model
 # weights are mounted (image/CVM.md) and HF_HUB_OFFLINE keeps the Hugging Face libraries off the network.
 # The CUDA libraries come as wheels; the NVIDIA driver comes from the VM. NVIDIA's nvattest is in neither image.
 
@@ -132,6 +134,47 @@ RUN set -e; cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
     [ -e "$cuda/lib64" ] || ln -s lib "$cuda/lib64"; \
     for f in "$cuda"/lib/lib*.so.[0-9]*; do name="${f%%.so.*}.so"; [ -e "$name" ] || ln -s "$(basename "$f")" "$name"; done; \
     test -e "$cuda/lib64/libcudart.so"
+# SageAttention: 8-bit attention for the H3 DiT, built in but NOT the default. KUNO_H3_ATTENTION=sage runs the SGLang
+# servers with `--attention-backend sage_attn` (worker/src/kuno_worker/h3_servers.py); anything else leaves SGLang's own
+# choice, which is FlashAttention on Hopper and what every measurement and clip so far used. Measured on one H200
+# (h3-turbo, 8 passes, 5 s, seed 1234, research/h3-image-check_2026-09-17.md §3): 47.95 s against FlashAttention's
+# 51.26 s, so 6.5% faster, for about 2 GB more GPU memory and a different picture — 30.2 dB PSNR and 0.925 SSIM between
+# the two clips, each backend repeating bit-identically. SGLang falls back to FlashAttention with only a log line when
+# the package is missing, which is why kuno-h3-worker refuses `sage` in an image without it rather than serving
+# something else.
+#   SAGE_ARCH is 9.0 (Hopper: H200), the only architecture this has been built or measured for. B200 and B300 need
+#   "9.0 10.0" here and a rebuild; until then leave KUNO_H3_ATTENTION at its default on them.
+#   SAGE_REF is the commit SGLang 0.5.19 names for the SM90 binding it looks for. The image has no git, so the source
+#   comes as GitHub's tarball of that commit and is checked by the digest of the extracted tree, which re-gzipping
+#   does not change:  find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum
+#   nvcc 13.4 compiles against the wheel's CUDA 13.0 headers, which CCCL refuses unless
+#   -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK says the major versions match; setup.py links -lcuda, which the pip toolkit
+#   does not ship, so an empty stub carrying the driver's soname satisfies the link and the VM's real libcuda.so.1 is
+#   what loads at run time. The build took 234 s on 12 cores on 2026-09-17.
+ARG SAGE_REF=d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4
+ARG SAGE_TREE_SHA256=9ec4a895ec9905423e4d9b8c908fcb2bc829046d0c036e3c8dcafa7b3fd0b408
+ARG SAGE_ARCH=9.0
+RUN set -eu; \
+    cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
+    mkdir -p /tmp/sage /tmp/cudalib; \
+    python3 -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], "/tmp/sage.tar.gz")' \
+        "https://codeload.github.com/thu-ml/SageAttention/tar.gz/${SAGE_REF}"; \
+    tar -xzf /tmp/sage.tar.gz -C /tmp/sage --strip-components=1; \
+    found="$(cd /tmp/sage && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"; \
+    [ "$found" = "${SAGE_TREE_SHA256}" ] || { echo "SageAttention ${SAGE_REF} hashes to $found, not ${SAGE_TREE_SHA256}" >&2; exit 1; }; \
+    echo | gcc -shared -x c - -Wl,-soname,libcuda.so.1 -o /tmp/cudalib/libcuda.so; \
+    cd /tmp/sage \
+    && CUDA_HOME="$cuda" LIBRARY_PATH=/tmp/cudalib TORCH_CUDA_ARCH_LIST="${SAGE_ARCH}" MAX_JOBS=32 EXT_PARALLEL=4 \
+       NVCC_APPEND_FLAGS='--threads 8 -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK' \
+       python3 -m pip --python /opt/sglang/bin/python install --no-deps --no-build-isolation --no-compile --no-cache-dir . \
+    && cd / \
+    && python3 -m pip --python /opt/sglang/bin/python show -f sageattention | grep -q 'sm90_compile\.py' \
+    && ls /opt/sglang/lib/python3.12/site-packages/sageattention/_qattn_sm90*.so \
+    && rm -rf /tmp/sage /tmp/sage.tar.gz /tmp/cudalib /root/.cache
+# The package cannot be imported here: its kernels link libcuda.so.1, which the VM's driver provides and a build
+# container has not got. So the check above is that the files are installed — the SM90 binding SGLang looks for and
+# the compiled SM90 kernels beside it. Importing it is what the first `sage` server on a GPU does.
+
 # The H3 weights are a Hugging Face hub cache mounted at /models/h3 (models--MiniMaxAI--MiniMax-H3/…), which
 # SGLang and diffusers both resolve offline. kuno-h3-worker refuses profiles that would load H3 twice on one worker's
 # GPUs (h3, h3-reference and h3-turbo each have their own server), so the default is one profile, and one that needs

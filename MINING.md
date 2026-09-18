@@ -22,11 +22,20 @@ reachability, then lists which profiles the machine can serve and what is missin
 | `ltx-2.5-fast` | 1 | 80 GB | cheapest confidential entry: an RTX PRO 6000 Server Edition; also H200, B200, B300 |
 | `ltx-2.5-pro` | 1 | 80 GB | an H200, B200 or B300 on the confidential tier |
 | `ltx-2.5-4k` | 1 | 141 GB | an H200, B200 or B300. An H200 would serve 2160p up to 10 s at 24 fps (extrapolated); the 96 GB RTX PRO 6000 would serve 1440p up to 10 s and 2160p up to 4 s, 3 s of which ran ([section 3b](#3b-switch-to-resident-runtimes-for-real-serving)) |
-| `h3-turbo`, `h3`, `h3-reference` | 4 per worker | 80 GB | a whole 8-GPU H200, B200 or B300 server running two workers |
+| `h3-turbo` | 1 | 141 GB | an H200, B200 or B300, the same single-GPU VM LTX-2.5 uses. One H200 serves clips up to 10 s; a B200 or B300 serves the profile's full 14 s ([section 3c](#what-one-gpu-serves-of-h3-turbo)) |
+| `h3`, `h3-reference` | 4 per worker | 80 GB | a whole 8-GPU H200, B200 or B300 server running two workers |
 
 The subnet README's hardware classes (C1, C2, C4) are how the network groups these profiles;
-the VRAM column is the minimum each one needs. RTX 4090 and 5090 cards run quantized LTX-2.5 on the
-open tier instead; see [section 6](#what-each-consumer-card-can-serve).
+the VRAM column is the minimum each one needs. `h3-turbo` moved from four GPUs to one on 2026-09-17: one H200 renders
+it at 9.92 GPU-seconds per output second against 15.6 through a four-GPU worker, which is the difference between
+selling it above and below cost, and a single-GPU confidential VM is far easier to rent than a whole server.
+RTX 4090 and 5090 cards run quantized LTX-2.5 on the open tier instead; see
+[section 6](#what-each-consumer-card-can-serve).
+
+**Which jobs each H3 profile gets.** `h3` and `h3-reference` are sold in **Private mode only** since 2026-09-17: a
+Standard second of full H3 sold for $0.06 while the render costs $0.14 of GPU time, so the gateway now refuses
+Standard jobs for them outright and only private jobs reach those workers. `h3-turbo` is sold in both modes and is the
+H3 tier's Standard offer ([PRICING.md](PRICING.md) §4).
 
 The confidential tier, which serves private jobs, additionally requires an Intel TDX host
 (Xeon 5th gen "Emerald Rapids" or Xeon 6 "Granite Rapids") with the GPUs in NVIDIA
@@ -60,8 +69,9 @@ a server whose CPUs or memory can't hold them. Disable sub-NUMA clustering in th
 `--no-numa`. Run every TD under the same hotkey; start each one under systemd or tmux
 (image/CVM.md, "Several TDs on one server").
 
-**H3 on a whole 8-GPU server.** NVIDIA allows multi-GPU confidential computing only for a whole
-server, so H3 runs as one 8-GPU TD with two workers of four GPUs each:
+**H3 on a whole 8-GPU server.** `h3` and `h3-reference` run on four GPUs each. NVIDIA allows multi-GPU confidential
+computing only for a whole server, so they run as one 8-GPU TD with two workers of four GPUs each. (`h3-turbo` does
+not need any of this: it is a single-GPU profile, served from the `c2.*.x1` shapes above.)
 - `c8.h200-141gb.x8`: every GPU and NVSwitch in Protected PCIe mode. Traffic between the GPUs is
   not encrypted, which customers are told.
 - `c8.b200-180gb.x8` or `c8.b300-288gb.x8`: CC mode on, with Fabric Manager on the host set to
@@ -71,16 +81,16 @@ Plan it with `plan-host.py --shape c8.…`, and give each group of four GPUs its
 
 ```
 KUNO_GPU_GROUPS=0,1,2,3 4,5,6,7
-KUNO_PROFILES=h3-turbo h3-reference
-KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors
+KUNO_PROFILES=h3 h3-reference
 ```
 
 `KUNO_PROFILES` lists each group's profiles in the order of the groups, space-separated: here GPUs 0–3
-serve `h3-turbo` and GPUs 4–7 `h3-reference`. One loaded H3 takes 87–97 GB of each H200, so a worker
-refuses to load it twice, and each group serves one of `h3`, `h3-reference` and `h3-turbo`
+serve `h3` and GPUs 4–7 `h3-reference`. One loaded H3 takes 87–97 GB of each H200, so a worker
+refuses to load it twice, and each group serves one of `h3` and `h3-reference`
 (image/CVM.md §6). Each worker container starts its own SGLang server; the second worker's listen on
-ports 30020–30022. `h3-turbo` has run on H200s straight against SGLang, not yet through the worker
-([section 3c](#3c-worker-images)).
+ports 30020–30022. Every group of one VM is the same size, and the published measurement for a `c8.*` shape
+requires four GPUs per enclave, so a whole-server TD serves `h3` and `h3-reference`, never `h3-turbo`.
+`h3` and `h3-reference` have run through the worker and a real gateway on 4× H200 (2026-09-17).
 
 ## 2. Get the weights
 
@@ -115,13 +125,14 @@ sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
   --performance-mode speed --port 30010 --model-variant fl2va     # h3
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
   --performance-mode speed --port 30011 --model-variant ref2va    # h3-reference
-sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 4 --ulysses-degree 4 \
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --num-gpus 1 --ulysses-degree 1 \
   --performance-mode speed --port 30012 --model-variant fl2va \
   --lora-path /models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors --lora-nickname turbo   # h3-turbo
 ```
 
-Each takes 87–97 GB of every one of its four H200s, so run one per set of four GPUs. The Turbo LoRA
-comes from `lightx2v/Minimax-h3-Turbo`.
+`h3` and `h3-reference` take 87–97 GB of every one of their four H200s, so run one per set of four GPUs. `h3-turbo`
+is one GPU, and on an H200 it peaks at 127–129 GB for a 5 s clip and 138 GB at 14 s, so nothing else fits beside it.
+The Turbo LoRA comes from `lightx2v/Minimax-h3-Turbo`.
 
 The H3 worker image starts these servers itself ([section 3c](#3c-worker-images)). It reads the
 weights from a Hugging Face hub cache mounted at `/models/h3`, for example one written by
@@ -221,9 +232,10 @@ export KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.
 ```
 
 For MiniMax H3, `real` sends every profile to the SGLang servers from step 2, which are already
-resident; `h3-turbo` goes to its own server with the LoRA. The exception is verified mode for `h3-turbo`
-(`KUNO_VERIFIED_HARDWARE_CLASS` set to a C4 class): it runs in the worker process through diffusers, the runtime its
-profile pins, so that the worker can commit to every step, and no Turbo server starts. That path has not run on GPUs.
+resident; `h3-turbo` goes to its own one-GPU server with the LoRA. The exception is verified mode for `h3-turbo`
+(`KUNO_VERIFIED_HARDWARE_CLASS` set to a C2 class it pins, such as `C2.h200-141gb.x1`): it runs in the worker process
+through diffusers, the runtime its profile pins, so that the worker can commit to every step, and no Turbo server
+starts. That path has not run on GPUs.
 Serving several LTX-2.5 profiles on one machine loads them in turn and evicts the least recently used when VRAM runs
 out, so pin `KUNO_PROFILES` to what the card can actually hold.
 
@@ -343,11 +355,14 @@ not by tag. No digest is published yet.
 - Your hotkey: `KUNO_HOTKEY_SEED_FILE`, pointing at a mounted file.
 - `KUNO_PROFILES`, `KUNO_VERIFIED_HARDWARE_CLASS` and `KUNO_MODEL_DIGEST`.
 - H3 only:
-  - `KUNO_PROFILES`: one H3 profile per four GPUs. The worker refuses a set that loads H3 twice, such as
-    `h3,h3-reference`, because two don't fit on H200s or, very likely, B200s. `KUNO_H3_SHARED_SERVERS=1` allows it,
-    for GPUs that hold two such as B300s (never run).
+  - `KUNO_PROFILES`: one H3 profile per worker — `h3` or `h3-reference` on four GPUs, `h3-turbo` on one. The worker
+    refuses a set that loads H3 twice, such as `h3,h3-reference`, because two don't fit on H200s or, very likely,
+    B200s. `KUNO_H3_SHARED_SERVERS=1` allows it, for GPUs that hold two such as B300s (never run).
   - `KUNO_H3_TURBO_LORA`: the Turbo LoRA's path, required for `h3-turbo`.
-  - `KUNO_H3_NUM_GPUS`: default 4.
+  - `KUNO_H3_NUM_GPUS`: the GPUs per SGLang server. The default is what each server's own profiles need: 4 for `h3`
+    and `h3-reference`, 1 for `h3-turbo`.
+  - `KUNO_H3_ATTENTION`: `default` (SGLang's own choice, FlashAttention on Hopper) or `sage`
+    ([below](#sageattention-h3-only)).
   - `KUNO_SGLANG_ARGS`: extra `sglang serve` flags.
   - `KUNO_SGLANG_START_TIMEOUT_S`: default 3600.
   - `KUNO_SGLANG_LOG=inherit`: shows the servers' output on a dev box. It is discarded otherwise, because
@@ -370,19 +385,64 @@ docker run --rm --gpus all \
   <registry>/<namespace>/kunoworld-worker@sha256:<ltx digest>
 ```
 
-MiniMax H3 on four GPUs. H3 has no open-tier class, so outside a CVM this is a dev-network run
+MiniMax H3 Turbo on one GPU, and `h3` on four. H3 has no open-tier class, so outside a CVM this is a dev-network run
 ([section 3](#3-first-run-on-a-dev-network)) with that network's settings added:
 
 ```bash
-docker run --rm --gpus '"device=0,1,2,3"' --ipc host \
+docker run --rm --gpus '"device=0"' \
   -v /models/h3:/models/h3:ro -e KUNO_PROFILES=h3-turbo \
   -e KUNO_H3_TURBO_LORA=/models/h3/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors … \
   <registry>/<namespace>/kunoworld-worker@sha256:<h3 digest>
+
+docker run --rm --gpus '"device=0,1,2,3"' --ipc host \
+  -v /models/h3:/models/h3:ro -e KUNO_PROFILES=h3 … \
+  <registry>/<namespace>/kunoworld-worker@sha256:<h3 digest>
 ```
+
+### SageAttention (H3 only)
+
+The H3 image also carries [SageAttention](https://github.com/thu-ml/SageAttention)'s 8-bit attention, built in and
+**off by default**. `KUNO_H3_ATTENTION=sage` starts every SGLang server with `--attention-backend sage_attn`; anything
+else leaves SGLang's own choice, which is FlashAttention on an H200.
+
+- **What it saves.** Measured on one H200 (`h3-turbo`, 8 passes, 5 s, seed 1234, 2026-09-17): 47.95 s against
+  FlashAttention's 51.26 s, so **6.5% less GPU time** — 9.28 GPU-seconds per output second against 9.92 — for about
+  2 GB more GPU memory.
+- **What it changes.** A **different picture, not a worse one**: the two clips differ by 30.2 dB PSNR and 0.925 SSIM,
+  and each backend repeats its own clip bit-identically. Your videos will not match another miner's frame for frame,
+  which costs you nothing: H3 jobs carry no step commitment, and validators judge H3 output on quality, never by
+  comparing your frames with a replay.
+- **Verified mode does not use it.** `h3-turbo` in verified mode runs in the worker process on diffusers, whose
+  determinism recipe pins `sdpa`; only the SGLang servers read this setting.
+- **Where it is recorded.** The worker's start-up log names each server's GPU count and attention backend, for example
+  `starting the SGLang turbo server on 127.0.0.1:30012 (1 GPU(s), sage_attn attention)`. Nothing else carries it: H3
+  has no precision recipe and no step commitment.
+- **Hopper only in this image.** The kernels are built for SM90 (H200), the card they were measured on. On a B200 or
+  B300, leave it at `default` until the image is rebuilt with those architectures; the worker refuses `sage` in an
+  image without the package, but it cannot tell whether the kernels match your card.
+
+### What one GPU serves of `h3-turbo`
+
+A 5 s Turbo clip peaks at 126.6 GB of GPU memory with FlashAttention and 128.9 with SageAttention (2026-09-17), and a
+14 s clip at 137.6–138.9 GB (2026-09-16). On an H200 that leaves 2–3 GB free at 14 s, which is too tight to sell, so
+the worker advertises a **serving envelope** for `h3-turbo`, the same mechanism the open tier uses for quantized
+LTX-2.5 ([section 6](#serving-envelope)): at registration it says the longest clip its card holds, the gateway sends
+only jobs inside it, and one outside fails as `capacity_refused` without being decrypted.
+
+| Card | Longest `h3-turbo` clip | Where it comes from |
+|---|---|---|
+| 141 GB (H200) | **10 s** | interpolated between the two measured lengths: about 134 GB at 10 s, leaving 7 GB free |
+| 180 GB or more (B200, B300) | **14 s**, the profile's own limit | 40 GB of headroom at 14 s; unmeasured on those cards |
+| under about 120 GB | nothing | a 5 s clip alone needs 127–129 GB; `kuno-preflight` does not offer the profile there |
+
+Only 5 s and 14 s are measured, both on an H200 with one GPU; everything between them is interpolated and nothing
+above 141 GB has been measured at all. The worker reads its card's memory through NVML at start-up; where it cannot
+(no driver), it advertises the profile's full limits, as it did before envelopes existed.
 
 What the H3 image needs from the host:
 - **Driver:** its SGLang runs a CUDA 13 torch, so the driver must be R580 or newer.
-- **Shared memory:** `--ipc host` (or a large `--shm-size`) gives NCCL shared memory across the four GPUs.
+- **Shared memory:** `--ipc host` (or a large `--shm-size`) gives NCCL shared memory across the four GPUs of `h3` and
+  `h3-reference`. `h3-turbo` uses one GPU and needs none.
 - **A licensed country.** The MiniMax H3 Community License excludes the European Union, the United Kingdom,
   the Republic of Korea and the United States, and running the model there is not licensed at all. The gateway
   refuses to register an enclave offering `h3`, `h3-turbo` or `h3-reference` from an excluded country, or from
@@ -401,8 +461,9 @@ What the H3 image needs from the host:
   - **Where to run.** Place H3 workers close to a landmark, in a licensed country.
 
 **Both images have run on rented GPUs, without confidential computing.** LTX-2.5 Fast and Pro ran on an RTX PRO 6000;
-H3 and H3 Director ran on 4× H200, one profile per worker. H3 Turbo ran on 4× H200 straight against the image's SGLang,
-not yet through the worker. Neither image has run inside a confidential VM; image/CVM.md lists what is unverified.
+`h3`, `h3-reference` and `h3-turbo` ran on H200s, one profile per worker, and on 2026-09-17 `h3-turbo` and `h3` ran
+through the worker and a real gateway on four GPUs each. One-GPU Turbo serving has run straight against SGLang, not yet
+through the worker, and SageAttention has run only outside the published image. Neither image has run inside a confidential VM; image/CVM.md lists what is unverified.
 
 ## 4. Mainnet
 
@@ -613,6 +674,8 @@ Before loading, the worker checks each of these and refuses with the reason:
   Blackwell.
 - **Host RAM fits the offload mode.**
 
+<a id="serving-envelope"></a>
+
 **Serving envelope.** At start-up the worker turns its memory plan into a *serving envelope*: for each
 resolution, aspect ratio and frame rate, the longest duration the plan fits. It is the same rule the
 refusal below uses, so the two always agree. Every registration carries the envelope of each profile
@@ -626,7 +689,9 @@ The gateway sends you only jobs inside it. It picks standard jobs' workers by th
 Private clients get a filtered `/v1/route`, and the gateway refuses to admit a private job sealed to
 you that doesn't fit (`409 envelope_exceeded`). A card whose plan fits every request of a profile advertises nothing
 for it, which means the profile's full limits; the envelope comes from the class's VRAM or, for classes that declare
-none (the confidential ones), the GPU's own memory.
+none (the confidential ones), the GPU's own memory. The same registration field carries `h3-turbo`'s envelope on a
+confidential worker, from measured peaks rather than a memory plan
+([section 3c](#what-one-gpu-serves-of-h3-turbo)).
 
 **What a refusal costs.** A job the plan cannot fit fails at once with `capacity_refused`, before its
 inputs are downloaded or decrypted, naming the longest duration the class serves at that size and

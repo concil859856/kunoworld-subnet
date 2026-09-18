@@ -23,7 +23,7 @@ from kuno_worker.verified import RetentionStore
 PROFILES = load_profiles()
 NOOP = lambda _v, _s: None  # noqa: E731
 LTX_CLASS = "C1.rtx-pro-6000-bw-se.x1"
-H3_CLASS = "C4.h200-141gb.x4.ulysses4"
+H3_CLASS = "C2.h200-141gb.x1"
 
 pytestmark = pytest.mark.skipif(ffmpeg_exe() is None, reason="ffmpeg is needed to encode the stub frames")
 
