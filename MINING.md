@@ -426,6 +426,9 @@ included.
 - **Hopper only in this image.** The kernels are built for SM90 (H200), the card they were measured on. On a B200 or
   B300, `auto` falls back to SGLang's default and says why in the log. `sage` by name is refused in an image without
   the package, or where NVML reports a card the kernels are not built for.
+- **Checked on your GPU before use.** SGLang runs FlashAttention with only a warning when SageAttention's SM90 kernels
+  fail to import, which is what the first image with them did on an H200 (2026-09-18, fixed in the next build). So the
+  worker runs SGLang's own import test first: `auto` falls back and logs the error, `sage` refuses to start.
 
 ### What one GPU serves of `h3-turbo`
 
@@ -437,12 +440,11 @@ only jobs inside it, and one outside fails as `capacity_refused` without being d
 
 | Card | Longest `h3-turbo` clip | Where it comes from |
 |---|---|---|
-| 141 GB (H200) | **10 s** | interpolated between the two measured lengths: about 134 GB at 10 s, leaving 7 GB free |
+| 141 GB (H200) | **10 s** | measured through the worker on 2026-09-18: 134,935 MiB of 143,771 with FlashAttention, about 2.3 GB more with SageAttention |
 | 180 GB or more (B200, B300) | **14 s**, the profile's own limit | 40 GB of headroom at 14 s; unmeasured on those cards |
 | under about 120 GB | nothing | a 5 s clip alone needs 127–129 GB; `kuno-preflight` does not offer the profile there |
 
-Only 5 s and 14 s are measured, both on an H200 with one GPU; everything between them is interpolated and nothing
-above 141 GB has been measured at all. The worker reads its card's memory through NVML at start-up; where it cannot
+5 s, 10 s and 14 s are measured, all on an H200 with one GPU; nothing above 141 GB has been measured at all. The worker reads its card's memory through NVML at start-up; where it cannot
 (no driver), it advertises the profile's full limits, as it did before envelopes existed.
 
 What the H3 image needs from the host:

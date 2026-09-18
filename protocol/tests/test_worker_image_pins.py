@@ -158,6 +158,23 @@ def test_sageattention_is_built_from_a_pinned_commit_for_the_gpus_the_worker_giv
     assert "KUNO_H3_ATTENTION" not in stage_env("h3") and "KUNO_H3_ATTENTION" not in stage_env("ltx")
     launcher = (SUBNET / "worker" / "src" / "kuno_worker" / "h3_servers.py").read_text()
     assert "SAGE_COMPUTE_CAPABILITIES = frozenset({(9, 0)})" in launcher
+
+
+def test_sageattentions_kernels_need_the_driver_and_pass_sglangs_import_test_at_build_time():
+    """On 2026-09-18 the image's own SM90 kernel failed to import on an H200 (undefined cuTensorMapEncodeTiled: an empty
+    libcuda stub had been dropped by --as-needed), and SGLang served FlashAttention with only a warning. The stub now
+    defines the driver function, the build fails if a kernel calls the driver without needing libcuda.so.1, and it runs
+    SGLang's own Hopper import test against the stub, the same one kuno-h3-worker runs on the GPU."""
+    body = stage("h3")
+    stub = body.index("-Wl,-soname,libcuda.so.1 -o /tmp/cudalib/libcuda.so")
+    assert "int cuTensorMapEncodeTiled(void)" in body[stub - 200:stub]
+    assert "echo | gcc -shared" not in body
+    assert "nm -D --undefined-only" in body and "NEEDED.*\\[libcuda\\.so\\.1\\]" in body
+    launcher = (SUBNET / "worker" / "src" / "kuno_worker" / "h3_servers.py").read_text()
+    check = re.search(r'^SAGE_HOPPER_CHECK = "(.+)"$', launcher, re.M).group(1)
+    assert f'ARG SAGE_HOPPER_CHECK="{check}"' in body
+    assert 'LD_LIBRARY_PATH=/tmp/cudalib /opt/sglang/bin/python -c "$SAGE_HOPPER_CHECK"' in body
+    assert body.index('-c "$SAGE_HOPPER_CHECK"') < body.index("rm -rf /tmp/sage /tmp/sage.tar.gz /tmp/cudalib")
     assert "sageattention" not in stage("ltx")
 
 

@@ -31,8 +31,11 @@ OTHER_CLASS = "C4.h200-141gb.x4.ulysses4"
 
 @pytest.fixture(autouse=True)
 def gpus_nvml_cannot_see(monkeypatch):
-    """As on a machine without a driver, whatever this one has: tests that need GPUs say which."""
+    """As on a machine without a driver, whatever this one has: tests that need GPUs say which. SGLang's import test
+    passes unless a test puts the real one back."""
     monkeypatch.setattr(h3_servers, "visible_compute_capabilities", lambda: None)
+    monkeypatch.setitem(h3_servers.__dict__, "_real_sage_import_error", h3_servers.sage_import_error)
+    monkeypatch.setattr(h3_servers, "sage_import_error", lambda binary, env: None)
 
 
 def on_gpus(monkeypatch, *capabilities: tuple[int, int]) -> None:
@@ -141,6 +144,57 @@ def test_auto_falls_back_to_sglangs_default_where_sageattention_cannot_run(tmp_p
     assert "--attention-backend" not in server.argv and server.attention == "default"
     assert "KUNO_H3_ATTENTION=auto: SGLang's default attention on every server, because " in caplog.text
     assert reason in caplog.text
+
+
+UNDEFINED = ("ImportError: /opt/sglang/lib/python3.12/site-packages/sageattention/_qattn_sm90.cpython-312-x86_64-linux-gnu.so: "
+             "undefined symbol: cuTensorMapEncodeTiled")
+
+
+def venv_python(binary: str, *, fails_with: str | None) -> Path:
+    """The venv's `python`: a script that passes SGLang's Hopper import test, or fails it the way the first GPU run
+    of the image's own kernels did (2026-09-18). It records its environment beside itself."""
+    python = Path(binary).parent / "python"
+    fail = f"echo 'Traceback (most recent call last):' >&2; echo '{fails_with}' >&2; exit 1" if fails_with else "exit 0"
+    # Shell builtins only: the servers' PATH is the venv's bin directory plus whatever PATH the worker had.
+    python.write_text(f"#!/bin/sh\nexport -p > \"${{0%/*}}/probe.env\"\n[ \"$1\" = -c ] || exit 3\n{fail}\n")
+    python.chmod(0o755)
+    return python
+
+
+def test_sageattention_must_import_the_way_sglang_checks_it_before_a_server_gets_it(tmp_path, monkeypatch, caplog):
+    """SGLang runs FlashAttention with only a warning when SageAttention's SM90 binding does not import, as happened on
+    the image's first GPU run. So the worker runs the same import first: `auto` falls back and says why, `sage` refuses."""
+    on_gpus(monkeypatch, H200)
+    monkeypatch.setattr(h3_servers, "sage_import_error", h3_servers.__dict__["_real_sage_import_error"])
+    binary = venv(tmp_path / "v", "sageattention")
+    venv_python(binary, fails_with=UNDEFINED)
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, KUNO_SGLANG_BIN=binary)
+    with caplog.at_level(logging.INFO, logger="kuno.worker.h3_servers"):
+        [server] = plan_servers(config, env)
+    assert "--attention-backend" not in server.argv and server.attention == "default"
+    assert "because SageAttention's SM90 kernels do not load (" + UNDEFINED + ")" in caplog.text
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, KUNO_SGLANG_BIN=binary,
+                            KUNO_H3_ATTENTION="sage")
+    with pytest.raises(ValueError, match="SM90 kernels do not load .*undefined symbol: cuTensorMapEncodeTiled"):
+        plan_servers(config, env)
+    # Kernels that import get the server, and the check ran with the servers' environment: no worker settings.
+    venv_python(binary, fails_with=None)
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, KUNO_SGLANG_BIN=binary)
+    assert plan_servers(config, env)[0].attention == "sage_attn"
+    probe_env = (Path(binary).parent / "probe.env").read_text()
+    assert "KUNO_" not in probe_env and str(Path(binary).parent) in probe_env
+
+
+def test_the_import_check_is_not_run_where_it_cannot_say_anything(tmp_path, monkeypatch):
+    """A bare `sglang` on PATH has no venv to run, and GPUs the kernels are not built for never get SageAttention."""
+    monkeypatch.setattr(h3_servers, "sage_import_error", h3_servers.__dict__["_real_sage_import_error"])
+    assert h3_servers.sage_import_error("sglang", {}) is None
+    binary = venv(tmp_path / "v", "sageattention")
+    python = venv_python(binary, fails_with=UNDEFINED)
+    on_gpus(monkeypatch, B200)
+    config, env = configure(tmp_path, KUNO_PROFILES="h3-turbo", KUNO_H3_TURBO_LORA=LORA, KUNO_SGLANG_BIN=binary)
+    plan_servers(config, env)
+    assert not (python.parent / "probe.env").exists()
 
 
 def test_default_and_sage_are_asked_for_by_name(tmp_path, monkeypatch):

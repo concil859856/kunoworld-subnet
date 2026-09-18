@@ -171,8 +171,14 @@ RUN set -e; cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
 #   does not change:  find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum
 #   nvcc 13.4 compiles against the wheel's CUDA 13.0 headers, which CCCL refuses unless
 #   -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK says the major versions match; setup.py links -lcuda, which the pip toolkit
-#   does not ship, so an empty stub carrying the driver's soname satisfies the link and the VM's real libcuda.so.1 is
-#   what loads at run time. The build took 234 s on 12 cores on 2026-09-17.
+#   does not ship, so a stub carrying the driver's soname satisfies the link and the VM's real libcuda.so.1 is what
+#   loads at run time. The build took 234 s on 12 cores on 2026-09-17.
+#   The stub must DEFINE the driver functions the kernels call (only cuTensorMapEncodeTiled, in the SM90 kernel, for
+#   its TMA descriptors). The linker runs with --as-needed, so an empty stub supplied nothing, was dropped, and the SM90
+#   kernel came out with an undefined cuTensorMapEncodeTiled and no NEEDED entry for libcuda.so.1. On an H200 its
+#   import failed ("undefined symbol"), and SGLang, whose Hopper check is exactly that import, logged "missing the SM90
+#   binding fix" and ran FlashAttention instead (2026-09-18, the first GPU run of the image's own kernels). The readelf
+#   check below fails the build if any kernel calls a cu* driver function without needing libcuda.so.1.
 #   Reproducible because of --objdir-as-tempdir. Without it nvcc names its temporary files after its process id
 #   (/tmp/tmpxft_<pid>_00000000-6_<source>.cudafe1.cpp), and gcc copies that name into the object's symbol table: the
 #   FILE symbol and the _GLOBAL__sub_I_ constructor's name. The four extensions compile in parallel threads, so which
@@ -184,6 +190,7 @@ RUN set -e; cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
 ARG SAGE_REF=d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4
 ARG SAGE_TREE_SHA256=9ec4a895ec9905423e4d9b8c908fcb2bc829046d0c036e3c8dcafa7b3fd0b408
 ARG SAGE_ARCH=9.0
+ARG SAGE_HOPPER_CHECK="from sageattention.sm90_compile import qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_fake_impl"
 RUN set -eu; \
     cuda=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13; \
     mkdir -p /tmp/sage /tmp/cudalib; \
@@ -192,7 +199,7 @@ RUN set -eu; \
     tar -xzf /tmp/sage.tar.gz -C /tmp/sage --strip-components=1; \
     found="$(cd /tmp/sage && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"; \
     [ "$found" = "${SAGE_TREE_SHA256}" ] || { echo "SageAttention ${SAGE_REF} hashes to $found, not ${SAGE_TREE_SHA256}" >&2; exit 1; }; \
-    echo | gcc -shared -x c - -Wl,-soname,libcuda.so.1 -o /tmp/cudalib/libcuda.so; \
+    printf 'int cuTensorMapEncodeTiled(void) { return 0; }\n' | gcc -shared -x c - -Wl,-soname,libcuda.so.1 -o /tmp/cudalib/libcuda.so; \
     cd /tmp/sage \
     && CUDA_HOME="$cuda" LIBRARY_PATH=/tmp/cudalib TORCH_CUDA_ARCH_LIST="${SAGE_ARCH}" MAX_JOBS=32 EXT_PARALLEL=4 \
        NVCC_APPEND_FLAGS='--threads 8 -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK --objdir-as-tempdir' \
@@ -203,10 +210,20 @@ RUN set -eu; \
     && if grep -l -a 'tmpxft_' /opt/sglang/lib/python3.12/site-packages/sageattention/*.so; then \
            echo "nvcc's temporary file names are in the kernels above: the image would not be reproducible" >&2; exit 1; \
        fi \
+    && for so in /opt/sglang/lib/python3.12/site-packages/sageattention/*.so; do \
+           if nm -D --undefined-only "$so" | grep -qE ' cu[A-Z]' && ! readelf -d "$so" | grep -q 'NEEDED.*\[libcuda\.so\.1\]'; then \
+               echo "$so calls the CUDA driver but does not need libcuda.so.1: it would fail to import on a GPU" >&2; exit 1; \
+           fi; \
+       done \
+    && readelf -d /opt/sglang/lib/python3.12/site-packages/sageattention/_qattn_sm90*.so | grep -q 'NEEDED.*\[libcuda\.so\.1\]' \
+    && ln -s libcuda.so /tmp/cudalib/libcuda.so.1 \
+    && PYTHONDONTWRITEBYTECODE=1 LD_LIBRARY_PATH=/tmp/cudalib /opt/sglang/bin/python -c "$SAGE_HOPPER_CHECK" \
     && rm -rf /tmp/sage /tmp/sage.tar.gz /tmp/cudalib /root/.cache
-# The package cannot be imported here: its kernels link libcuda.so.1, which the VM's driver provides and a build
-# container has not got. So the check above is that the files are installed — the SM90 binding SGLang looks for and
-# the compiled SM90 kernels beside it. Importing it is what the first `sage` server on a GPU does.
+# The build container has no driver, so the last check imports against the stub, which is enough to prove every symbol
+# resolves: it is SGLang 0.5.19's own Hopper test (sglang/multimodal_gen/runtime/platforms/cuda.py), which falls back to
+# FlashAttention with only a warning when this import fails. kuno-h3-worker repeats it on the GPU before starting a
+# `sage` server (worker/src/kuno_worker/h3_servers.py). The import writes no bytecode (PYTHONDONTWRITEBYTECODE), so the
+# layer stays reproducible.
 
 # The H3 weights are a Hugging Face hub cache mounted at /models/h3 (models--MiniMaxAI--MiniMax-H3/…), which
 # SGLang and diffusers both resolve offline. kuno-h3-worker refuses profiles that would load H3 twice on one worker's

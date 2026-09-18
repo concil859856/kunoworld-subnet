@@ -292,7 +292,8 @@ The `h3` target adds SGLang's side:
     The Turbo server is the fl2va checkpoint on port 30012 with `--num-gpus 1 --ulysses-degree 1` plus
     `--lora-path <KUNO_H3_TURBO_LORA> --lora-nickname turbo`.
   - **The attention backend.** With `KUNO_H3_ATTENTION` unset or `auto`, the Turbo server gets `--attention-backend
-    sage_attn` when the package is installed and NVML reports only SM90 GPUs; every other server, and Turbo anywhere
+    sage_attn` when the package is installed, NVML reports only SM90 GPUs and SGLang's own import test of the SM90
+    kernels passes on them; every other server, and Turbo anywhere
     else, keeps SGLang's own choice (FlashAttention on Hopper), with a log line saying why. `default` is SGLang's
     choice on every server and `sage` is SageAttention on every server. `sage` is refused at start-up in an image
     without the package or on GPUs the kernels are not built for, because SGLang would otherwise fall back to
@@ -332,13 +333,15 @@ The `h3` target adds SGLang's side:
 - **One GPU.** `h3-turbo` is a single-GPU profile since 2026-09-17: one H200 renders it at 9.92 GPU-seconds per
   output second against 15.6 through a four-GPU worker, and a single-GPU confidential VM is far easier to rent. It is
   served from the `c2.*.x1` shapes, not the whole-server `c8.*` ones.
-- **Its envelope.** One H200 peaks at 126.6-128.9 GB for a 5 s clip and 137.6-138.9 GB at 14 s, so the worker
+- **Its envelope.** One H200 peaks at 126.6-128.9 GB for a 5 s clip, 134.9 GB (134,935 MiB, FlashAttention) at 10 s and
+  137.6-138.9 GB at 14 s, so the worker
   advertises `h3-turbo` up to 10 s on a 141 GB card and the profile's full 14 s on 180 GB or more
   (`worker/backends/h3.py`, MINING.md §3c).
 - **Measured.** SGLang 0.5.19 from this image served the LoRA through `--lora-path` on 4 H200s (2026-09-16),
   at 11.5 GPU-s per output second at 5 s, and on 2026-09-17 through the worker and a real gateway, at 15.6 on four
   GPUs (`research/pricing/measured_2026-09-16_h3-turbo.md` and `research/h3-image-check_2026-09-17.md` in the dev
-  repo). One-GPU serving has run only straight against SGLang, not through the worker.
+  repo). On 2026-09-18 one-GPU serving ran through the worker and a real gateway: a 10 s clip on one H200 in 146.3
+  GPU-seconds, FlashAttention.
 - **No lightx2v.** LightX2V's own `inference_minimax_h3.py` isn't in the image, and no backend runs it.
 
 **Run on GPUs without confidential computing** (4 of 8 H200s, 2026-09-15 and -16): SGLang loads H3 from a read-only,
@@ -347,13 +350,12 @@ names exist (both fixed in `worker.Dockerfile`). **Not verified**, in particular
 - **Two H3 loads on one GPU group** (`KUNO_H3_SHARED_SERVERS=1`), on any GPU. The image's earlier default,
   `h3,h3-reference`, started both servers on four GPUs; it never ran, and would almost certainly run out of memory
   on H200s.
-- **`h3-turbo` through the worker:** the Turbo server started by `kuno-h3-worker` **on one GPU**. The four-GPU Turbo
-  server and its requests at 9 points ran through the worker and a real gateway on 2026-09-17; one-GPU serving has run
-  only straight against SGLang, and never with the memory of a 10 s clip checked against the envelope.
 - **SageAttention in this image:** `worker.Dockerfile` builds it reproducibly (`image/build.sh --variant h3 --check`
   gave two identical digests on 2026-09-18) and installs the SM90 kernels. The measurements above came from a build
-  in a container committed from the published image. The kernels `worker.Dockerfile` builds have not been imported
-  on a GPU, and only SM90 is built.
+  in a container committed from the published image. The first image's own kernels failed to import on an H200
+  (2026-09-18: linked without `libcuda.so.1`), so SGLang served FlashAttention; the fix (a stub that defines the
+  driver function, a link check and SGLang's import test at build time, the same test in the worker on the GPU) has
+  not yet run on a GPU. Only SM90 is built.
 - SGLang's JIT kernels compiling with the CUDA 13 toolkit that pip wheels put in `/opt/sglang`. `kuno-h3-worker` sets
   the servers' `CUDA_HOME` to it (`site-packages/nvidia/cu13`, holding `nvcc` and the runtime headers), and g++ is
   the host compiler. Whether those wheels hold everything the kernels include and link is unchecked.

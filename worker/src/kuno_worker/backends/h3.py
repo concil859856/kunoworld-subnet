@@ -78,13 +78,14 @@ SGLANG_TURBO_SHIFTS = {"flow_shift": TURBO_SHIFTS["video_shift"], "audio_flow_sh
 # can render. Measured peaks of one H200 (nominally 141 GB) at 1344x768 with the 8-step LoRA:
 #
 #     5 s   126.6 GB with FlashAttention, 128.9 with SageAttention   2026-09-17, research/h3-image-check_2026-09-17.md §3
+#    10 s   134,935 MiB of the card's 143,771 (nvidia-smi), FlashAttention, through kuno-h3-worker and a real gateway,
+#           2026-09-18 (SGLang's own figure: 133,674 MB); research/h3-image-check_2026-09-17.md, "One-GPU Turbo"
 #    14 s   137.6 GB with the 8-step LoRA, 138.9 with the 4-step one 2026-09-16, research/pricing/measured_2026-09-16_h3-turbo.md
 #
 # so the peak grows by about 1.1 GB per second of clip, and 14 s leaves 2-3 GB of the card: too tight to advertise.
-# Interpolating the two measured lengths, 10 s peaks at about 134 GB, which leaves 7 GB free, and that is what a 141 GB
-# card advertises. A card of 180 GB or more (B200, B300) has 40 GB of headroom at 14 s and serves the profile in full;
-# those two lengths are the only measured ones, every length between them is interpolated, and no card above 141 GB has
-# been measured at all. Rungs, smallest card first: (the GPU's total memory, the longest clip it serves). The rungs sit
+# 10 s leaves about 8.8 GB, 6.5 with SageAttention's extra 2.3, and that is what a 141 GB card advertises (interpolating
+# 5 s and 14 s had predicted about 134 GB). A card of 180 GB or more (B200, B300) has 40 GB of headroom at 14 s and
+# serves the profile in full; no card above 141 GB has been measured at all. Rungs, smallest card first: (the GPU's total memory, the longest clip it serves). The rungs sit
 # far from every real card's size, so it makes no difference whether a card's memory is counted in GB or GiB.
 TURBO_ONE_GPU_RUNGS = ((120.0, 10.0), (160.0, 14.0))
 

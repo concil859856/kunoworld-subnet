@@ -92,6 +92,11 @@ AUTO_SAGE_SERVERS = frozenset({"turbo"})
 # The GPU architectures the image's SageAttention kernels are compiled for: SAGE_ARCH in image/worker.Dockerfile, 9.0
 # (Hopper: H200). A B200 (10.0) or B300 (10.3) has no kernel to run, so `auto` gives them SGLang's default.
 SAGE_COMPUTE_CAPABILITIES = frozenset({(9, 0)})
+# SGLang 0.5.19's own test before it uses SageAttention on Hopper (sglang/multimodal_gen/runtime/platforms/cuda.py). When
+# this import fails it logs "missing the SM90 binding fix" and runs FlashAttention, which is how the image's first GPU
+# run (2026-09-18) served FlashAttention while asking for SageAttention: the SM90 kernel had been linked without
+# libcuda.so.1. So the worker runs the same import on the GPU first. image/worker.Dockerfile runs it at build time too.
+SAGE_HOPPER_CHECK = "from sageattention.sm90_compile import qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_fake_impl"
 URL_KEYS = {"fl2va": "KUNO_H3_FL2VA_URL", "ref2va": "KUNO_H3_REF2VA_URL", "turbo": "KUNO_H3_TURBO_URL"}
 IN_PROCESS = "in-process"
 SHARED_KEY = "KUNO_H3_SHARED_SERVERS"
@@ -148,10 +153,11 @@ def attention_backends(env: Mapping[str, str], binary: str, names: Sequence[str]
     SageAttention is 8-bit attention: on one H200 it rendered a 5 s Turbo clip in 47.95 s against FlashAttention's
     51.26 s (6.5% faster) for about 2 GB more memory. The two clips differ (30.2 dB PSNR, 0.925 SSIM, and a visibly
     different framing), and the owner could not tell which was better (research/h3-image-check_2026-09-17.md §3).
-    SGLang falls back to FlashAttention with only a log line when the package is missing, so `sage` asked for by name
-    is refused where the image cannot serve it; `auto` falls back instead, and says so in the log. Raises ValueError for
-    an unknown value, or for `sage` in an image without sageattention in the SGLang venv or on GPUs NVML reports its
-    kernels are not built for."""
+    SGLang falls back to FlashAttention with only a log line when the package is missing or its SM90 kernels do not
+    import, so `sage` asked for by name is refused where the image cannot serve it; `auto` falls back instead, and says
+    so in the log. On GPUs the kernels are built for, both first run SGLang's own import test (sage_import_error).
+    Raises ValueError for an unknown value, or for `sage` in an image without sageattention in the SGLang venv, on GPUs
+    NVML reports its kernels are not built for, or where they do not import."""
     choice = (env.get(ATTENTION_KEY) or AUTO_ATTENTION).strip()
     if choice not in ATTENTION_CHOICES:
         raise ValueError(f"{ATTENTION_KEY}={choice!r} is not one of {', '.join(ATTENTION_CHOICES)}")
@@ -161,6 +167,8 @@ def attention_backends(env: Mapping[str, str], binary: str, names: Sequence[str]
     capabilities = visible_compute_capabilities() if installed else None
     unbuilt = sorted({cc for cc in capabilities or () if cc not in SAGE_COMPUTE_CAPABILITIES})
     built_for = ", ".join(f"sm_{major}{minor}" for major, minor in sorted(SAGE_COMPUTE_CAPABILITIES))
+    # SGLang would fall back silently if the kernels do not load on these GPUs, so try them the way it does.
+    load_error = sage_import_error(binary, env) if installed and capabilities and not unbuilt else None
     if choice == "sage":
         if not installed:
             raise ValueError(
@@ -174,6 +182,12 @@ def attention_backends(env: Mapping[str, str], binary: str, names: Sequence[str]
                 f"worker's GPUs include {', '.join(f'sm_{a}{b}' for a, b in unbuilt)}. Use {ATTENTION_KEY}={DEFAULT_ATTENTION} "
                 "(or auto), or rebuild the image with those architectures in SAGE_ARCH"
             )
+        if load_error:
+            raise ValueError(
+                f"{ATTENTION_KEY}=sage: SageAttention's SM90 kernels do not load in the SGLang environment of {binary} "
+                f"({load_error}), and SGLang would fall back to FlashAttention without failing. Use "
+                f"{ATTENTION_KEY}={DEFAULT_ATTENTION} (or auto), or an image whose kernels import"
+            )
         # Where NVML cannot say (a development machine without a driver), `sage` is taken at its word.
         return {name: "sage" for name in names}
     if not installed:
@@ -182,10 +196,32 @@ def attention_backends(env: Mapping[str, str], binary: str, names: Sequence[str]
         reason = "NVML did not report the GPUs' architecture"
     elif unbuilt:
         reason = f"the image's SageAttention kernels are built for {built_for}, not {', '.join(f'sm_{a}{b}' for a, b in unbuilt)}"
+    elif load_error:
+        reason = f"SageAttention's SM90 kernels do not load ({load_error})"
     else:
         return {name: "sage" if name in AUTO_SAGE_SERVERS else DEFAULT_ATTENTION for name in names}
     log.info("%s=auto: SGLang's default attention on every server, because %s", ATTENTION_KEY, reason)
     return {name: DEFAULT_ATTENTION for name in names}
+
+
+def sage_import_error(binary: str, env: Mapping[str, str]) -> str | None:
+    """None when SGLang's Hopper test (SAGE_HOPPER_CHECK) passes in the venv of `binary`, run with the servers'
+    environment; otherwise the last line of its error. None too when there is no venv Python to run (a bare `sglang` on
+    PATH, as on a development machine): there is nothing to check it against."""
+    if os.sep not in binary:
+        return None
+    python = Path(binary).parent / "python"
+    if not python.exists():
+        return None
+    try:
+        done = subprocess.run([str(python), "-c", SAGE_HOPPER_CHECK], env=server_env(env, binary), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"the import could not be tried: {exc}"
+    if done.returncode == 0:
+        return None
+    lines = [line.strip() for line in (done.stderr or "").splitlines() if line.strip()]
+    return (lines[-1] if lines else f"exit code {done.returncode}")[:300]
 
 
 def visible_compute_capabilities() -> list[tuple[int, int]] | None:
