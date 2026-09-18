@@ -139,7 +139,8 @@ automatic checks and on accountability instead:
   signed or sealed. A blocked job returns `safety_blocked` with a fixed message and delivers
   nothing. Production images must load the classifiers or they refuse to start. There is no
   setting that allows sexual content. Details and limits: [SECURITY.md](SECURITY.md#output-safety).
-- **Strikes.** Every blocked job counts against the account. Private mode needs an account in
+- **Strikes.** Every blocked job counts against the account, except one blocked only for text a model wrote inside the
+  enclave (an enhanced prompt, or a Director plan's shot prompts), which is refused and refunded without a strike. Private mode needs an account in
   good standing with a verified payment.
 - **Reports.** Anyone who comes across a video can report it. A report of child sexual abuse
   material can include the video's key. That is the only way anyone can review a Private video,
