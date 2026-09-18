@@ -197,7 +197,9 @@ random capital letters.
 1. **Refuse** what doesn't fit, before decrypting: invalid params, outside the envelope, or a backend without a planner
    (`internal_error`; such a worker doesn't advertise `plan/1`).
 2. **Check the brief**, the style and a revision's instruction with the content policy and the prompt classifier
-   (`safety_blocked`, fixed message). Length and option errors are `prompt_too_long` and `bad_payload`.
+   (`safety_blocked`, fixed message, a strike). A revision's earlier plan is the customer's too, and parts of it come back
+   byte-identical, so it gets step 7's checks here, before the planner runs: a block after step 3 is then always the
+   planner's text. Length and option errors are `prompt_too_long` and `bad_payload`.
 3. **Write.** Messages: the `plan/1` system prompt (`kuno_protocol/plan_prompts/plan-1.txt`, placeholders filled by
    `system_prompt`) and `Brief: <brief>`; a revision adds the earlier plan as the planner's own turn and the instruction.
    Decoding: `do_sample`, temperature 0.7, top-p 0.95, top-k 64, `max_new_tokens` = `limits.plan.max_new_tokens` (2,048).
@@ -205,7 +207,7 @@ random capital letters.
 4. **Repair** (`repair`, deterministic). Syntax: `<think>` blocks and text outside the outermost braces dropped; trailing
    commas removed; an object closed early and continued (`…]} , "notes": …` and `…]} "notes": …`, 2 of the 5 GPU replies)
    reopened; text after a complete object dropped. A `{"refusal": …}` object without shots is `safety_blocked`, with no
-   retry. Shots: non-objects and blank prompts dropped, at most `max_shots` kept; text tidied (diffusers' quote and dash
+   retry and no strike (`strike: false`, [Content policy](#content-policy)). Shots: non-objects and blank prompts dropped, at most `max_shots` kept; text tidied (diffusers' quote and dash
    mapping, Markdown, "Shot 3:" labels, collapsed whitespace); a join word written as a prompt's last sentence ("Cut.")
    removed; a missing beat named from the prompt's first 6 words. Joins: the first `fresh`, an unknown one `cut`, and a
    `continue` whose prompt names a different shot size than the shot before becomes `cut`. Durations: a missing one gets
@@ -222,7 +224,8 @@ random capital letters.
    the retry). No plan from either: **`plan_failed`**. Problems a plan can live with become notices in `repairs`.
 7. **Check the output.** Every shot's model prompt, `shot_prompt(scene, prompt)`, goes through the content policy and the
    prompt classifier; title, notes and beats through the content policy. A block writes a new plan once (steps 3-6, seeds
-   `seed + 2` and `seed + 3`); a second block is `safety_blocked`. Stage `checking`, reported once.
+   `seed + 2` and `seed + 3`); a second block is `safety_blocked` with no strike (`strike: false`): the planner wrote
+   it. Stage `checking`, reported once.
 8. **Deliver.** `validate` again (a failure is a worker bug, `internal_error`), then seal, upload and sign. No frame check,
    no C2PA manifest, no step commitment.
 
@@ -747,6 +750,50 @@ negative_prompt)`, which raises `ContentPolicyViolation` with a `category` of `s
 inside the enclave for every job, and gateways call it wherever they can read the prompt. A worker
 reports a block as `safety_blocked` with a fixed message that never depends on the prompt; the
 category is never sent. A worker whose configured classifiers cannot run reports `internal_error`.
+
+### Failure reports and strikes
+
+A worker fails a job with `POST /miner/v1/jobs/{job_id}/fail`, enclave-signed:
+
+```
+{"code": "safety_blocked", "message": "The request was blocked by the content policy.", "strike": false}
+```
+
+`code` is at most 64 characters and `message` at most 500. `strike` is optional, and a worker sends it only as `false`,
+only with `safety_blocked`, and only when the customer wrote none of what was blocked:
+
+- the enhanced prompt (the sealed `enhance_prompt` option), blocked by the content policy or the prompt classifier;
+- a plan's shot prompts, title, notes or beats, blocked twice ([Plans](#plans-director), step 7);
+- the planner refusing the brief (step 4). Our checks passed the brief, and a small model's refusal is not a block of
+  anything the customer wrote.
+
+Everything the customer wrote is checked before any model writes a word: the prompt, the negative prompt, a storyboard's
+shots, a plan's brief, style and instruction, and a revision's earlier plan. A block of any of it is reported without
+the field. So is a block of the rendered frames ("The video was blocked by the content policy."), enhanced prompt or
+not: the exemption is for text a model wrote, and frames are not text.
+
+The gateway records a strike on the customer's account for every `safety_blocked` unless the report says
+`"strike": false`. Nothing else changes. The job fails as `safety_blocked` with the same fixed message, is refunded, and
+counts as `safety_blocked` wherever codes count: the validators' miner-fault codes, the ledger feed, metrics. `strike`
+means nothing with any other code, which never strikes.
+
+**What it reveals.** For a Private job, `strike: false` tells the gateway that a model inside the enclave wrote the blocked
+text. For a video job that means enhancement was asked for, a sealed option the gateway otherwise never learns (the
+worker gives enhancement no progress stage for that reason), and that the enhanced prompt was blocked. For a plan, whose
+mode the params show anyway, it means the brief passed and the planner's text was blocked or the planner refused. Its
+absence on a Private `safety_blocked` says the reverse: the customer's own text, or the frames, were blocked. That one bit
+is the least the gateway needs to decide a strike. The report gives no reason, category or stage, and the message is
+the one every blocked prompt gets. The gateway keeps the bit only as a missing strike row, which operators see beside
+the job's metadata. A Standard job reveals nothing new: the gateway reads its prompt and options.
+
+**Compatibility.** A worker sends the field only when it is false, so every other report is byte-for-byte what it was.
+A gateway from before the field ignores unknown fields in a failure report and records the strike, as before: upgrade
+gateways before workers. A gateway refuses a `strike` that is not a JSON boolean (`422 invalid_body`), and the job stays
+running until a well-formed report arrives or it times out.
+
+**Trust.** The gateway takes `strike` on the miner's word, as it takes the code. A miner that leaves the field out gets an
+innocent customer a strike, but it could already do that by reporting `safety_blocked` falsely. Sending the field gains a
+miner nothing: the job is refunded and counts the same either way. So there is no new check.
 
 ## Receipts (certificates)
 

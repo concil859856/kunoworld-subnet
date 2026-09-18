@@ -48,10 +48,12 @@ class PlanClient(RecordingClient):
     def __init__(self):
         super().__init__()
         self.failures: list[tuple[str, str]] = []
+        self.strikes: list[bool] = []
         self.stages: list[str] = []
 
-    def fail(self, _job_id, code, message):
+    def fail(self, _job_id, code, message, strike=True):
         self.failures.append((code, message))
+        self.strikes.append(strike)
 
     def progress(self, _job_id, _value, stage):
         self.stages.append(stage)
@@ -273,6 +275,73 @@ def test_titles_notes_and_beats_are_held_to_the_content_policy(tmp_path):
     beat["shots"][2]["beat"] = BLOCKED
     worker = planner_worker(tmp_path, ScriptedPlanner(json.dumps(beat), json.dumps(beat)))
     assert failure(worker, plan_job(worker)[0]) == ("safety_blocked", PROMPT_BLOCKED)
+
+
+# ------------------------------------------------------------------ strikes: who wrote what was blocked
+
+
+def test_a_blocked_brief_style_or_instruction_is_the_customers_and_a_strike(tmp_path):
+    first = planner_worker(tmp_path, ScriptedPlanner(ROASTERY["raw"]))
+    earlier = delivered(first, *plan_job(first, options={"max_shot_s": 11}))
+    revise = PlanRevision(plan=earlier, instruction=BLOCKED, shots=[3]).model_dump(mode="json")
+    for payload in ({"brief": BLOCKED}, {"options": {"style": BLOCKED}}, {"brief": "", "options": {"max_shot_s": 11, "revise": revise}}):
+        backend = ScriptedPlanner(ROASTERY["raw"])
+        worker = planner_worker(tmp_path, backend)
+        job, _ = plan_job(worker, **payload)
+        assert failure(worker, job) == ("safety_blocked", PROMPT_BLOCKED) and worker.client.strikes == [True]
+        assert backend.calls == []
+
+
+def test_what_the_planner_wrote_blocked_twice_is_no_strike(tmp_path):
+    # A shot prompt, through the prompt check.
+    safety.configure(SafetyGate(classifier=RecordingClassifier(blocks=lambda text: "\n\n" in text)))  # every shot prompt
+    worker = planner_worker(tmp_path, ScriptedPlanner(ROASTERY["raw"], ROASTERY["raw"]))
+    assert failure(worker, plan_job(worker)[0]) == ("safety_blocked", PROMPT_BLOCKED) and worker.client.strikes == [False]
+
+    # A beat, through the content policy.
+    safety.configure(SafetyGate())
+    beat = json.loads(ROASTERY["raw"].replace("]} ,", "],"))
+    beat["shots"][2]["beat"] = BLOCKED
+    worker = planner_worker(tmp_path, ScriptedPlanner(json.dumps(beat), json.dumps(beat)))
+    assert failure(worker, plan_job(worker)[0]) == ("safety_blocked", PROMPT_BLOCKED) and worker.client.strikes == [False]
+
+    # A first block the second plan fixes costs nothing at all: the plan is delivered.
+    worker = planner_worker(tmp_path, ScriptedPlanner(json.dumps(beat), ROASTERY["raw"]))
+    worker.process(plan_job(worker)[0])
+    assert worker.client.failures == [] and len(worker.client.uploads) == 1
+
+
+def test_the_planners_refusal_of_a_brief_that_passed_the_checks_is_no_strike(tmp_path):
+    backend = ScriptedPlanner('{"refusal": "cannot plan this brief"}')
+    worker = planner_worker(tmp_path, backend)
+    assert failure(worker, plan_job(worker)[0]) == ("safety_blocked", PROMPT_BLOCKED) and worker.client.strikes == [False]
+    assert len(backend.calls) == 1
+
+
+def test_blocked_text_in_a_revisions_earlier_plan_is_the_customers_and_strikes_before_the_planner_runs(tmp_path):
+    """A revision gives parts of the earlier plan back byte-identical, so the worker checks it as the customer's before the
+    planner runs: a block after that is always the planner's text."""
+    first = planner_worker(tmp_path, ScriptedPlanner(ROASTERY["raw"]))
+    earlier = delivered(first, *plan_job(first, options={"max_shot_s": 11}))
+    shot = earlier.shots[0].model_copy(update={"prompt": f"{earlier.shots[0].prompt} {BLOCKED}."})
+    for edited in (earlier.model_copy(update={"notes": BLOCKED}), earlier.model_copy(update={"shots": [shot, *earlier.shots[1:]]})):
+        backend = ScriptedPlanner(ROASTERY["raw"])
+        worker = planner_worker(tmp_path, backend)
+        revise = PlanRevision(plan=edited, instruction="make it darker", shots=[3]).model_dump(mode="json")
+        job, _ = plan_job(worker, "", options={"max_shot_s": 11, "revise": revise})
+        assert failure(worker, job) == ("safety_blocked", PROMPT_BLOCKED) and worker.client.strikes == [True]
+        assert backend.calls == []
+
+    # The earlier plan passes; the planner's rewrite of shot 3 is blocked twice: the planner's text, no strike.
+    rewritten = json.loads(ROASTERY["raw"].replace("]} ,", "],"))
+    rewritten["shots"][2]["prompt"] = f"Close-up shot; {BLOCKED}."
+    rewritten["shots"][2]["duration_s"] = 11
+    backend = ScriptedPlanner(json.dumps(rewritten), json.dumps(rewritten))
+    worker = planner_worker(tmp_path, backend)
+    revise = PlanRevision(plan=earlier, instruction="make it darker", shots=[3]).model_dump(mode="json")
+    job, _ = plan_job(worker, "", options={"max_shot_s": 11, "revise": revise})
+    assert failure(worker, job) == ("safety_blocked", PROMPT_BLOCKED) and worker.client.strikes == [False]
+    assert len(backend.calls) == 2
 
 
 # ------------------------------------------------------------------ refusals before planning

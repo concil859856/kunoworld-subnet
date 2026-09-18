@@ -38,7 +38,7 @@ class StubClient:
     def progress(self, *_args, **_kwargs) -> bool:
         return False
 
-    def fail(self, _job_id, code, message):
+    def fail(self, _job_id, code, message, strike=True):
         self.failures.append((code, message))
 
     def upload_blob(self, *_args):

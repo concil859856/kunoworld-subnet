@@ -142,7 +142,7 @@ class RecordingClient:
         self.registered.append(extra)
         return {"status": "active"}
 
-    def fail(self, job_id, code, message):
+    def fail(self, job_id, code, message, strike=True):
         self.failed.append((job_id, code, message))
 
 

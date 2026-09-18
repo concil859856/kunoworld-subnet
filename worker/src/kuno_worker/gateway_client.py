@@ -133,8 +133,14 @@ class GatewayClient:
         body = self._json({"output_blob_id": blob_id, "receipt": receipt.model_dump(mode="json")})
         self._send("POST", f"/miner/v1/jobs/{job_id}/complete", body)
 
-    def fail(self, job_id: str, code: str, message: str) -> None:
-        self._send("POST", f"/miner/v1/jobs/{job_id}/fail", self._json({"code": code, "message": message[:500]}))
+    def fail(self, job_id: str, code: str, message: str, *, strike: bool = True) -> None:
+        body: dict = {"code": code, "message": message[:500]}
+        if not strike:
+            # A `safety_blocked` whose blocked text a model inside the enclave wrote (worker.JobRejected): no strike on the
+            # customer's account. Sent only then, so every other report is byte-for-byte what it was; gateways from before
+            # the field ignore it and record the strike.
+            body["strike"] = False
+        self._send("POST", f"/miner/v1/jobs/{job_id}/fail", self._json(body))
 
     def retire(self) -> dict:
         """Tell the gateway this enclave is leaving, so queued jobs are released at once."""

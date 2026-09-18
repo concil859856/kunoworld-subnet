@@ -214,3 +214,19 @@ def test_client_sends_the_proof_only_when_there_is_one():
     client.register(evidence, "5x", 1, proof)
     assert "hotkey_proof" not in bodies[0]
     assert bodies[1]["hotkey_proof"]["enclave_id"] == evidence.enclave_id
+
+
+def test_a_failure_report_says_strike_false_only_for_a_block_a_model_wrote():
+    """Every other report is byte-for-byte what it was before the field, so older gateways read it as they always did."""
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    client = GatewayClient("http://gateway", generate_signing_key(), "e" * 32, transport=httpx.MockTransport(handler))
+    message = "The request was blocked by the content policy."
+    client.fail("job", "safety_blocked", message)
+    client.fail("job", "safety_blocked", message, strike=False)
+    assert bodies[0] == json.dumps({"code": "safety_blocked", "message": message}).encode()
+    assert json.loads(bodies[1]) == {"code": "safety_blocked", "message": message, "strike": False}

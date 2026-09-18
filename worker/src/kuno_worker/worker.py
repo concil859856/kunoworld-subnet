@@ -60,23 +60,40 @@ PROGRESS_INTERVAL_S = 0.5
 # as gone. A render or an upload can block the job thread for longer, so a side thread repeats the last progress report.
 HEARTBEAT_S = 20.0
 # One message for every blocked prompt, whoever wrote it. In Private mode the gateway sees failure messages but not the
-# sealed options, so a message of its own for an enhanced prompt would tell it that enhancement was asked for.
+# sealed options, so a message of its own for an enhanced prompt would tell it that enhancement was asked for. Only
+# `strike: false` on the report says a model wrote the blocked text (JobRejected.strike): the one bit a strike needs.
 PROMPT_BLOCKED = "The request was blocked by the content policy."
 # A plan job whose planner never wrote a usable plan (kuno_protocol.plans.PLAN_FAILED): refunded, and not a miner fault.
 PLAN_FAILED_MESSAGE = "The planner could not write a usable plan for this brief."
 
 
 class JobRejected(Exception):
-    def __init__(self, code: str, message: str):
+    """A job this worker refuses or can't finish, reported to the gateway as `code` and `message`.
+
+    `strike` is False only for a `safety_blocked` the customer wrote nothing of: our check blocked text a language model
+    wrote inside the enclave (`model_text_blocked`), or the planner refused a brief that passed our check (`PlanRefused`).
+    The failure report then carries `strike: false` and the gateway records no strike on the account (PROTOCOL.md,
+    "Failure reports and strikes"). The job still fails as `safety_blocked` with the same fixed message, and is refunded."""
+
+    def __init__(self, code: str, message: str, *, strike: bool = True):
         super().__init__(message)
-        self.code, self.message = code, message
+        self.code, self.message, self.strike = code, message, strike
+
+
+def model_text_blocked() -> JobRejected:
+    """`safety_blocked` for text a language model wrote inside the enclave: an enhanced prompt, or a plan's shot prompts,
+    title, notes and beats. Everything the customer wrote passed the same checks before the model wrote a word, so the
+    blocked text is the model's and the customer gets no strike. The message is the one every blocked prompt gets."""
+    return JobRejected("safety_blocked", PROMPT_BLOCKED, strike=False)
 
 
 class PlanRefused(JobRejected):
-    """The planner refused the brief: `safety_blocked`, and never regenerated."""
+    """The planner refused the brief: `safety_blocked`, never regenerated, and no strike. The brief, style, instruction and
+    any earlier plan passed our own checks before the planner saw them; the refusal is a small model's judgement, not a
+    block by our check of anything the customer wrote."""
 
     def __init__(self) -> None:
-        super().__init__("safety_blocked", PROMPT_BLOCKED)
+        super().__init__("safety_blocked", PROMPT_BLOCKED, strike=False)
 
 
 class JobCanceled(Exception):
@@ -432,7 +449,7 @@ class Worker:
                 return self.process(job)
         except JobRejected as exc:
             self._discard_openings(job.job_id)
-            self._fail(job.job_id, exc.code, exc.message)
+            self._fail(job.job_id, exc.code, exc.message, strike=exc.strike)
         except JobCanceled:
             self._discard_openings(job.job_id)
             log.info("job %s canceled by the customer", job.job_id)
@@ -464,9 +481,9 @@ class Worker:
         except Exception as exc:  # never let cleanup mask the job's own failure
             log.warning("could not discard retained openings for job %s (%s)", job_id, type(exc).__name__)
 
-    def _fail(self, job_id: str, code: str, message: str) -> None:
+    def _fail(self, job_id: str, code: str, message: str, strike: bool = True) -> None:
         try:
-            self.client.fail(job_id, code, message)
+            self.client.fail(job_id, code, message, strike=strike)
         except (httpx.HTTPError, GatewayError):
             log.warning("could not report failure for job %s", job_id)
 
@@ -562,6 +579,7 @@ class Worker:
             for prompt in model_prompts:
                 check_request(prompt, payload.negative_prompt)
         except SafetyViolation:
+            # The customer's own prompt, negative prompt or shots, before any model has written anything: a strike.
             raise JobRejected("safety_blocked", PROMPT_BLOCKED) from None
 
         width, height = profile.size_for(job.params.resolution, job.params.aspect_ratio)
@@ -597,6 +615,7 @@ class Worker:
         try:
             check_output(result.data, signals, shot_frames=task.shot_frames)
         except SafetyViolation:
+            # A strike, enhanced prompt or not: the strike exemption covers blocked text a model wrote, and these are frames.
             raise JobRejected("safety_blocked", "The video was blocked by the content policy.") from None
         except SafetyUnavailable:
             raise JobRejected("internal_error", "The worker could not run its content safety check.") from None
@@ -712,7 +731,17 @@ class Worker:
             for text in written:
                 if text.strip():
                     check_request(text)
+            if options.revise is not None:
+                # The earlier plan is the customer's too, edited or not, and a revision gives parts of it back
+                # byte-identical. Held here to the checks a written plan gets (`_checked_plan`), so a block after the
+                # planner runs is always the planner's text, and customer text slipped into a revision still strikes.
+                earlier = options.revise.plan
+                for text in earlier.model_prompts():
+                    check_request(text)
+                for label in self._labels(earlier):
+                    check_prompt(label)
         except SafetyViolation:
+            # The customer's own text: a strike, as for any blocked prompt.
             raise JobRejected("safety_blocked", PROMPT_BLOCKED) from None
 
         width, height = profile.size_for(params.resolution, params.aspect_ratio)
@@ -767,7 +796,9 @@ class Worker:
         `shot_prompt(scene, prompt)`, is text a language model wrote for the video model, so it goes through
         `_generate_checked` like an enhanced prompt; the title, notes and beats are only shown to people, so they get the
         shared content policy. A block is written again once, from the next seeds, and a second block is
-        `safety_blocked`. The planner refusing the brief is `safety_blocked` at once."""
+        `safety_blocked`. The planner refusing the brief is `safety_blocked` at once. Neither is a strike
+        (`model_text_blocked`, `PlanRefused`): the brief, style, instruction and any earlier plan passed these checks
+        before the planner ran (`_plan`)."""
         drafts: list[tuple[Plan, int]] = []
 
         def write() -> list[str]:
@@ -781,12 +812,11 @@ class Worker:
             try:
                 self._generate_checked(write, None)
                 plan, _ = drafts[-1]
-                for label in (plan.title, plan.notes, *(shot.beat for shot in plan.shots)):
-                    if label.strip():
-                        check_prompt(label)
+                for label in self._labels(plan):
+                    check_prompt(label)
                 return plan, sum(tokens for _, tokens in drafts)
             except ContentPolicyViolation:
-                blocked = JobRejected("safety_blocked", PROMPT_BLOCKED)
+                blocked = model_text_blocked()
             except PlanRefused:
                 raise
             except JobRejected as exc:
@@ -839,9 +869,12 @@ class Worker:
         enhanced prompt, and every shot prompt of a plan (`_checked_plan`). It reports no progress stage of its own, since the gateway
         sees stages, and whether a prompt was enhanced is sealed.
 
-        A block is `safety_blocked` with the fixed message any prompt gets. A classifier that cannot answer fails the
-        job as the miner's internal_error, as it does for the customer's prompt. The customer's length limit is not
-        applied: the enhancer's own token budget bounds what it writes, and the customer can't shorten it."""
+        A block is `safety_blocked` with the fixed message any prompt gets, and no strike (`model_text_blocked`): the
+        customer's texts passed these checks before the model ran, so the blocked text is the model's. The negative prompt
+        beside it changes nothing there: what the content policy blocks in a negative prompt it blocks beside any prompt,
+        so it would have blocked beside the customer's, and the classifier never reads it. A classifier that cannot
+        answer fails the job as the miner's internal_error, as it does for the customer's prompt. The customer's length
+        limit is not applied: the enhancer's own token budget bounds what it writes, and the customer can't shorten it."""
         texts = generate()
         if not texts or any(not isinstance(text, str) or not text.strip() for text in texts):
             # A model that wrote nothing: a failure of this worker, not a prompt to render or to blame on the customer.
@@ -850,8 +883,13 @@ class Worker:
             for text in texts:
                 check_request(text, negative_prompt)
         except SafetyViolation:
-            raise JobRejected("safety_blocked", PROMPT_BLOCKED) from None
+            raise model_text_blocked() from None
         return texts
+
+    @staticmethod
+    def _labels(plan: Plan) -> list[str]:
+        """A plan's texts that only people read, held to the shared content policy: its title, notes and beats."""
+        return [label for label in (plan.title, plan.notes, *(shot.beat for shot in plan.shots)) if label.strip()]
 
     @staticmethod
     def _model_prompts(params: GenerationParams, payload: SealedPayload) -> list[str]:

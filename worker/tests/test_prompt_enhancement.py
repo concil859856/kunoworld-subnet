@@ -55,9 +55,11 @@ class FailureClient(RecordingClient):
     def __init__(self):
         super().__init__()
         self.failures: list[tuple[str, str]] = []
+        self.strikes: list[bool] = []
 
-    def fail(self, _job_id, code, message):
+    def fail(self, _job_id, code, message, strike=True):
         self.failures.append((code, message))
+        self.strikes.append(strike)
 
 
 class EnhancingBackend(MockBackend):
@@ -229,6 +231,51 @@ def test_an_enhanced_prompt_the_content_policy_blocks_is_safety_blocked_before_a
     error = rejected(worker, enhanced_job(worker, prompt=BLOCKED))
     assert (error.code, error.message) == ("safety_blocked", PROMPT_BLOCKED)
     assert plain.events == []  # a blocked prompt is never enhanced
+
+
+def test_a_blocked_enhanced_prompt_is_reported_without_a_strike_and_a_blocked_customer_prompt_with_one(tmp_path):
+    """The owner's rule: no strike when the blocked text is a model's. The report is otherwise word for word the same."""
+    backend = EnhancingBackend(enhanced=BLOCKED)
+    worker = make_worker(tmp_path, backend)
+    worker.client = FailureClient()
+    worker.handle_job(enhanced_job(worker))
+    assert worker.client.failures == [("safety_blocked", PROMPT_BLOCKED)] and worker.client.strikes == [False]
+    assert backend.rendered == []
+
+    # The customer's own prompt, blocked before the enhancer runs: a strike, whether or not enhancement was asked for.
+    for options in ({ENHANCE_PROMPT_OPTION: True}, {}):
+        plain = EnhancingBackend()
+        worker = make_worker(tmp_path, plain)
+        worker.client = FailureClient()
+        worker.handle_job(sealed(worker, SealedPayload(prompt=BLOCKED, seed=7, options=options)))
+        assert worker.client.failures == [("safety_blocked", PROMPT_BLOCKED)] and worker.client.strikes == [True]
+        assert plain.events == []
+
+
+def test_the_classifier_blocking_an_enhanced_prompt_is_no_strike_either(tmp_path):
+    safety.configure(SafetyGate(classifier=RecordingClassifier(blocks=ENHANCED)))
+    worker = make_worker(tmp_path, EnhancingBackend())
+    worker.client = FailureClient()
+    worker.handle_job(enhanced_job(worker))
+    assert worker.client.failures == [("safety_blocked", PROMPT_BLOCKED)] and worker.client.strikes == [False]
+
+    # The same classifier blocking the same words as the customer's prompt: a strike.
+    worker = make_worker(tmp_path, EnhancingBackend())
+    worker.client = FailureClient()
+    worker.handle_job(sealed(worker, SealedPayload(prompt=ENHANCED, seed=7)))
+    assert worker.client.strikes == [True]
+
+
+def test_blocked_frames_are_a_strike_even_after_enhancement(tmp_path, monkeypatch):
+    def block(video, signals, shot_frames=None):
+        raise safety.SafetyViolation("sexual")
+
+    monkeypatch.setattr(worker_module, "check_output", block)
+    worker = make_worker(tmp_path, EnhancingBackend())
+    worker.client = FailureClient()
+    worker.handle_job(enhanced_job(worker))
+    assert worker.client.failures == [("safety_blocked", "The video was blocked by the content policy.")]
+    assert worker.client.strikes == [True]
 
 
 def test_the_prompt_classifier_judges_the_enhanced_prompt(tmp_path):

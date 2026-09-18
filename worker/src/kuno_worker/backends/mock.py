@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from kuno_protocol.canonical import canonical_json, sha256_hex
@@ -44,11 +45,25 @@ class MockBackend(Backend):
     storyboards = True
     plans = True
 
-    def __init__(self, ffmpeg: str | None = None, retention: RetentionStore | None = None, hardware_class: str | None = DEV_HARDWARE_CLASS):
+    def __init__(
+        self, ffmpeg: str | None = None, retention: RetentionStore | None = None, hardware_class: str | None = DEV_HARDWARE_CLASS,
+        *, enhancer: Callable[[str], str] | None = None, plan_reply: Callable[[str], str] | None = None,
+    ):
         self.ffmpeg = ffmpeg or _ffmpeg()
         self.retention = retention
         self.hardware_class = hardware_class
         (retention or shared_retention()).register_replayer(TOY_RUNTIME, toy_replayer)
+        # Test hooks, so tests can have a model inside the enclave write what the safety checks block. `enhancer` gives
+        # this renderer a stand-in prompt enhancer (prompt -> enhanced prompt); without it, as on dev networks, the
+        # enhancement option has no effect. `plan_reply` rewrites each canned planner reply before the worker repairs it.
+        self._enhancer, self._plan_reply = enhancer, plan_reply
+        if enhancer is not None:
+            self.prompt_enhancement = True
+
+    def enhance_prompt(self, task: GenerationTask) -> str:
+        if self._enhancer is None:
+            return super().enhance_prompt(task)
+        return self._enhancer(task.prompt)
 
     def generate(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:
         if task.params.mode is Mode.STORYBOARD:
@@ -103,6 +118,8 @@ class MockBackend(Backend):
                 prompt += " A warm voice-over says, " + ", ".join(f'"{quote}"' for quote in quotes) + "."
             shots.append({"beat": f"Beat {index + 1}", "prompt": prompt, "duration_s": length, "join": "fresh" if index == 0 else "cut"})
         reply = json.dumps({"title": "Mock plan", "scene": "A plain, evenly lit studio set.", "shots": shots, "notes": "Written by the mock planner."})
+        if self._plan_reply is not None:
+            reply = self._plan_reply(reply)
         return PlanText(text=reply, output_tokens=max(1, len(reply) // 4), planner=MOCK_PLANNER)
 
     def _storyboard(self, task: GenerationTask, progress: ProgressFn) -> VideoResult:

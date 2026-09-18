@@ -46,7 +46,7 @@ class RecordingClient:
             self.reports.append((threading.current_thread().name, value, stage))
             return self.cancel_from_report is not None and len(self.reports) >= self.cancel_from_report
 
-    def fail(self, _job_id, code, _message):
+    def fail(self, _job_id, code, _message, strike=True):
         self.failures.append(code)
 
 
